@@ -1,0 +1,9 @@
+Port 22
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers dev
+# ulak forward needs -L tunnels
+AllowTcpForwarding yes
+Subsystem sftp internal-sftp

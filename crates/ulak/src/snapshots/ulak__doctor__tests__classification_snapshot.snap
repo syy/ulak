@@ -1,0 +1,12 @@
+---
+source: crates/ulak/src/doctor.rs
+expression: "out.rows.join(\"\\n\")"
+---
+  SYNC        web        volume   site                       
+  SYNC        prober     volume   data                       writable
+  SYNC        prober     build    app                        
+  SYNC        app_conf   config   configs/app.conf           
+  EMPTY    ghost      volume   not-here                   not on this machine — nothing to mount
+  NEW      db         volume   pgdata                     not here yet — the container creates it · writable
+  SERVER   web        volume   /etc/localtime             the server's own copy is used
+  MISSING  worker     volume   /opt/certs                 NOT on the server

@@ -1,0 +1,47 @@
+name: workspace-demo
+
+# Ulak synchronizes these local paths before running Compose on the server:
+#   ./app     — build context containing the baked marker
+#   ./.env    — environment variables read by Compose
+#   ./bind    — a read-only bind mount containing a marker
+#   ./configs — configuration mounted into the prober
+#   ./site    — HTML served by nginx
+# The writable ./data mount demonstrates files coming back to the checkout.
+
+services:
+  # Evidence you can see: is the right HTML served, or a 403?
+  web:
+    image: nginx:alpine
+    # Bound to 127.0.0.1 on purpose: otherwise 8080 would be open to the
+    # whole internet on the server's public IP. Reach it over an SSH tunnel.
+    ports:
+      - "127.0.0.1:8080:80"
+      # A second port, because one is a special case. Publishing several
+      # is the ordinary shape — web here, a database port there — and it
+      # is the only shape in which a port can be busy while the others
+      # come home. With a single port a busy one leaves no tunnel child
+      # at all, which the service already handles; the mixed set is what
+      # `scenario_a_busy_port_is_named_not_skipped` needs to build.
+      - "127.0.0.1:18080:80"
+    volumes:
+      - ./site:/usr/share/nginx/html:ro
+
+  # Machine-readable evidence: it reports every mechanism, one by one.
+  prober:
+    build:
+      context: ./app
+    env_file:
+      - ./.env
+    volumes:
+      - ./bind:/mnt/bind:ro
+      # Writable mount: the container writes HERE. This is exactly the
+      # scenario where rsync --delete destroys data. `ulak doctor`
+      # must warn about it.
+      - ./data:/data
+    configs:
+      - source: app_conf
+        target: /mnt/config/app.conf
+
+configs:
+  app_conf:
+    file: ./configs/app.conf

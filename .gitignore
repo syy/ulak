@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# macOS
+.DS_Store
+
+# e2e scratch
+/tmp
+
+# Checkout-specific configuration
+ulak.local.toml
+/examples/demo/ulak.toml
+# The demo's writable mount comes back to the checkout
+/examples/demo/data/

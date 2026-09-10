@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Lint + full test run including e2e against the dockerized sshd fixture.
+  # ubuntu runners allow --privileged, which the DinD fixture needs.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      # Dry run of `cargo publish`. Cargo fails on a missing readme but
+      # not on missing license texts, so those are checked in the archive.
+      - name: Package (what crates.io would receive)
+        run: |
+          cargo package -p ulak --locked --no-verify
+          tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-MIT$'
+          tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-APACHE$'
+      # The e2e harness never pulls (see `needs_image`): it hands the
+      # server a copy from THIS machine's daemon, so the suite cannot go
+      # red on Docker Hub's per-IP anonymous limit halfway through a run.
+      # A fresh runner's daemon starts empty, so the one pull the harness
+      # refuses to make has to happen here — once, before anything runs,
+      # where a rate limit is one loud step rather than seven red test
+      # binaries. These are every image the suite asks to be seeded; the
+      # rest it builds locally.
+      - name: Seed the images the e2e suite hands to the server
+        run: |
+          for image in alpine:3.20 nginx:alpine busybox redis:7.2 registry:2 docker/buildkit-syft-scanner:stable-1; do
+            docker pull "$image"
+          done
+      # The agent is for `bake::tests::with_a_real_buildx`, not for ssh:
+      # Buildx resolves `ssh = ["default"]` for an ssh-style git context
+      # even when only asked to --print, so a runner without one gets a
+      # diagnostic where the recorded fixture has a plan. No keys are
+      # loaded, and none are needed.
+      - name: Tests (unit + e2e via dockerized sshd)
+        run: |
+          eval "$(ssh-agent -s)"
+          ULAK_TEST_E2E_HUB=block cargo test --workspace
+
+  # macOS runners have no docker daemon, so the e2e fixture is skipped.
+  # The unit tests still run in full, Buildx included: `bake --print`
+  # only evaluates the definition and never reaches a daemon (measured),
+  # so the CLI and the plugin are the whole requirement — no Desktop, no
+  # Colima. Installing them is not optional politeness. The recordings in
+  # bake.rs are checked against the real tool and that check deliberately
+  # cannot skip itself, so a runner without Buildx fails the suite rather
+  # than quietly covering less than it claims.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # macOS ships Apple's openrsync, which reports "rsync version 2.6.9
+      # compatible" and is exactly what `local_rsync` refuses. Without a
+      # real one, every command that checks for rsync stops at that check
+      # and never reaches the thing the test is about: `ulak doctor` on an
+      # unreachable server returned in under a second with a local verdict,
+      # so the deadline test was measuring nothing. The runner has to meet
+      # the same requirement ulak states to its users.
+      - name: rsync >= 3.2
+        run: |
+          brew install rsync
+          "$(brew --prefix)/bin/rsync" --version | head -1
+      - name: Docker CLI and Buildx
+        run: |
+          brew install docker docker-buildx
+          mkdir -p ~/.docker/cli-plugins
+          ln -sfn "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" \
+            ~/.docker/cli-plugins/docker-buildx
+          docker buildx version
+      - name: Tests (e2e skipped)
+        run: |
+          eval "$(ssh-agent -s)"
+          cargo test --workspace
+        env:
+          ULAK_TEST_E2E: skip
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the minimum Rust version
+        id: msrv
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import tomllib
+
+          package = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]
+          print(f"version={package['rust-version']}")
+          PYTHON
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the minimum supported Rust version
+        run: cargo check --locked --all-targets

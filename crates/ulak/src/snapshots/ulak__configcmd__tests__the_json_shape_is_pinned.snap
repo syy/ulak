@@ -1,0 +1,80 @@
+---
+source: crates/ulak/src/configcmd.rs
+expression: json
+---
+{
+  "project": "demo",
+  "layers": [
+    {
+      "label": "project",
+      "path": "[HOME]/ulak.toml",
+      "state": "loaded"
+    },
+    {
+      "label": "local",
+      "path": "[HOME]/ulak.local.toml",
+      "state": "absent"
+    }
+  ],
+  "settings": [
+    {
+      "key": "host",
+      "value": "deploy@server",
+      "from": "[HOME]/ulak.toml"
+    },
+    {
+      "key": "workspace.namespace",
+      "value": "(automatic)",
+      "from": "default"
+    },
+    {
+      "key": "sync.exclude",
+      "value": "(none)",
+      "from": "default"
+    },
+    {
+      "key": "sync.include",
+      "value": ".env",
+      "from": "default"
+    },
+    {
+      "key": "sync.protect",
+      "value": "(none)",
+      "from": "default"
+    },
+    {
+      "key": "sync.max_delete",
+      "value": "unlimited",
+      "from": "env",
+      "variable": "ULAK_SYNC_MAX_DELETE"
+    },
+    {
+      "key": "forward.auto",
+      "value": "true",
+      "from": "default"
+    },
+    {
+      "key": "service.auto",
+      "value": "true",
+      "from": "default"
+    }
+  ],
+  "environment": [
+    {
+      "name": "ULAK_DEPLOY_TARGET",
+      "value": "someone-elses",
+      "role": "unknown"
+    },
+    {
+      "name": "ULAK_SYNC_MAX_DELETE",
+      "value": "unlimited",
+      "role": "setting",
+      "key": "sync.max_delete"
+    },
+    {
+      "name": "ULAK_TEST_E2E",
+      "value": "skip",
+      "role": "test-hook"
+    }
+  ]
+}
