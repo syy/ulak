@@ -46,6 +46,10 @@ pub const SCRIPT: Duration = Duration::from_secs(60);
 /// cold connection in 0.92–1.32 s (measured), so 15 s is pure headroom.
 pub const PROBE: Duration = Duration::from_secs(15);
 
+/// One small-file streaming batch, including an optional helper startup.
+/// It is capped at 8 MiB; a stalled channel must yield to rsync repair.
+pub const STREAM: Duration = Duration::from_secs(5);
+
 /// The bootstrap push: the compose files, the env files, nothing else.
 pub const BOOTSTRAP: Duration = Duration::from_secs(120);
 

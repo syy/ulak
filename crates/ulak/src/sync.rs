@@ -1,8 +1,9 @@
-//! The sync engine: one rsync profile, no fallbacks.
+//! The sync engine: one selection policy, bulk rsync and small-file streaming.
 //!
 //! Profile: one rsync from the ANCHOR with --delay-updates
-//! --partial-dir, a NUL-delimited literal exclude list computed by
-//! walk.rs, and filter rules for protect and the footprint.
+//! --partial-dir. Bulk pushes and existing-file pulls use the literal
+//! excludes from walk.rs; creation pulls select unclaimed leaves through
+//! selection.rs. Protect and footprint rules apply to both pull passes.
 //!
 //! Rule order is the whole design (rsync takes the FIRST match):
 //!   0. partials  — rsync's own half-written blobs, ours to exclude
@@ -32,7 +33,7 @@
 //!
 //! It says those two things to ONE DESTINATION'S ledger. Every receipt
 //! this engine writes — the ever-synced mark, the pending-deletion
-//! counter, the push window and the ledger itself — is keyed by workspace
+//! counter and the ledger itself — is keyed by workspace
 //! AND ssh destination (`config::WorkspaceStateKey`), because the same
 //! checkout syncing to two servers has two independent remote copies:
 //! server A confirming a deletion says nothing about the file still
@@ -55,6 +56,132 @@
 //! overwrite and does not need it. Both carry `--prune-empty-dirs`, so
 //! the pull can never plant a directory that ulak — which deletes
 //! nothing local — could not take back.
+//!
+//! Do not give the existing-file pass the entire tree via --files-from.
+//! rsync 3.5.0 builds an implied include list for a remote sender and
+//! checks each received name against it (flist.c: recv_file_entry).
+//! Reproduce with tens of thousands of unchanged files: rsync -rltpz
+//! --from0 --no-recursive --files-from=- --update --existing
+//! --prune-empty-dirs host:tree/ tree/, feeding every leaf on stdin.
+//! Sampling the receiver lands in check_filter/rule_matches; ordinary
+//! recursive traversal avoids this all-pairs check. --existing supplies
+//! the receiving-side safety, so enumerating local leaves adds cost
+//! without adding that guarantee.
+//!
+//! Warm sessions retain the selected local paths and their inode, size,
+//! mode, nanosecond mtime and ctime. Watcher notices carry paths; unchanged
+//! observations cost no transfer. Small regular files use the persistent
+//! stream.rs channel — replaces of known leaves, and for bounded structural
+//! change (new or removed leaves under known directories, which walk.rs
+//! rescans alone and `rescanned_plan` splices into the last full plan)
+//! creates and guarded unlinks in the same exchange, with the ledger
+//! claiming before the exchange and retiring on its receipt. Large
+//! or unstable files, unknown ancestors and failed batches use the
+//! checksum-selected rsync path and the removal script. Only an
+//! acknowledged batch updates the pre-transfer observations. One exchange
+//! is one round trip; stream.rs owns why that beats an rsync.
+//! Directory or rule changes, restarts, ledger writes and missed events require a full
+//! reconcile. With a healthy remote index, the idle deadline audits local
+//! metadata on a background thread instead of blocking saves behind a full
+//! rsync. observer.rs audits remote metadata independently too. Missing
+//! capabilities and invalidated indexes retain full reconciliation.
+//! Content ancestors live in baseline.rs, independently of the warm index.
+//! Full pushes hold differing remote edits, pulls hold differing local edits;
+//! divergence with no agreed content is held by a pull and follows
+//! `[sync] no_history` on a push (`baseline::may_push`). Warm streaming checks
+//! the expected remote ancestor before replacement. Metadata is a scheduling
+//! hint, never permission to overwrite a different remote version.
+//! Snapshots precede transfers:
+//! a save made during one remains different and must be sent again.
+//! A missed watcher event or restart leaves such a save to the next full
+//! survey, which compares content rather than seconds; no push window or
+//! catch-up pass is kept, because a content survey needs neither.
+//!
+//! A full reconcile is ONE survey: one walk, and one fingerprint of every
+//! selected leaf on each end, read through the digest caches hashcache.rs
+//! governs. The survey is also the transfer selection. rsync is handed
+//! exactly the differing names — under `--checksum`, so a same-size save
+//! in the same second cannot hide — plus the synced directories missing
+//! or re-moded on the server, and traverses the tree only when more than
+//! `EXACT_PASS_LIMIT` leaves differ. A restart used to hash both ends
+//! twice and run two `--checksum` traversals; one survey now feeds push
+//! and pull. The push folds what it confirmed back into the survey, so
+//! the pull reads nothing a second time.
+//! The server's file inventory for the creating pull is listed while this
+//! machine hashes; the server's fingerprints come after the local hashing,
+//! because they are asked for by difference against its digests
+//! (`Survey::take`). Synced directories are surveyed too, so a push names
+//! only the ones missing or re-moded; and the previous transfer leases are
+//! retired in the round trip that prepares the workspace. The differing
+//! leaves themselves, when small and under existing directories, go over
+//! the persistent channel too — creates and guarded replaces up, reads
+//! landed under the survey's stamps down — and the channel then stays
+//! open for the warm session. A quiet restart is therefore one survey and
+//! no rsync; a busy one is one exchange each way.
+//! A PUSH batch the helper refuses applied nothing, and what happens next
+//! is decided by the reason, never by handing the same selection to rsync:
+//! `RSYNC_CAN` names the limits of the channel that rsync covers, every
+//! other reason is the server having moved since the survey and holds the
+//! leaf as a conflict (`split_refusal`). A refused pull read falls back to
+//! the `--existing` / `--ignore-existing` passes by design: a read writes
+//! nothing on the server, and those passes decide at the instant of
+//! writing, as the channel's landing does. The ledger claims before the
+//! exchange, and `fresh_claims` says which of those claims to retire when
+//! a refusal proves nothing was applied — a claim on a server-born file is
+//! a licence to delete it later. A LOST receipt proves nothing either
+//! way, so the claims stand beside the sent content, recorded as
+//! unconfirmed before every exchange on both paths
+//! (`unconfirmed_sends`, `baseline::State::unconfirmed`); before a claimed row is
+//! deleted, `never_landed` compares that record with the server's copy
+//! and retires the claim instead when the send never arrived. A replace
+//! of a claimed leaf is recorded only once its receipt is lost, and only
+//! when the name has agreed content (`attempted`): an acknowledged save
+//! writes no extra state, and a claim with no agreed content stays the
+//! ledger's word rather than turning into a send that never landed.
+//!
+//! A claimed row deleted here whose server copy changed since the last
+//! agreed content (`moved_on_the_server`) is not deleted and does not stop
+//! the sync: the server's edit wins. A server copy ulak itself sent
+//! without a receipt is not such a change. `retire_moved` marks the file
+//! as returning (`baseline::State::returning`), retires the claim and
+//! names the file, and every other deletion goes ahead. Whichever pull
+//! lands the file next claims it again and ends the return
+//! (`claim_returned`): this sync's, the `pull_back` after a passthrough,
+//! build or run, or the service's `pull_changes`. A second local deletion
+//! is then judged like any other. The mark is durable because that pull
+//! is often a later command's. Handed from push to pull in memory it
+//! reached only `ulak sync`, and under `ulak docker compose` the file came
+//! home unclaimed, so each later deletion of it was silently undone. Every
+//! claim a push makes ends a return too, and so does a pull that sees the
+//! server without the file (`returns_the_server_lost`);
+//! `baseline::State::returning` lists what else does.
+//!
+//! The judgements read the server and delete nothing, so `push` makes
+//! them before the budget counts the rows (`judge_doomed`). It makes them
+//! again right before the removal when a person confirmed an over-budget
+//! list: the prompt has no time limit, and the removal script's `rm -f`
+//! checks nothing. One request reads every doomed row (`read_doomed`), and
+//! baseline.py answers each with its copy or with why it cannot be judged
+//! (`baseline::Copies`), so no row stops the others. A row whose path the
+//! server restructured, with a parent that is no longer a real directory
+//! or a leaf that is neither a regular file nor a symlink, stays on the
+//! server, untracked from then on (`retire_restructured`): ulak does not
+//! delete through such a path. A row that cannot be read right now, such
+//! as a file being written or one the SSH user may not read, keeps its
+//! claim and is judged again by the next sync (`hold_unreadable`); the
+//! claim keeps it out of the pull's creating pass. Neither stops the sync,
+//! and no directory row above either kind is removed that round
+//! (`spare_dirs_above`). The removal script keeps any row with a symlink
+//! on its way as well (`removal_script`). A read the helper never answers
+//! is an SSH failure like any other. A dry run makes the same split
+//! without retiring anything (`preview_deletions`). A `[sync] protect`
+//! path is never doomed, even when it was claimed before it was protected
+//! (`doomed_files`).
+//! A removal the server confirms leaves no agreed content behind
+//! (`forget_removed`). The warm path's rsync fallback reads its doomed
+//! rows after its upload, right before the removal, and steps aside to the
+//! full reconcile for a row the server changed, whether that read or the
+//! helper's refused unlink finds it.
 //!
 //! Deletion budget: the doomed set is known exactly and up front, so
 //! within budget it is applied, and over budget it is either confirmed
@@ -111,6 +238,982 @@ pub struct SyncReport {
     pub pending_deletions: usize,
 }
 
+/// A successfully reconciled selection, held only by the service that
+/// observed it. No cache on disk is trusted after a restart. A foreground
+/// writer changes the ledger stamp and invalidates the selection too.
+#[derive(Default)]
+pub struct Session {
+    signature: String,
+    observed: std::collections::BTreeMap<PathBuf, crate::selection::Stamp>,
+    ledger: Option<crate::selection::Stamp>,
+    pending_deletions: usize,
+    children: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<std::ffi::OsString>>,
+    owned: std::collections::BTreeSet<PathBuf>,
+    stream: Option<crate::stream::Client>,
+    stream_unavailable: bool,
+    watcher: Option<crate::observer::Watcher>,
+    /// The last full walk's answer, with every directory rescanned since
+    /// spliced in (`rescanned_plan`).
+    plan: walk::WalkReport,
+    audit: Option<std::thread::JoinHandle<std::collections::BTreeSet<PathBuf>>>,
+    deferred: std::collections::BTreeSet<PathBuf>,
+    common: Option<crate::baseline::State>,
+}
+
+impl Session {
+    pub fn indexed(&self) -> bool {
+        self.watcher.as_ref().is_some_and(|w| w.healthy())
+    }
+
+    pub fn pending(&self) -> bool {
+        self.watcher.as_ref().is_some_and(|w| w.pending())
+            || self.audit.as_ref().is_some_and(|a| a.is_finished())
+            || !self.deferred.is_empty()
+    }
+
+    /// Audit the known selection without holding up the transfer worker.
+    /// Directory stamps detect structural changes; those still use the owner
+    /// walk. The snapshot precedes the scan, so racing saves remain dirty.
+    pub fn audit(&mut self) {
+        if self.audit.is_none() {
+            let observed = self.observed.clone();
+            let children = self.children.clone();
+            self.audit = Some(std::thread::spawn(move || {
+                observed
+                    .into_iter()
+                    .filter_map(|(path, previous)| {
+                        if children.get(&path).is_some_and(|before| {
+                            directory_children(&path).as_ref() == Some(before)
+                        }) {
+                            return None;
+                        }
+                        (crate::selection::Stamp::read(&path).as_ref() != Some(&previous))
+                            .then_some(path)
+                    })
+                    .collect()
+            }));
+        }
+    }
+}
+
+/// The ledger file's stamp. A session's selection holds only while the
+/// ledger is the one the session itself last wrote or read; a foreground
+/// writer changes it.
+fn ledger_stamp(state: &crate::config::WorkspaceStateKey) -> Option<crate::selection::Stamp> {
+    crate::intent::workspace_state_dir_path(state)
+        .and_then(|p| crate::selection::Stamp::read(&p.join("ledger")))
+}
+
+/// Accelerate known leaves and bounded structural batches. Capturing BEFORE the transfer is
+/// essential: observing after it would acknowledge an edit that arrived
+/// while rsync was reading the previous version. Such edits retain a
+/// different stamp and the queued watcher notice sends them next.
+pub fn reconcile_changes(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    session: &mut Session,
+    paths: Option<&std::collections::BTreeSet<PathBuf>>,
+) -> Result<SyncReport> {
+    if opts.dry_run {
+        *session = Session::default();
+        return reconcile_once(project, fp, ssh, opts);
+    }
+    let signature = format!(
+        "{}:{:?}:{}",
+        ssh.dest,
+        project.config.sync,
+        serde_json::to_string(fp)?
+    );
+    let state = project.state_key(&ssh.dest);
+    let mut paths = paths.cloned();
+    if let Some(paths) = &mut paths {
+        paths.append(&mut session.deferred);
+    }
+    if session.audit.as_ref().is_some_and(|a| a.is_finished())
+        && let Some(audit) = session.audit.take()
+    {
+        match (audit.join(), &mut paths) {
+            (Ok(changed), Some(paths)) => paths.extend(changed),
+            (Err(_), _) => paths = None,
+            _ => {}
+        }
+    }
+    if session.watcher.as_ref().is_some_and(|w| !w.healthy()) {
+        paths = None;
+    }
+    let candidates = paths
+        .as_ref()
+        .filter(|_| session.signature == signature && session.ledger == ledger_stamp(&state))
+        .and_then(|paths| changed_leaves(&fp.anchor, session, paths));
+    if let Some(changed) = candidates {
+        if changed.is_empty() {
+            return pull_changes(project, fp, ssh, opts, session);
+        }
+        let names: Vec<String> = changed
+            .keys()
+            .filter_map(|p| crate::invocation::anchor_rel(&fp.anchor, p))
+            .collect();
+        let deadline = crate::proc::Budget::new(crate::proc::RECONCILE);
+        let result = transfer_changed(project, fp, ssh, session, &changed).and_then(|events| {
+            events.map(Ok).unwrap_or_else(|| {
+                let rsync = local_rsync()?;
+                let selected = names
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>();
+                let Some(mut common) = session.common.take() else {
+                    return Err(content_conflict("the common-content state is unavailable"));
+                };
+                let local = crate::baseline::local(&fp.anchor, &selected)?;
+                let remote =
+                    crate::baseline::remote(ssh, &project.remote_dir(), &selected, &deadline)?;
+                if local.iter().any(|(p, l)| {
+                    !crate::baseline::may_push(
+                        project.config.sync.no_history,
+                        common.get(p),
+                        l.as_ref(),
+                        remote.get(p).and_then(Option::as_ref),
+                    )
+                }) {
+                    return Err(content_conflict("a selected file changed on the server"));
+                }
+                say_what_no_history_sends(local.keys(), &common.entries, &local, &remote);
+                let events = offer_again(&rsync, project, ssh, fp, &names, &deadline)?.or_fail()?;
+                remember_common(&mut common, ssh, project, fp, &selected, &deadline)?;
+                session.common = Some(common);
+                Ok(events)
+            })
+        });
+        match result {
+            Ok(events) => {
+                session.observed.extend(changed);
+                let mut report = render_events(&events, opts.quiet);
+                report.pending_deletions = session.pending_deletions;
+                // Continuous typing must not starve unrelated server output.
+                // At most one bounded reverse batch follows each local batch.
+                let reverse = pull_changes(project, fp, ssh, opts, session)?;
+                report.pulled += reverse.pulled;
+                return Ok(report);
+            }
+            Err(e) => {
+                *session = Session::default();
+                return Err(e);
+            }
+        }
+    }
+    if session.signature == signature
+        && session.ledger == ledger_stamp(&state)
+        && let Some(paths) = paths.as_ref()
+        && let Some(report) = reconcile_structure(project, fp, ssh, opts, session, paths)?
+    {
+        return Ok(report);
+    }
+    *session = Session::default();
+    let plan = checked_plan(project, fp)?;
+    let (roots, pruned) = inventory_scope(&project.config.sync.protect, fp, &plan.excludes);
+    // Subscribe before reconciling: output written during the full transfer
+    // must survive into the next turn. The helper's registration scan runs
+    // while the survey does — both read-only — and is waited for before
+    // the transfer writes. This read-only helper has no writer lease, so
+    // fencing the full push cannot revoke its observation window.
+    let pending = crate::observer::Watcher::start(
+        ssh,
+        &project.remote_dir(),
+        &serde_json::json!({"roots": roots, "pruned": pruned}),
+    )
+    .map_err(|error| ui::dim(&ui::flatten(&error)))
+    .ok();
+    let deadline = crate::proc::Budget::new(crate::proc::RECONCILE);
+    let started = std::time::SystemTime::now();
+    let (mut survey, doomed, doomed_dirs) = prepare(project, fp, ssh, plan, true, &deadline)?;
+    // The pre-transfer observations are the stamps the survey read the
+    // fingerprints under; directories are stamped here.
+    let mut observed: std::collections::BTreeMap<_, _> = survey
+        .cache
+        .stamps()
+        .map(|(name, stamp)| (fp.anchor.join(name), stamp.clone()))
+        .collect();
+    for dir in survey
+        .plan
+        .kept_dirs
+        .iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .map(|p| fp.anchor.join(p))
+        .chain(fp.watch_dirs())
+    {
+        if let Some(stamp) = crate::selection::Stamp::read(&dir) {
+            observed.insert(dir, stamp);
+        }
+    }
+    let children = observed
+        .keys()
+        .filter(|p| p.is_dir())
+        .filter_map(|p| directory_children(p).map(|c| (p.clone(), c)))
+        .collect();
+    let watcher = pending.and_then(|pending| {
+        pending
+            .ready(&crate::proc::Budget::new(crate::proc::STREAM))
+            .map_err(|error| ui::dim(&ui::flatten(&error)))
+            .ok()
+    });
+    // The channel the transfer opens stays open for the session.
+    let mut channel = None;
+    let report = transfer(
+        project,
+        fp,
+        ssh,
+        opts,
+        &mut survey,
+        doomed,
+        doomed_dirs,
+        started,
+        &deadline,
+        &mut channel,
+    )?;
+    survey.finish()?;
+    let owned = ledger::synced_files(&state)
+        .iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .map(|p| fp.anchor.join(p))
+        .collect();
+    *session = Session {
+        signature,
+        observed,
+        ledger: ledger_stamp(&state),
+        pending_deletions: report.pending_deletions,
+        children,
+        owned,
+        stream: channel,
+        stream_unavailable: false,
+        watcher,
+        plan: survey.plan,
+        audit: None,
+        deferred: std::collections::BTreeSet::new(),
+        common: Some(survey.common),
+    };
+    Ok(report)
+}
+
+/// Reuse the owner walk for selection, but send only its changed leaves —
+/// over the persistent channel when every item fits it, else by selected
+/// rsync and the removal script. This bounds files-from filters and keeps
+/// directory creation/removal and rule changes on the conservative full
+/// path. New files still acquire ledger claims before the transfer can
+/// fail, so a partial transfer leaves nothing unclaimed. A doomed row the
+/// server changed since the last agreed content sends the rest of the
+/// batch to the full path too, which keeps the server's copy
+/// (`retire_moved`); the rsync path reads the doomed rows for that only
+/// after its upload, right before the removal.
+fn reconcile_structure(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    session: &mut Session,
+    paths: &std::collections::BTreeSet<PathBuf>,
+) -> Result<Option<SyncReport>> {
+    if session.common.is_none()
+        || paths.iter().any(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n == ".gitignore" || n.ends_with(".dockerignore") || n == "ulak.toml"
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let Some((plan, scopes)) = rescanned_plan(&project.config.sync, fp, &session.plan, paths)?
+    else {
+        return Ok(None);
+    };
+    let state = project.state_key(&ssh.dest);
+    let mut doomed = doomed_files(project, &state, &fp.anchor, &plan.kept);
+    if !doomed_directories(project, &state, &fp.anchor).is_empty()
+        || !opts
+            .max_delete_override
+            .unwrap_or(project.config.sync.max_delete)
+            .allows(doomed.len())
+    {
+        return Ok(None);
+    }
+    let within = |path: &std::path::Path| scopes.iter().any(|s| path.starts_with(s));
+    // Fresh observations for the rescanned directories only; every other
+    // observation stands, and nothing replaces the session's until the
+    // transfer has succeeded — a refreshed stamp before a failed transfer
+    // would make the save look already sent.
+    let mut observed = std::collections::BTreeMap::new();
+    let mut selected = Vec::new();
+    for raw in &plan.kept {
+        let name = std::str::from_utf8(raw)?;
+        let path = fp.anchor.join(name);
+        if !within(&path) {
+            continue;
+        }
+        let Some(stamp) = crate::selection::Stamp::read(&path) else {
+            return Ok(None);
+        };
+        if session.observed.get(&path) != Some(&stamp) {
+            if !std::fs::symlink_metadata(&path)?.is_file()
+                || !path
+                    .parent()
+                    .is_some_and(|p| session.children.contains_key(p))
+            {
+                return Ok(None);
+            }
+            selected.push(raw.clone());
+        }
+        observed.insert(path, stamp);
+    }
+    if selected.len() + doomed.len() > 128 {
+        return Ok(None);
+    }
+    // Capture the directory inventory before network work as well. A new
+    // sibling arriving during a transfer must remain visible to the audit.
+    let mut children = std::collections::BTreeMap::new();
+    for path in plan
+        .kept_dirs
+        .iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .map(|p| fp.anchor.join(p))
+        .filter(|p| within(p))
+        .chain(fp.watch_dirs())
+    {
+        let Some(stamp) = crate::selection::Stamp::read(&path) else {
+            return Ok(None);
+        };
+        let Some(names) = directory_children(&path) else {
+            return Ok(None);
+        };
+        observed.insert(path.clone(), stamp);
+        children.insert(path, names);
+    }
+    let deadline = crate::proc::Budget::new(crate::proc::RECONCILE);
+    let Some(mut common) = session.common.take() else {
+        return Ok(None);
+    };
+    let mut report = SyncReport::default();
+    let streamed = match stream_structure(
+        project,
+        fp,
+        ssh,
+        session,
+        &mut common,
+        &state,
+        &selected,
+        &doomed,
+        &observed,
+        opts.quiet,
+    ) {
+        Ok(Structure::Applied(streamed)) => Some(streamed),
+        Ok(Structure::Rsync) => None,
+        Ok(Structure::Full) => {
+            session.common = Some(common);
+            return Ok(None);
+        }
+        Err(e) => {
+            session.common = Some(common);
+            return Err(e);
+        }
+    };
+    let rsync_needed = streamed.is_none();
+    if let Some(streamed) = streamed {
+        report = streamed;
+    } else {
+        let local = crate::baseline::local(&fp.anchor, &selected)?;
+        // A read that fails decides nothing here, and nothing has been
+        // sent yet: the full reconcile reads again.
+        let Ok(remote) = crate::baseline::remote(ssh, &project.remote_dir(), &selected, &deadline)
+        else {
+            session.common = Some(common);
+            return Ok(None);
+        };
+        if local.iter().any(|(p, l)| {
+            !crate::baseline::may_push(
+                project.config.sync.no_history,
+                common.get(p),
+                l.as_ref(),
+                remote[p].as_ref(),
+            )
+        }) {
+            return Err(content_conflict(
+                "a changed path has different server content",
+            ));
+        }
+        say_what_no_history_sends(local.keys(), &common.entries, &local, &remote);
+    }
+    if rsync_needed && !selected.is_empty() {
+        let rsync = local_rsync()?;
+        let pass = rsync_pass_dir(
+            &rsync,
+            project,
+            fp,
+            ssh,
+            &plan.excludes,
+            &[],
+            &["--checksum"],
+            Direction::Up,
+            Some(&selected),
+            &deadline,
+        )?;
+        let claimed = claim(&selected, &[], &pass.events);
+        ledger::store(&state, &fp.anchor, &claimed, &[], &[]);
+        common.end_return(&claimed)?;
+        report = render_events(&pass.or_fail()?, opts.quiet);
+        remember_common(&mut common, ssh, project, fp, &selected, &deadline)?;
+    }
+    if rsync_needed && !doomed.is_empty() {
+        // Judged only now, after the upload and right before the removal
+        // script's `rm -f`, which compares nothing: a server rewrite the
+        // upload set off, such as a watcher regenerating the file, meets a
+        // read taken after it, as in the full push. A row the server
+        // changed since the last agreed content is the full reconcile's,
+        // whose pull brings the server's copy home (`retire_moved`), so
+        // the batch steps aside before this judgement writes anything.
+        // What went up is claimed and recorded by then, so stepping aside
+        // repeats none of it. A read the helper never answers is an error
+        // like any SSH failure.
+        let copies = read_doomed(ssh, project, &doomed, &deadline)?;
+        if !split_moved(doomed.clone(), &common, &copies.remote)
+            .1
+            .is_empty()
+        {
+            session.common = Some(common);
+            return Ok(None);
+        }
+        doomed = set_aside(&state, &fp.anchor, &mut common, &copies, doomed)?;
+        doomed = retire_never_landed(&state, &fp.anchor, &mut common, &copies.remote, doomed)?;
+        if !doomed.is_empty() {
+            let removal = delete_remote(ssh, project, &doomed, &[])?;
+            ledger::store(&state, &fp.anchor, &[], &removal.files, &[]);
+            forget_removed(&mut common, &removal.files)?;
+            report.deleted = removal.count;
+            report.pending_deletions = removal.kept_files;
+        }
+    }
+    session.observed.retain(|p, _| !within(p));
+    session.observed.extend(observed);
+    session.children.retain(|p, _| !within(p));
+    session.children.extend(children);
+    session.owned = ledger::synced_files(&state)
+        .iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .map(|p| fp.anchor.join(p))
+        .collect();
+    session.ledger = ledger_stamp(&state);
+    session.plan = plan;
+    session.common = Some(common);
+    session.pending_deletions = report.pending_deletions;
+    crate::invocation::record_pending_deletions(&state, report.pending_deletions);
+    report.pulled += pull_changes(project, fp, ssh, opts, session)?.pulled;
+    Ok(Some(report))
+}
+
+/// Bound reverse work to a small candidate batch. The same rsync filter
+/// ranking and receiving-time existence guards as pull_back still decide
+/// what can land. Local dirty observations take priority over remote output.
+fn pull_changes(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    session: &mut Session,
+) -> Result<SyncReport> {
+    let notices = match session.watcher.as_mut() {
+        Some(watcher) => watcher.take(),
+        None => Some(Vec::new()),
+    };
+    let Some(notices) = notices else {
+        return reconcile_changes(project, fp, ssh, opts, session, None);
+    };
+    let excluded = crate::selection::Excludes::new(session.plan.excludes.clone());
+    let mut existing = Vec::new();
+    let mut invented = Vec::new();
+    let mut acknowledge = Vec::new();
+    let mut deferred = Vec::new();
+    for notice in notices {
+        if excluded.contains(notice.path.as_bytes()) {
+            continue;
+        }
+        if notice.deleted {
+            let path = fp.anchor.join(&notice.path);
+            if !session.owned.contains(&path) && !path.try_exists()? {
+                // An acknowledged ledger deletion echoes through inotify.
+                // It cannot require another full reconciliation. A
+                // returning file the server deleted has nothing left to
+                // come home, and its mark would claim the next same-named
+                // file the server makes (`returns_the_server_lost`).
+                if let Some(common) = session.common.as_mut() {
+                    common.end_return([notice.path.as_str()])?;
+                }
+                continue;
+            }
+            // The full engine restores locally present files and settles
+            // ledger-owned deletions. The notice never authorizes a local rm.
+            return reconcile_changes(project, fp, ssh, opts, session, None);
+        }
+        let path = fp.anchor.join(&notice.path);
+        let current = crate::selection::Stamp::read(&path);
+        if session.observed.get(&path) != current.as_ref() {
+            session.deferred.insert(path);
+            deferred.push(notice);
+            continue;
+        }
+        if session.observed.contains_key(&path) {
+            if notice.matches(&path).is_some() {
+                continue;
+            }
+            let local = crate::baseline::fingerprint(&path)?;
+            let remote = notice.content();
+            let base = session.common.as_ref().and_then(|s| s.get(&notice.path));
+            if !crate::baseline::may_pull(base, local.as_ref(), remote.as_ref()) {
+                ui::warn(&format!(
+                    "sync conflict: {} — both copies are preserved",
+                    notice.path
+                ));
+                continue;
+            }
+            existing.push(notice.path.as_bytes().to_vec());
+            acknowledge.push(notice);
+        } else if !session.owned.contains(&path) && current.is_none() {
+            invented.push(notice.path.as_bytes().to_vec());
+            // A newly created local path must go through walk.rs before it
+            // enters the warm selection: an ignore may apply only now that
+            // the path exists. Its local watcher notice triggers that walk.
+        }
+    }
+    if let Some(watcher) = session.watcher.as_mut() {
+        watcher.retain(deferred);
+    }
+    let mut report = SyncReport {
+        pending_deletions: session.pending_deletions,
+        ..SyncReport::default()
+    };
+    if existing.is_empty() && invented.is_empty() {
+        return Ok(report);
+    }
+    // Small files come home over the persistent channel in one exchange,
+    // landed under the same guards the two rsync passes carry (`land`);
+    // anything the channel refuses — a large file, a missing one — takes
+    // those passes as before.
+    let (mut events, new_events) =
+        match stream_pull(project, fp, ssh, session, &existing, &invented)? {
+            Some(landed) => landed,
+            None => {
+                let rsync = local_rsync()?;
+                let budget = crate::proc::Budget::new(crate::proc::RECONCILE);
+                let refreshed = rsync_pass_dir(
+                    &rsync,
+                    project,
+                    fp,
+                    ssh,
+                    &session.plan.excludes,
+                    &[],
+                    &["--checksum", "--update", "--existing", "--prune-empty-dirs"],
+                    Direction::Down,
+                    Some(&existing),
+                    &budget,
+                )?
+                .or_fail()?;
+                let created = rsync_pass_dir(
+                    &rsync,
+                    project,
+                    fp,
+                    ssh,
+                    &session.plan.excludes,
+                    &[],
+                    &["--ignore-existing", "--prune-empty-dirs"],
+                    Direction::Down,
+                    Some(&invented),
+                    &budget,
+                )?
+                .or_fail()?;
+                (refreshed, created)
+            }
+        };
+    say_what_slipped_past_the_ignores(project, fp, &new_events);
+    // A returning file lands here when no full pull brought it home first.
+    // Nothing above recorded what a created file holds, so the agreed
+    // content is read before the claim, as the full pull's confirmation
+    // does; claimed on the old record, the next local deletion would read
+    // as the server's edit and bring the file back again.
+    if let Some(common) = session.common.as_mut() {
+        let landed = landed_back(common, &new_events);
+        if !landed.is_empty() {
+            let rows: Vec<Vec<u8>> = landed.iter().map(|p| p.as_bytes().to_vec()).collect();
+            let budget = crate::proc::Budget::new(crate::proc::RECONCILE);
+            remember_common(common, ssh, project, fp, &rows, &budget)?;
+            let state = project.state_key(&ssh.dest);
+            claim_returned(&state, &fp.anchor, common, &landed)?;
+            session
+                .owned
+                .extend(landed.iter().map(|p| fp.anchor.join(p)));
+            session.ledger = ledger_stamp(&state);
+        }
+    }
+    events.extend(new_events);
+    for notice in acknowledge {
+        let path = fp.anchor.join(&notice.path);
+        if let Some(stamp) = notice.matches(&path) {
+            if let Some(common) = session.common.as_mut() {
+                common.record(std::collections::BTreeMap::from([(
+                    notice.path.clone(),
+                    notice.content(),
+                )]))?;
+            }
+            session.observed.insert(path, stamp);
+        }
+    }
+    report.pulled = events
+        .iter()
+        .filter(|e| matches!(e, Event::Push(p) if !p.ends_with('/')))
+        .count();
+    Ok(report)
+}
+
+/// What the channel made of a structural batch.
+enum Structure {
+    /// The helper applied the whole batch.
+    Applied(SyncReport),
+    /// Not a batch for the channel — a large or unstable file, too many
+    /// items, no helper — so the rsync path takes it as before.
+    Rsync,
+    /// The helper refused to unlink a doomed row: the server's copy is not
+    /// the last agreed content. Nothing was applied, and the full
+    /// reconcile decides the row (`retire_moved`).
+    Full,
+}
+
+/// The structural batch over the persistent channel: creates for leaves
+/// the ledger does not claim, guarded replaces for the ones it does, and
+/// guarded unlinks for the doomed rows — one exchange, one round trip,
+/// where rsync plus the checks around it cost three sessions. The helper
+/// verifies every item before applying any, so a refusal applies nothing.
+/// A refused unlink sends the batch to the full reconcile, where the
+/// server's edit wins over the deletion; any other refusal is a conflict
+/// for the full survey to hold.
+#[allow(clippy::too_many_arguments)]
+fn stream_structure(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    session: &mut Session,
+    common: &mut crate::baseline::State,
+    state: &crate::config::WorkspaceStateKey,
+    selected: &[Vec<u8>],
+    doomed: &[String],
+    observed: &std::collections::BTreeMap<PathBuf, crate::selection::Stamp>,
+    quiet: bool,
+) -> Result<Structure> {
+    if session.stream_unavailable {
+        return Ok(Structure::Rsync);
+    }
+    let mut batch = crate::stream::Batch::new();
+    for raw in selected {
+        let name = std::str::from_utf8(raw)?;
+        let path = fp.anchor.join(name);
+        let Some(stamp) = observed.get(&path) else {
+            return Ok(Structure::Rsync);
+        };
+        let create = !session.owned.contains(&path);
+        if batch.add(&fp.anchor, &path, stamp, create).is_none() {
+            return Ok(Structure::Rsync);
+        }
+    }
+    for name in doomed {
+        // The helper unlinks only a copy it can compare to the last agreed
+        // content; a row without one takes the rsync path, where
+        // `never_landed` and `moved_on_the_server` judge it before the
+        // removal script runs.
+        let Some(expected) = common.get(name).cloned() else {
+            return Ok(Structure::Rsync);
+        };
+        if batch.unlink(name.clone(), Some(expected)).is_none() {
+            return Ok(Structure::Rsync);
+        }
+    }
+    if batch.is_empty() {
+        return Ok(Structure::Applied(SyncReport::default()));
+    }
+    batch.guard(&common.entries);
+    let accepted = batch.contents();
+    let written = batch.written();
+    // Claimed BEFORE the exchange, beside an unconfirmed record of what
+    // is sent (`fresh_claims`, `unconfirmed_sends`); a refusal retires
+    // both, a lost receipt leaves both standing.
+    let fresh = fresh_claims(&written, |name| {
+        session.owned.contains(&fp.anchor.join(name))
+    });
+    // The protective record first: a failed or interrupted write must
+    // never leave a claim standing without it (measured).
+    let sends = unconfirmed_sends(&fresh, common, &accepted);
+    common.record_unconfirmed(sends.clone())?;
+    ledger::store(state, &fp.anchor, &written, &[], &[]);
+    let budget = crate::proc::Budget::new(crate::proc::STREAM);
+    let result =
+        open_stream(project, ssh, session, &budget).and_then(|client| client.send(batch, &budget));
+    match result {
+        Ok(applied) if applied.refused.is_empty() => {
+            common.record(accepted)?;
+            // Claimed for good now, which ends any return; a refusal
+            // below retires a fresh claim and leaves its return standing.
+            common.end_return(&written)?;
+            ledger::store(state, &fp.anchor, &[], &applied.deleted, &[]);
+            let events: Vec<Event> = applied.changed.into_iter().map(Event::Push).collect();
+            let mut report = render_events(&events, quiet);
+            report.deleted = applied.deleted.len();
+            if !quiet {
+                for p in &applied.deleted {
+                    ui::dim(&format!("- {p}"));
+                }
+            }
+            Ok(Structure::Applied(report))
+        }
+        Ok(applied) => {
+            ledger::store(state, &fp.anchor, &[], &fresh, &[]);
+            common.settle(&fresh)?;
+            // A doomed row the SSH user may not read is the rsync
+            // fallback's to hold (`set_aside`), which deletes the rest of
+            // the batch's rows; stepping aside to the full path instead
+            // would repeat on every structural batch while it stays so.
+            if applied
+                .refused
+                .iter()
+                .any(|(p, why)| doomed.contains(p) && why == "unreadable")
+            {
+                return Ok(Structure::Rsync);
+            }
+            if applied.refused.iter().any(|(p, _)| doomed.contains(p)) {
+                return Ok(Structure::Full);
+            }
+            Err(content_conflict(&format!(
+                "the server's copy of {} {}",
+                applied.refused[0].0, applied.refused[0].1
+            )))
+        }
+        Err(error) => {
+            // No receipt: the helper may have applied the batch before the
+            // answer was lost, so the fresh claims STAND — retiring them
+            // would make an upload look server-born and pull it back after
+            // a local delete — and so does their unconfirmed record, which
+            // the deletion rule compares with the server's copy
+            // (`never_landed`) before a claim is acted on. The replaces
+            // join that record now (`attempted`).
+            let replaced = attempted(common, &accepted)
+                .into_iter()
+                .filter(|(p, _)| !sends.contains_key(p))
+                .collect();
+            let recorded = common.record_unconfirmed(replaced);
+            revoke_stream(project, ssh, session)?;
+            recorded?;
+            Err(error)
+        }
+    }
+}
+
+/// The way down over the channel: one read exchange for the existing and
+/// the invented candidates, each landed only over the stamp it was
+/// observed under or into a name still absent (stream::land). None means
+/// the channel is not for this batch — unavailable, too many names, or a
+/// refusal such as a file past the helper's size — and the rsync passes
+/// decide as before; nothing was written either way.
+fn stream_pull(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    session: &mut Session,
+    existing: &[Vec<u8>],
+    invented: &[Vec<u8>],
+) -> Result<Option<(Vec<Event>, Vec<Event>)>> {
+    if session.stream_unavailable {
+        return Ok(None);
+    }
+    let mut batch = crate::stream::Batch::new();
+    for raw in existing.iter().chain(invented) {
+        if batch.read(String::from_utf8(raw.clone())?).is_none() {
+            return Ok(None);
+        }
+    }
+    let budget = crate::proc::Budget::new(crate::proc::STREAM);
+    let result =
+        open_stream(project, ssh, session, &budget).and_then(|client| client.send(batch, &budget));
+    match result {
+        Ok(applied) if applied.refused.is_empty() => {
+            let mut refreshed = Vec::new();
+            let mut created = Vec::new();
+            for pulled in &applied.pulled {
+                let path = fp.anchor.join(&pulled.path);
+                let known = existing
+                    .iter()
+                    .any(|e| e.as_slice() == pulled.path.as_bytes());
+                let expected = session.observed.get(&path);
+                if known != expected.is_some() {
+                    continue;
+                }
+                if crate::stream::land(&fp.anchor, pulled, expected)?.is_some() {
+                    let events = if known { &mut refreshed } else { &mut created };
+                    events.push(Event::Push(pulled.path.clone()));
+                }
+            }
+            Ok(Some((refreshed, created)))
+        }
+        Ok(_) => Ok(None),
+        Err(error) => {
+            revoke_stream(project, ssh, session)?;
+            Err(error)
+        }
+    }
+}
+
+/// The session's channel, opened on first use.
+fn open_stream<'a>(
+    project: &Project,
+    ssh: &Ssh,
+    session: &'a mut Session,
+    budget: &crate::proc::Budget,
+) -> Result<&'a mut crate::stream::Client> {
+    if session.stream.is_none() {
+        session.stream = Some(crate::stream::Client::connect(
+            ssh,
+            &project.remote_dir(),
+            &project.remote_workspace_root(),
+            budget,
+        )?);
+    }
+    session.stream.as_mut().ok_or_else(|| {
+        fail!("the persistent transfer channel was not opened")
+            .now("run ulak sync to reconcile with rsync")
+            .into_err()
+    })
+}
+
+/// After a transport failure the channel is closed and its remote lease
+/// retired, so bytes it may still be applying cannot land behind the
+/// rsync repair that follows. A lost ACK is not permission for an
+/// unconditional repair either: the next full survey decides.
+fn revoke_stream(project: &Project, ssh: &Ssh, session: &mut Session) -> Result<()> {
+    session.stream = None;
+    session.stream_unavailable = true;
+    crate::stream::fence(
+        ssh,
+        &project.remote_workspace_root(),
+        &crate::proc::Budget::new(crate::proc::STREAM),
+    )
+}
+
+/// The stream has no policy of its own: every candidate is an already
+/// selected and claimed leaf. A failed/partial batch is repaired by the
+/// checksum pass, after revoking its remote lease so buffered bytes cannot
+/// race the repair even if killing local SSH leaves the remote child alive.
+fn transfer_changed(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    session: &mut Session,
+    changed: &std::collections::BTreeMap<PathBuf, crate::selection::Stamp>,
+) -> Result<Option<Vec<Event>>> {
+    if session.stream_unavailable {
+        return Ok(None);
+    }
+    let Some(mut batch) = crate::stream::prepare(&fp.anchor, changed) else {
+        return Ok(None);
+    };
+    let Some(common) = session.common.as_ref() else {
+        return Err(fail!("the common-content state is unavailable")
+            .now("run ulak sync before retrying the transfer")
+            .into_err());
+    };
+    batch.guard(&common.entries);
+    let accepted = batch.contents();
+    let budget = crate::proc::Budget::new(crate::proc::STREAM);
+    let result =
+        open_stream(project, ssh, session, &budget).and_then(|client| client.send(batch, &budget));
+    match result {
+        Ok(applied) if applied.refused.is_empty() => {
+            if let Some(common) = session.common.as_mut() {
+                common.record(accepted)?;
+            }
+            Ok(Some(applied.changed.into_iter().map(Event::Push).collect()))
+        }
+        // The helper applied nothing: the server's copy is not the one both
+        // ends last agreed on. That is a conflict for the full survey to
+        // hold, not a transport failure, so the channel is not revoked.
+        Ok(applied) => Err(content_conflict(&format!(
+            "the server's copy of {} {}",
+            applied.refused[0].0, applied.refused[0].1
+        ))),
+        Err(error) => {
+            // The helper may have applied the replaces before the answer
+            // was lost (`attempted`).
+            let recorded = session.common.as_mut().map_or(Ok(()), |common| {
+                let replaced = attempted(common, &accepted);
+                common.record_unconfirmed(replaced)
+            });
+            revoke_stream(project, ssh, session)?;
+            recorded?;
+            Err(error)
+        }
+    }
+}
+
+fn changed_leaves(
+    anchor: &std::path::Path,
+    session: &Session,
+    paths: &std::collections::BTreeSet<PathBuf>,
+) -> Option<std::collections::BTreeMap<PathBuf, crate::selection::Stamp>> {
+    let mut changed = std::collections::BTreeMap::new();
+    for path in paths {
+        if !session.observed.contains_key(path)
+            && !session.owned.contains(path)
+            && std::fs::symlink_metadata(path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            // Editors rename a temporary sibling over a known file. A
+            // vanished, never-owned sibling has no bytes or deletion to
+            // send; the final filename's own notice remains in the batch.
+            continue;
+        }
+        let previous = session.observed.get(path)?;
+        let current = crate::selection::Stamp::read(path)?;
+        if let Some(before) = session.children.get(path) {
+            // Some watcher backends report a directory instead of its
+            // changed child. A stable directory mtime says nothing about
+            // writes inside existing files. Only a batch that also names
+            // descendants can use the atomic-save shortcut.
+            if paths.iter().any(|p| p != path && p.starts_with(path))
+                && directory_children(path).as_ref() == Some(before)
+            {
+                continue;
+            }
+            return None;
+        }
+        if previous == &current {
+            continue;
+        }
+        let name = path.file_name()?.to_str()?;
+        if name == ".gitignore"
+            || name.ends_with(".dockerignore")
+            || name == "ulak.toml"
+            || !path.starts_with(anchor)
+            || !std::fs::symlink_metadata(path).ok()?.is_file()
+        {
+            return None;
+        }
+        changed.insert(path.clone(), current);
+    }
+    Some(changed)
+}
+
+fn directory_children(
+    path: &std::path::Path,
+) -> Option<std::collections::BTreeSet<std::ffi::OsString>> {
+    std::fs::read_dir(path)
+        .ok()?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()
+        .ok()
+}
+
 /// THE engine, and the only one.
 ///
 /// `ulak sync` runs it and the service runs it — the same function,
@@ -130,18 +1233,402 @@ pub fn reconcile_once(
     ssh: &Ssh,
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
-    let started = std::time::SystemTime::now();
     let deadline = crate::proc::Budget::new(crate::proc::RECONCILE);
-    let mut report = run_sync(project, fp, ssh, opts, &deadline)?;
+    if opts.dry_run {
+        return run_sync(project, fp, ssh, opts, &deadline);
+    }
+    let plan = checked_plan(project, fp)?;
+    let (report, mut survey) = reconcile_full(project, fp, ssh, opts, plan, &deadline)?;
+    survey.finish()?;
+    Ok(report)
+}
+
+/// Both legs over one survey, handed back so a session can keep its
+/// common-content state and excludes without reading either again.
+fn reconcile_full(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    plan: walk::WalkReport,
+    deadline: &crate::proc::Budget,
+) -> Result<(SyncReport, Survey)> {
+    let started = std::time::SystemTime::now();
+    let (mut survey, doomed, doomed_dirs) = prepare(project, fp, ssh, plan, true, deadline)?;
+    let report = transfer(
+        project,
+        fp,
+        ssh,
+        opts,
+        &mut survey,
+        doomed,
+        doomed_dirs,
+        started,
+        deadline,
+        &mut None,
+    )?;
+    Ok((report, survey))
+}
+
+/// Both legs of a prepared survey. `started` predates the survey: it is
+/// the line between "the server may already know this" and "you typed it
+/// just now, and it is yours" — see `pull`.
+#[allow(clippy::too_many_arguments)]
+fn transfer(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    survey: &mut Survey,
+    doomed: Vec<String>,
+    doomed_dirs: Vec<String>,
+    started: std::time::SystemTime,
+    deadline: &crate::proc::Budget,
+    channel: &mut Option<crate::stream::Client>,
+) -> Result<SyncReport> {
+    let mut report = push(
+        project,
+        fp,
+        ssh,
+        opts,
+        survey,
+        doomed,
+        doomed_dirs,
+        deadline,
+        channel,
+    )?;
     // A workspace runs both ways, because a local bind mount does: whatever
     // the stack produced comes home in the same breath it went up.
-    // `started` is the line between "the server may already know this"
-    // and "you typed it just now, and it is yours" — see `pull_back`.
-    if !opts.dry_run {
-        let back = pull_back(project, fp, ssh, opts.quiet, &deadline, Some(started))?;
-        report.pulled += back.pulled;
-    }
+    let back = pull(
+        project,
+        fp,
+        ssh,
+        opts.quiet,
+        survey,
+        deadline,
+        Some(started),
+        channel,
+    )?;
+    report.pulled += back.pulled;
     Ok(report)
+}
+
+/// What one exchange over the survey's channel came to. `Refused` is the
+/// helper's answer with nothing applied and every reason by name: the
+/// caller must not simply hand the same selection to rsync, because a
+/// refusal for content means the server moved since the survey and rsync
+/// would write over that. `Unavailable` is a channel that could not be
+/// opened, so nothing was sent. `Lost` is a transport that failed after
+/// the batch was handed over, so the helper may have applied it; the
+/// lease is retired so bytes still buffered remotely cannot land behind
+/// the rsync that follows, and when that retirement cannot reach the
+/// server `channel_send` fails instead. Either way the rsync pass takes
+/// the batch as before.
+enum Sent {
+    Applied(crate::stream::Applied),
+    Refused(Vec<(String, String)>),
+    Unavailable,
+    Lost,
+}
+
+/// One exchange over the survey's channel, opened on first use and handed
+/// to the warm session afterwards.
+fn channel_send(
+    project: &Project,
+    ssh: &Ssh,
+    channel: &mut Option<crate::stream::Client>,
+    batch: crate::stream::Batch,
+) -> Result<Sent> {
+    let budget = crate::proc::Budget::new(crate::proc::STREAM);
+    if channel.is_none() {
+        match crate::stream::Client::connect(
+            ssh,
+            &project.remote_dir(),
+            &project.remote_workspace_root(),
+            &budget,
+        ) {
+            Ok(client) => *channel = Some(client),
+            Err(error) => {
+                ui::dim(&ui::flatten(&error));
+                return Ok(Sent::Unavailable);
+            }
+        }
+    }
+    let Some(client) = channel.as_mut() else {
+        return Ok(Sent::Unavailable);
+    };
+    match client.send(batch, &budget) {
+        Ok(applied) if applied.refused.is_empty() => Ok(Sent::Applied(applied)),
+        Ok(applied) => Ok(Sent::Refused(applied.refused)),
+        Err(error) => {
+            ui::dim(&ui::flatten(&error));
+            *channel = None;
+            crate::stream::fence(ssh, &project.remote_workspace_root(), &budget)?;
+            Ok(Sent::Lost)
+        }
+    }
+}
+
+/// The helper's refusals that name a limit of the channel, not a move on
+/// the server: a create under a parent directory the server lacks — the
+/// footprint's own roots are not surveyed as directories, so a first
+/// population reaches the channel this way, and rsync's creating pass
+/// makes the parents as it always has. `stream.py`'s `verify` answers it
+/// for a create only, and compares a large server copy before it answers
+/// anything, so no push refusal here can be a move on the server in
+/// disguise. "needs rsync" is a pull's answer and is deliberately absent:
+/// on a push it would mean the helper skipped that comparison.
+const RSYNC_CAN: &[&str] = &["missing parent"];
+
+/// What a refused push batch leaves for rsync, and what it holds. The
+/// helper refuses a whole batch at once; only a reason in `RSYNC_CAN` is
+/// an invitation to rsync. Any other reason — the server's copy differs
+/// from the survey's, a name appeared, a file vanished — says the server
+/// moved in the window since the survey, and rsync sending the stale
+/// selection would write over that; those leaves are held, like any
+/// conflict, for the next survey to judge.
+fn split_refusal(
+    selected: &[String],
+    refused: &[(String, String)],
+) -> (Vec<String>, Vec<(String, String)>) {
+    let held: Vec<(String, String)> = refused
+        .iter()
+        .filter(|(_, reason)| !RSYNC_CAN.contains(&reason.as_str()))
+        .cloned()
+        .collect();
+    let rsync = selected
+        .iter()
+        .filter(|p| !held.iter().any(|(h, _)| h == *p))
+        .cloned()
+        .collect();
+    (rsync, held)
+}
+
+/// The claims a batch would make for the first time. Claimed BEFORE the
+/// exchange like every push, so a create the helper applied without a
+/// receipt is never left unclaimed — and retired again when a refusal
+/// proves the exchange applied nothing, because a claim on a file the
+/// server held all along is a licence to delete it later:
+/// `moved_on_the_server` has no record to consult for it. Measured: a
+/// refused create, then a local delete, doomed the server's own
+/// file even under no_history = hold. A lost receipt is not such proof;
+/// see `never_landed`.
+fn fresh_claims(written: &[Vec<u8>], claimed: impl Fn(&str) -> bool) -> Vec<String> {
+    written
+        .iter()
+        .filter_map(|w| std::str::from_utf8(w).ok())
+        .filter(|name| !claimed(name))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One full comparison of the selection, taken once per reconcile and
+/// shared by the push and the pull. Its digests are the transfer
+/// selection: the fingerprints already say which leaves differ, so rsync
+/// is handed exactly those names instead of hashing the tree a second
+/// time under `--checksum`. Wider than `EXACT_PASS_LIMIT`, the traversing
+/// pass takes over — the module header records why a long files-from list
+/// is the wrong shape for rsync.
+struct Survey {
+    plan: walk::WalkReport,
+    local: crate::baseline::Contents,
+    remote: crate::baseline::Contents,
+    /// The synced directories' modes, `d:<mode>` or None, on each end.
+    /// Never common content: only the push reads them, to name what is
+    /// missing or re-moded on the server.
+    local_dirs: crate::baseline::Contents,
+    remote_dirs: crate::baseline::Contents,
+    /// The server's file inventory for the creating pull, taken alongside
+    /// the fingerprints when a pull will follow. What the push creates in
+    /// the meantime is claimed by then and filtered out by the ledger.
+    listing: Option<Vec<u8>>,
+    /// The names returning (`baseline::State::returning`) when `listing`
+    /// was asked for. A listing shows the server without a returning file
+    /// only for a mark made before it (`returns_the_server_lost`); the
+    /// push's judgement that marks a file reads the server after it.
+    returning_when_listed: std::collections::BTreeSet<String>,
+    common: crate::baseline::State,
+    cache: crate::hashcache::Cache,
+}
+
+/// Above this many exact names, one traversing rsync is cheaper than the
+/// receiver's all-pairs implied-include check (module header).
+const EXACT_PASS_LIMIT: usize = 4096;
+
+impl Survey {
+    fn take(
+        project: &Project,
+        fp: &Footprint,
+        ssh: &Ssh,
+        plan: walk::WalkReport,
+        for_pull: bool,
+        deadline: &crate::proc::Budget,
+    ) -> Result<Survey> {
+        let state = project.state_key(&ssh.dest);
+        let common = crate::baseline::State::load(&state, &fp.anchor)?;
+        let returning_when_listed = common.returning_names();
+        let mut cache = crate::hashcache::Cache::open(&state, &fp.anchor);
+        // The inventory listing runs while this machine hashes; the server's
+        // fingerprints are then asked for by difference — per-directory
+        // digests up, only the disagreeing directories down (baseline.rs
+        // `survey_in_background`). The cache is written before any answer
+        // can fail: a file that changed mid-hash costs one retry, not the
+        // selection's digests.
+        let listing =
+            for_pull.then(|| inventory_in_background(project, fp, ssh, &plan.excludes, deadline));
+        let local = cache.local(&fp.anchor, &plan.kept);
+        cache.save();
+        let local = local?;
+        let local_dirs = crate::baseline::directories(&fp.anchor, &plan.kept_dirs)?;
+        let answer = crate::baseline::survey_in_background(
+            ssh,
+            &project.remote_dir(),
+            &crate::baseline::remote_cache(project),
+            &local,
+            &local_dirs,
+            deadline,
+        );
+        let answer = answer.join().map_err(|_| {
+            fail!("the server content comparison did not finish")
+                .now("run ulak sync again; neither copy was chosen")
+                .into_err()
+        })??;
+        let listing = listing
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    fail!("the server's file inventory did not finish")
+                        .now("run ulak sync again")
+                        .into_err()
+                })?
+            })
+            .transpose()?;
+        let (remote, remote_dirs) = answer.merge(&local, &local_dirs)?;
+        Ok(Survey {
+            plan,
+            local,
+            remote,
+            local_dirs,
+            remote_dirs,
+            listing,
+            returning_when_listed,
+            common,
+            cache,
+        })
+    }
+
+    /// What a transfer just made equal, re-read on both ends and folded
+    /// back in, so the leg that follows sees the tree as it now is. Read
+    /// through the caches like the survey: a first population confirms
+    /// every file it sent, and the server's copies are new either way.
+    fn confirm(
+        &mut self,
+        ssh: &Ssh,
+        project: &Project,
+        fp: &Footprint,
+        names: &[Vec<u8>],
+        deadline: &crate::proc::Budget,
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let remote = crate::baseline::remote_in_background(
+            ssh,
+            &project.remote_dir(),
+            &crate::baseline::remote_cache(project),
+            names,
+            deadline,
+        );
+        let local = self.cache.local(&fp.anchor, names);
+        let (local, remote) = (local?, gathered(remote)?);
+        self.common
+            .record(crate::baseline::equal(&local, &remote))?;
+        self.local.extend(local);
+        self.remote.extend(remote);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.cache.save();
+        self.common.compact()
+    }
+}
+
+/// The server's half of a survey, collected after this machine's. A thread
+/// that panicked is reported like a failed comparison: neither copy is
+/// chosen.
+fn gathered(
+    remote: std::thread::JoinHandle<Result<crate::baseline::Contents>>,
+) -> Result<crate::baseline::Contents> {
+    remote.join().map_err(|_| {
+        fail!("the server content comparison did not finish")
+            .now("run ulak sync again; neither copy was chosen")
+            .into_err()
+    })?
+}
+
+/// Which surveyed leaves a push may send: every one whose content differs
+/// and whose server copy is absent or still the common ancestor — or,
+/// under `[sync] no_history = "send"`, has no ancestor on record. `held`
+/// are the rest — differing on both ends with proof, or no permission,
+/// that the server moved — so neither copy is chosen. A leaf gone from
+/// disk since the walk is neither: there is nothing to send and nothing
+/// to hold.
+fn push_selection(
+    no_history: crate::config::NoHistory,
+    base: &crate::baseline::Contents,
+    local: &crate::baseline::Contents,
+    remote: &crate::baseline::Contents,
+) -> (Vec<String>, Vec<String>) {
+    let mut held = Vec::new();
+    let mut selected = Vec::new();
+    for (p, l) in local {
+        let r = remote.get(p).and_then(Option::as_ref);
+        if !crate::baseline::may_push(
+            no_history,
+            base.get(p).and_then(Option::as_ref),
+            l.as_ref(),
+            r,
+        ) {
+            held.push(p.clone());
+        } else if l.is_some() && l.as_ref() != r {
+            selected.push(p.clone());
+        }
+    }
+    (held, selected)
+}
+
+/// The synced directories a push must still name: absent on the server,
+/// or carrying a different mode. rsync creates a named directory with its
+/// mode and without recursing, so an unchanged one costs nothing to omit.
+fn dir_selection(
+    local: &crate::baseline::Contents,
+    remote: &crate::baseline::Contents,
+) -> Vec<String> {
+    local
+        .iter()
+        .filter(|(p, l)| l.is_some() && l.as_ref() != remote.get(*p).and_then(Option::as_ref))
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// The mirror for the way down: server output may land only on a local
+/// copy that still IS the common ancestor; an unsent edit is held.
+fn pull_selection(
+    base: &crate::baseline::Contents,
+    local: &crate::baseline::Contents,
+    remote: &crate::baseline::Contents,
+) -> (Vec<String>, Vec<String>) {
+    let mut held = Vec::new();
+    let mut selected = Vec::new();
+    for (p, l) in local {
+        let r = remote.get(p).and_then(Option::as_ref);
+        if !crate::baseline::may_pull(base.get(p).and_then(Option::as_ref), l.as_ref(), r) {
+            held.push(p.clone());
+        } else if r.is_some() && l.as_ref() != r {
+            selected.push(p.clone());
+        }
+    }
+    (held, selected)
 }
 
 pub fn run_sync(
@@ -151,65 +1638,201 @@ pub fn run_sync(
     opts: &SyncOptions,
     deadline: &crate::proc::Budget,
 ) -> Result<SyncReport> {
-    let rsync_bin = local_rsync()?;
     let plan = checked_plan(project, fp)?;
+    if opts.dry_run {
+        return dry_run(project, fp, ssh, opts, &plan, deadline);
+    }
+    let (mut survey, doomed, doomed_dirs) = prepare(project, fp, ssh, plan, false, deadline)?;
+    let report = push(
+        project,
+        fp,
+        ssh,
+        opts,
+        &mut survey,
+        doomed,
+        doomed_dirs,
+        deadline,
+        &mut None,
+    )?;
+    survey.finish()?;
+    Ok(report)
+}
+
+/// What a real sync would do, told without a survey: a traversing
+/// `--dry-run` itemizes what rsync's quick check would send, and the
+/// ledger names what would be removed — less the rows a real sync would
+/// keep, judged over a read of their server copies that retires nothing
+/// (`preview_deletions`). The over-budget error sends people here to
+/// review the list, so it must not name a file the sync would keep.
+fn dry_run(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    plan: &walk::WalkReport,
+    deadline: &crate::proc::Budget,
+) -> Result<SyncReport> {
+    let rsync_bin = local_rsync()?;
     let state = project.state_key(&ssh.dest);
     let budget = opts
         .max_delete_override
         .unwrap_or(project.config.sync.max_delete);
+    let doomed = doomed_files(project, &state, &fp.anchor, &plan.kept);
+    let doomed_dirs = doomed_directories(project, &state, &fp.anchor);
+    let events = rsync_pass(
+        &rsync_bin,
+        project,
+        fp,
+        ssh,
+        &plan.excludes,
+        &[],
+        &["--dry-run"],
+        deadline,
+    )?
+    .or_fail()?;
+    let mut report = render_events(&events, opts.quiet);
+    let (doomed, doomed_dirs, kept) = if doomed.is_empty() {
+        (doomed, doomed_dirs, Vec::new())
+    } else {
+        let judged = crate::baseline::State::load(&state, &fp.anchor).and_then(|common| {
+            let copies = read_doomed(ssh, project, &doomed, deadline)?;
+            Ok((common, copies))
+        });
+        match judged {
+            Ok((common, copies)) => {
+                let (doomed, kept) = preview_deletions(doomed, &common, &copies);
+                (doomed, spare_dirs_above(doomed_dirs, &copies), kept)
+            }
+            Err(error) => {
+                ui::warn(&format!(
+                    "could not read the server's copies of the files a sync would delete, so every deletion is listed; a real sync stops on the same error: {}",
+                    ui::flatten(&error)
+                ));
+                (doomed, doomed_dirs, Vec::new())
+            }
+        }
+    };
+    for p in &doomed {
+        report.deleted += 1;
+        if !opts.quiet {
+            ui::dim(&format!("- {p}"));
+        }
+    }
+    for d in &doomed_dirs {
+        report.deleted += 1;
+        if !opts.quiet {
+            ui::dim(&format!("- {d}/"));
+        }
+    }
+    if !opts.quiet {
+        for line in &kept {
+            ui::dim(line);
+        }
+    }
+    summarize(&report, opts.quiet, true, budget);
+    if !budget.allows(doomed.len()) {
+        ui::warn(&format!(
+            "{} deletions exceed the budget of {budget} — a real sync will ask first",
+            doomed.len()
+        ));
+    }
+    Ok(report)
+}
+
+/// The ledger's doomed files (`ledger::doomed`) less every `[sync] protect`
+/// path: every place that asks what a sync would delete asks here. A
+/// protected path never enters the ledger, but a row claimed before its
+/// path was protected stays claimed, and protect means never deleted.
+/// Without this, the protect entry `held_warning` advises for a file the
+/// server owns changed nothing: the row stayed doomed, held and named on
+/// every sync, and deleted as soon as it could be read.
+fn doomed_files(
+    project: &Project,
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    kept: &[Vec<u8>],
+) -> Vec<String> {
+    let protect = &project.config.sync.protect;
+    let mut doomed = ledger::doomed(state, anchor, kept);
+    doomed.retain(|row| !walk::protected(protect, row));
+    doomed
+}
+
+/// `ledger::doomed_dirs` less every `[sync] protect` path, as
+/// `doomed_files` says.
+fn doomed_directories(
+    project: &Project,
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+) -> Vec<String> {
+    let protect = &project.config.sync.protect;
+    let mut doomed = ledger::doomed_dirs(state, anchor);
+    doomed.retain(|row| !walk::protected(protect, row));
+    doomed
+}
+
+/// What a push needs settled before the survey is worth taking: the
+/// doomed set from the ledger alone, and a workspace that exists on the
+/// server. baseline.py opens the project directory, so a first sync must
+/// create it first — and a re-layout empties it, which the survey then
+/// reads as it is rather than remembers as it was.
+fn prepare(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    plan: walk::WalkReport,
+    for_pull: bool,
+    deadline: &crate::proc::Budget,
+) -> Result<(Survey, Vec<String>, Vec<String>)> {
+    let state = project.state_key(&ssh.dest);
     // Computed BEFORE the push, from the ledger alone: no remote listing,
     // no second rsync pass, and the answer cannot change under us.
-    let mut doomed = ledger::doomed(&state, &fp.anchor, &plan.kept);
+    let mut doomed = doomed_files(project, &state, &fp.anchor, &plan.kept);
     // Directories go the same way, by their own command. They are kept
     // out of the BUDGET on purpose: the budget guards against destroying
     // work, and `rmdir` cannot — it refuses a directory that still holds
     // anything. A branch switch that retires forty directories is not the
     // kind of surprise the threshold exists to stop.
-    let mut doomed_dirs = ledger::doomed_dirs(&state, &fp.anchor);
-
-    if opts.dry_run {
-        let events = rsync_pass(
-            &rsync_bin,
-            project,
-            fp,
-            ssh,
-            &plan.excludes,
-            &["--dry-run"],
-            deadline,
-        )?
-        .or_fail()?;
-        let mut report = render_events(&events, opts.quiet);
-        for p in &doomed {
-            report.deleted += 1;
-            if !opts.quiet {
-                ui::dim(&format!("- {p}"));
-            }
-        }
-        for d in &doomed_dirs {
-            report.deleted += 1;
-            if !opts.quiet {
-                ui::dim(&format!("- {d}/"));
-            }
-        }
-        summarize(&report, opts.quiet, true, budget);
-        if !budget.allows(doomed.len()) {
-            ui::warn(&format!(
-                "{} deletions exceed the budget of {budget} — a real sync will ask first",
-                doomed.len()
-            ));
-        }
-        return Ok(report);
-    }
-
+    let mut doomed_dirs = doomed_directories(project, &state, &fp.anchor);
     on_layout(
         ensure_workspace(ssh, project)?,
         &state,
         &mut doomed,
         &mut doomed_dirs,
     );
-    let events = push_and_claim(&rsync_bin, project, fp, ssh, &plan, &state, deadline)?;
-    let mut report = render_events(&events, opts.quiet);
+    let survey = Survey::take(project, fp, ssh, plan, for_pull, deadline)?;
+    Ok((survey, doomed, doomed_dirs))
+}
 
+/// The way up, and the removals it licenses.
+#[allow(clippy::too_many_arguments)]
+fn push(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    opts: &SyncOptions,
+    survey: &mut Survey,
+    doomed: Vec<String>,
+    mut doomed_dirs: Vec<String>,
+    deadline: &crate::proc::Budget,
+    channel: &mut Option<crate::stream::Client>,
+) -> Result<SyncReport> {
+    let rsync_bin = local_rsync()?;
+    let state = project.state_key(&ssh.dest);
+    let budget = opts
+        .max_delete_override
+        .unwrap_or(project.config.sync.max_delete);
+    let events = push_and_claim(
+        &rsync_bin, project, fp, ssh, survey, &state, deadline, channel,
+    )?;
+    let mut report = render_events(&events, opts.quiet);
+    // Judged BEFORE the budget counts the rows: the judgements only read
+    // the server and retire claims, so they are safe even when the
+    // deletions then wait over budget, and a row the sync keeps must not
+    // be counted, prompted for or recorded as pending.
+    let copies = read_doomed(ssh, project, &doomed, deadline)?;
+    let mut doomed = judge_doomed(&state, &fp.anchor, &mut survey.common, &copies, doomed)?;
+    doomed_dirs = spare_dirs_above(doomed_dirs, &copies);
     if doomed.is_empty() && doomed_dirs.is_empty() {
         crate::invocation::record_pending_deletions(&state, 0);
         summarize(&report, opts.quiet, false, budget);
@@ -218,7 +1841,7 @@ pub fn run_sync(
 
     if !budget.allows(doomed.len()) {
         // No terminal to ask in (the daemon): push, report, carry on.
-        // Nothing is retired, so the rows stay exactly as they are —
+        // Nothing else is retired, so the rows stay exactly as they are —
         // which is what "those files are still up there" means, and what
         // lets the next sync name them again.
         if opts.over_budget == OverBudget::Report {
@@ -242,8 +1865,17 @@ pub fn run_sync(
             .now("or mark server-owned paths as protect in ulak.toml")
             .into_err());
         }
+        // The prompt waited on a person with no time limit, so the read
+        // judged above may be minutes old, and the removal script's
+        // `rm -f` compares nothing. A server edit made while the list was
+        // open is spared like any other: read and judge again, now.
+        let copies = read_doomed(ssh, project, &doomed, deadline)?;
+        doomed = judge_doomed(&state, &fp.anchor, &mut survey.common, &copies, doomed)?;
+        doomed_dirs = spare_dirs_above(doomed_dirs, &copies);
     }
 
+    // Listed after both judgements, so a row whose deletion is not
+    // applied is never shown as removed.
     if !opts.quiet {
         for p in &doomed {
             ui::dim(&format!("- {p}"));
@@ -256,6 +1888,7 @@ pub fn run_sync(
         }
     }
     let removal = delete_remote(ssh, project, &doomed, &doomed_dirs)?;
+    forget_removed(&mut survey.common, &removal.files)?;
     report.deleted += removal.count;
     summarize(&report, opts.quiet, false, budget);
     // Only what the server REALLY lost is un-claimed. A `rmdir` the
@@ -270,6 +1903,180 @@ pub fn run_sync(
     report.pending_deletions = removal.kept_files;
     crate::invocation::record_pending_deletions(&state, removal.kept_files);
     Ok(report)
+}
+
+/// The server's copies of the doomed rows, read for the deletion
+/// judgements in one request (`baseline::verdicts`): a copy, a structural
+/// verdict or a hold for every row. It fails only when the helper does not
+/// answer, and that is an error like any SSH failure: nothing is judged,
+/// deferred or recorded as pending.
+fn read_doomed(
+    ssh: &Ssh,
+    project: &Project,
+    doomed: &[String],
+    deadline: &crate::proc::Budget,
+) -> Result<crate::baseline::Copies> {
+    crate::baseline::verdicts(ssh, &project.remote_dir(), doomed, deadline)
+}
+
+/// Every deletion judgement over `copies`, the server's copies of `doomed`
+/// as the caller just read them (`read_doomed`): `set_aside`, then
+/// `retire_never_landed`, then `retire_moved`. The rows left are deleted;
+/// no row is removed without a judgement over its server copy.
+fn judge_doomed(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    copies: &crate::baseline::Copies,
+    doomed: Vec<String>,
+) -> Result<Vec<String>> {
+    let doomed = set_aside(state, anchor, common, copies, doomed)?;
+    let doomed = retire_never_landed(state, anchor, common, &copies.remote, doomed)?;
+    retire_moved(state, anchor, common, &copies.remote, doomed)
+}
+
+/// `doomed` split by baseline.py's verdicts: the rows whose server copy
+/// was read, the rows the server restructured, and the rows held this
+/// round.
+fn split_verdicts(
+    doomed: Vec<String>,
+    copies: &crate::baseline::Copies,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (mut read, mut restructured, mut held) = (Vec::new(), Vec::new(), Vec::new());
+    for row in doomed {
+        if copies.structural.contains_key(&row) {
+            restructured.push(row);
+        } else if copies.held.contains_key(&row) {
+            held.push(row);
+        } else {
+            read.push(row);
+        }
+    }
+    (read, restructured, held)
+}
+
+/// `doomed` without the rows baseline.py could not judge, none of which is
+/// deleted: `retire_restructured` stops tracking the rows the server
+/// restructured, and `hold_unreadable` keeps the claim of the rows that
+/// cannot be read right now. Neither stops the sync.
+fn set_aside(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    copies: &crate::baseline::Copies,
+    doomed: Vec<String>,
+) -> Result<Vec<String>> {
+    let (doomed, restructured, held) = split_verdicts(doomed, copies);
+    retire_restructured(state, anchor, common, copies, &restructured)?;
+    hold_unreadable(copies, &held);
+    Ok(doomed)
+}
+
+/// The rows whose path the server restructured: a parent is no longer a
+/// real directory, or the leaf is neither a regular file nor a symlink.
+/// Such a row can never be judged, and ulak does not delete through a
+/// path the server restructured, so it stays on the server and leaves
+/// ulak's tracking: its claim is retired, its unconfirmed sends are
+/// settled, and any return ends first, since a mark on an unclaimed name
+/// would claim a later file. No return is marked, because no pull lands a
+/// file through that path. One warning names them all, each with the
+/// server's reason.
+fn retire_restructured(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    copies: &crate::baseline::Copies,
+    restructured: &[String],
+) -> Result<()> {
+    if restructured.is_empty() {
+        return Ok(());
+    }
+    common.end_return(restructured)?;
+    common.settle(restructured)?;
+    ledger::store(state, anchor, &[], restructured, &[]);
+    ui::warn(&restructured_warning(copies, restructured));
+    Ok(())
+}
+
+/// The warning `retire_restructured` gives, split from the printing for
+/// the reason `slipped_past_the_ignores` is.
+fn restructured_warning(copies: &crate::baseline::Copies, restructured: &[String]) -> String {
+    let rows: Vec<String> = restructured
+        .iter()
+        .map(|p| format!("{p} ({})", copies.structural[p]))
+        .collect();
+    let them = if restructured.len() == 1 {
+        "it"
+    } else {
+        "them"
+    };
+    format!(
+        "the server changed the structure of the path to {}, so ulak left {them} there and stopped tracking {them}; your deletion was not applied",
+        rows.join(", ")
+    )
+}
+
+/// The rows baseline.py could not read this time: a file changing while
+/// it was read, one the SSH user may not read, or any other error. Their
+/// deletion waits and their claim stays, so they never enter the pull's
+/// creating pass, and the next sync judges them again. Retiring them as
+/// restructured instead turned a file caught mid-write into one ulak no
+/// longer tracked, and a file the SSH user may not read into a
+/// creating-pass candidate that failed every later pull.
+fn hold_unreadable(copies: &crate::baseline::Copies, held: &[String]) {
+    if let Some(warning) = held_warning(copies, held) {
+        ui::warn(&warning);
+    }
+}
+
+/// The warning `hold_unreadable` gives, split from the printing for the
+/// reason `slipped_past_the_ignores` is. A file the SSH user may not read
+/// is the server's own, and `[sync] protect` is how to say so; protected
+/// rows are never doomed (`doomed_files`), so that ends the warning.
+fn held_warning(copies: &crate::baseline::Copies, held: &[String]) -> Option<String> {
+    if held.is_empty() {
+        return None;
+    }
+    let rows: Vec<String> = held
+        .iter()
+        .map(|p| format!("{p} ({})", copies.held[p].why))
+        .collect();
+    let them = if held.len() == 1 { "it" } else { "them" };
+    let mut warning = format!(
+        "ulak could not read the server's copy of {} and left {them} there; your deletion waits, and the next sync tries again",
+        rows.join(", ")
+    );
+    let denied: Vec<&str> = held
+        .iter()
+        .filter(|p| copies.held[*p].denied)
+        .map(String::as_str)
+        .collect();
+    if !denied.is_empty() {
+        warning.push_str(&format!(
+            "; if the server owns {}, add {} to [sync] protect in ulak.toml",
+            denied.join(", "),
+            if denied.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    Some(warning)
+}
+
+/// `doomed_dirs` less every directory row above a row baseline.py could
+/// not judge this round. What such a directory holds is not ulak's to
+/// judge now, and `rmdir -p` resolves every component of the path it is
+/// given: a row under a parent the server turned into a symlink removed
+/// an empty directory from wherever the symlink pointed.
+fn spare_dirs_above(doomed_dirs: Vec<String>, copies: &crate::baseline::Copies) -> Vec<String> {
+    doomed_dirs
+        .into_iter()
+        .filter(|dir| {
+            !copies
+                .structural
+                .keys()
+                .chain(copies.held.keys())
+                .any(|row| walk::protect_covers(dir, row))
+        })
+        .collect()
 }
 
 /// The Relaid answer, acted on in one place because two push paths ask
@@ -313,47 +2120,172 @@ fn on_layout(
 /// unclaimed file can never be retired (nothing `doomed` can name it),
 /// and `pull_back`'s creating pass is free to plant it back in the repo
 /// after the user deletes it.
+#[allow(clippy::too_many_arguments)]
 fn push_and_claim(
     rsync_bin: &PathBuf,
     project: &Project,
     fp: &Footprint,
     ssh: &Ssh,
-    plan: &walk::WalkReport,
+    survey: &mut Survey,
     state: &crate::config::WorkspaceStateKey,
     deadline: &crate::proc::Budget,
+    channel: &mut Option<crate::stream::Client>,
 ) -> Result<Vec<Event>> {
-    let last = crate::invocation::last_push_window(state);
-    let from = std::time::SystemTime::now();
-    let mut pass = rsync_pass(rsync_bin, project, fp, ssh, &plan.excludes, &[], deadline)?;
-    // From the PREVIOUS push's window, never this one's: a second that is
-    // still running can still take another save, so re-offering inside it
-    // settles nothing.
-    let hidden = last
-        .map(|w| hidden_by_the_quick_check(&fp.anchor, &plan.kept, w))
-        .unwrap_or_default();
-    let settled = hidden.is_empty()
-        || match offer_again(rsync_bin, project, ssh, fp, &hidden, deadline) {
-            Ok(again) => {
-                pass.also(again);
-                true
-            }
-            Err(e) => {
-                pass.failed.get_or_insert(e);
-                false
-            }
-        };
-    // Recorded before the failure is raised, like the claim below: this
-    // pass has had files open, and the NEXT one has to ask about those
-    // seconds. A catch-up that did not run keeps the old window's start —
-    // dropping it would strand those files for good.
-    crate::invocation::record_push_window(
-        state,
-        match settled {
-            true => from,
-            false => last.map_or(from, |(f, _)| f),
-        },
-        crate::invocation::now_secs(),
+    let (mut held, selected) = push_selection(
+        project.config.sync.no_history,
+        &survey.common.entries,
+        &survey.local,
+        &survey.remote,
     );
+    say_what_no_history_sends(
+        &selected,
+        &survey.common.entries,
+        &survey.local,
+        &survey.remote,
+    );
+    for p in &held {
+        if !crate::baseline::may_pull(
+            survey.common.get(p),
+            survey.local.get(p).and_then(Option::as_ref),
+            survey.remote.get(p).and_then(Option::as_ref),
+        ) {
+            ui::warn(&format!(
+                "sync conflict: {p} — both copies are preserved; make their contents agree to resume syncing this file"
+            ));
+        }
+    }
+    survey
+        .common
+        .record(crate::baseline::equal(&survey.local, &survey.remote))?;
+    let mut confirmed = false;
+    let pass = if selected.len() > EXACT_PASS_LIMIT {
+        // The traversal judges by size and second, which cannot tell a
+        // selected leaf from its same-size server copy; `--checksum` can,
+        // and is owed only when some selected leaf HAS a server copy. A
+        // first population has none, and the sender's checksum of every
+        // file would be its only cost.
+        let existing = selected
+            .iter()
+            .any(|p| survey.remote.get(p).is_some_and(Option::is_some));
+        rsync_pass(
+            rsync_bin,
+            project,
+            fp,
+            ssh,
+            &survey.plan.excludes,
+            &held,
+            if existing { &["--checksum"] } else { &[] },
+            deadline,
+        )?
+    } else {
+        // The survey said which leaves and which directories differ. Small
+        // leaves under existing directories go over the channel in one
+        // exchange, claimed first and recorded from the receipt. Otherwise
+        // rsync creates a named directory with its mode and without
+        // recursing, and the missing parents of a named file (pinned by
+        // `a_directory_named_to_a_selected_pass_is_created`); nothing
+        // selected means no rsync at all.
+        let dirs = dir_selection(&survey.local_dirs, &survey.remote_dirs);
+        let mut for_rsync = selected.clone();
+        let mut streamed = None;
+        if dirs.is_empty() && !selected.is_empty() {
+            let mut batch = crate::stream::Batch::new();
+            let fits = selected.iter().all(|p| {
+                let create = !survey.remote.get(p).is_some_and(Option::is_some);
+                survey.cache.stamp_of(p).is_some_and(|stamp| {
+                    batch
+                        .add(&fp.anchor, &fp.anchor.join(p), stamp, create)
+                        .is_some()
+                })
+            });
+            if fits {
+                // Guarded on the server's copy AS SURVEYED, not on the
+                // common record: `push_selection` has already applied the
+                // record's rule (and `no_history`) to decide these may go
+                // over the server's copy, so the exchange has only to
+                // catch the server moving since. Guarding on the record
+                // refused every no-history send as "differs" — measured:
+                // a wiped runner's second job never reached the server.
+                batch.guard(&survey.remote);
+                let accepted = batch.contents();
+                let written = batch.written();
+                let already = ledger::synced_files(state);
+                let fresh = fresh_claims(&written, |name| {
+                    already.iter().any(|row| row.as_slice() == name.as_bytes())
+                });
+                // Claimed BEFORE the exchange, beside an unconfirmed record
+                // of what is sent (`fresh_claims`, `unconfirmed_sends`).
+                // The protective record first: a failed or interrupted
+                // write must never leave a claim without it.
+                let sends = unconfirmed_sends(&fresh, &survey.common, &accepted);
+                survey.common.record_unconfirmed(sends.clone())?;
+                ledger::store(state, &fp.anchor, &written, &[], &[]);
+                let sent = channel_send(project, ssh, channel, batch);
+                // A lost exchange — `Lost`, or its fence failing — may have
+                // applied the replaces too (`attempted`); rsync, or the
+                // error, comes after the record.
+                if matches!(sent, Ok(Sent::Lost) | Err(_)) {
+                    let replaced = attempted(&survey.common, &accepted)
+                        .into_iter()
+                        .filter(|(p, _)| !sends.contains_key(p))
+                        .collect();
+                    survey.common.record_unconfirmed(replaced)?;
+                }
+                match sent? {
+                    Sent::Applied(applied) => streamed = Some((applied, accepted)),
+                    Sent::Refused(refused) => {
+                        // Nothing landed. A create's missing parent goes
+                        // to rsync; the rest moved on the server since the
+                        // survey and are held, their fresh claims retired.
+                        let (rest, kept_back) = split_refusal(&selected, &refused);
+                        let retire: Vec<String> = kept_back
+                            .iter()
+                            .map(|(p, _)| p.clone())
+                            .filter(|p| fresh.contains(p))
+                            .collect();
+                        ledger::store(state, &fp.anchor, &[], &retire, &[]);
+                        survey.common.settle(&retire)?;
+                        for (p, reason) in &kept_back {
+                            ui::warn(&format!(
+                                "sync conflict: {p} — the server's copy of it {reason} since the survey; both copies are preserved and the next sync decides again"
+                            ));
+                            held.push(p.clone());
+                        }
+                        for_rsync = rest;
+                    }
+                    Sent::Unavailable | Sent::Lost => {}
+                }
+            }
+        }
+        match streamed {
+            Some((applied, accepted)) => {
+                survey.common.record(accepted.clone())?;
+                survey.remote.extend(accepted);
+                confirmed = true;
+                Pass {
+                    events: applied.changed.into_iter().map(Event::Push).collect(),
+                    failed: None,
+                }
+            }
+            None => {
+                let mut names: Vec<Vec<u8>> =
+                    for_rsync.iter().map(|p| p.as_bytes().to_vec()).collect();
+                names.extend(dirs.into_iter().map(String::into_bytes));
+                rsync_pass_dir(
+                    rsync_bin,
+                    project,
+                    fp,
+                    ssh,
+                    &survey.plan.excludes,
+                    &[],
+                    &["--checksum"],
+                    Direction::Up,
+                    Some(&names),
+                    deadline,
+                )?
+            }
+        }
+    };
     // Claimed BEFORE the failure is raised, and this order is the whole
     // point. A pass that exits 23 — one unreadable file in a tree that
     // otherwise arrived — has still put files on the server. Returning
@@ -362,9 +2294,382 @@ fn push_and_claim(
     // there forever, and `pull_back`'s creating pass was free to plant
     // it back in the repo. That is the same hole `claim` was written to
     // close, one exit code over.
-    let claimed = claim(&plan.kept, &plan.kept_dirs, &pass.events);
+    let kept: Vec<_> = survey
+        .plan
+        .kept
+        .iter()
+        .filter(|p| !held.iter().any(|h| h.as_bytes() == p.as_slice()))
+        .cloned()
+        .collect();
+    let claimed = claim(&kept, &survey.plan.kept_dirs, &pass.events);
     ledger::store(state, &fp.anchor, &claimed, &[], &[]);
-    pass.or_fail()
+    // A claim ends a return (module header). The claim made before the
+    // exchange does not end one: a refusal retires that claim again, and
+    // the name must then still be returning.
+    survey.common.end_return(&claimed)?;
+    let events = pass.or_fail()?;
+    if !confirmed {
+        survey.confirm(ssh, project, fp, &event_paths(&events), deadline)?;
+    }
+    Ok(events)
+}
+
+/// Whether a ledger-claimed file that is gone locally may still be
+/// removed from the server: only a KNOWN and differing last-agreed content
+/// says the server changed it since — container output the deletion
+/// would destroy. With no record at all the ledger's claim stands on its
+/// own, as it did before content records existed: a claimed file from an
+/// older ulak, or one whose confirmation was lost to a crash or to a
+/// delete that landed before it, must not become undeletable forever.
+/// Measured: a file created and deleted within the confirmation round
+/// trip left the service refusing the same deletion on every tick.
+///
+/// A server copy among ulak's own unconfirmed sends (`sent`, the evidence
+/// `never_landed` reads) is not a change either: a lost receipt leaves
+/// the record at the older content while the server holds the upload,
+/// and calling that the server's edit would bring the deleted file back.
+///
+/// A row this names is not an error: the server's edit wins over the
+/// deletion (`retire_moved`), and the pull brings that copy home.
+fn moved_on_the_server(
+    common: Option<&String>,
+    sent: Option<&std::collections::BTreeSet<String>>,
+    remote: Option<&String>,
+) -> bool {
+    matches!((common, remote), (Some(c), Some(r)) if c != r && !sent.is_some_and(|s| s.contains(r)))
+}
+
+/// `doomed` split by `moved_on_the_server`: the rows whose deletion
+/// stands, and the rows the server changed since the last agreed content.
+fn split_moved(
+    doomed: Vec<String>,
+    common: &crate::baseline::State,
+    remote: &crate::baseline::Contents,
+) -> (Vec<String>, Vec<String>) {
+    doomed.into_iter().partition(|p| {
+        !moved_on_the_server(
+            common.get(p),
+            common.unconfirmed(p),
+            remote.get(p).and_then(Option::as_ref),
+        )
+    })
+}
+
+/// `doomed` without the rows the server changed since the last agreed
+/// content. Their deletion is not applied: each is marked returning
+/// before its claim is retired, like `retire_never_landed` retires one,
+/// so the pull's creating pass takes the server's copy as server-born and
+/// brings it home, and `claim_returned` claims it again once it has. Every
+/// other deletion goes ahead. An error here would stop every later sync
+/// the same way, until someone reconciled the file by hand on one end.
+fn retire_moved(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    remote: &crate::baseline::Contents,
+    doomed: Vec<String>,
+) -> Result<Vec<String>> {
+    let (doomed, moved) = split_moved(doomed, common, remote);
+    if !moved.is_empty() {
+        common.mark_returning(&moved)?;
+        ledger::store(state, anchor, &[], &moved, &[]);
+        common.settle(&moved)?;
+        for p in &moved {
+            ui::warn(&format!(
+                "{p} changed on the server after it was last synced, so your deletion was not applied; the server's copy comes back"
+            ));
+        }
+    }
+    Ok(doomed)
+}
+
+/// The returning files (`baseline::State::returning`) a creating pass
+/// just landed. A returning name that did not land — held back, refused,
+/// or recreated here meanwhile — stays returning for a later pull.
+fn landed_back(common: &crate::baseline::State, created: &[Event]) -> Vec<String> {
+    created
+        .iter()
+        .filter_map(|e| match e {
+            Event::Push(p) if common.returning(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The returning files (`baseline::State::returning`) a pull's listing
+/// shows the server no longer holds: `marked` before the listing was asked
+/// for, inside what it covers — under one of its roots, outside what it
+/// prunes and what the pull excludes — yet absent from it, and neither
+/// claimed nor here. Nothing is left to come home under such a name. Its
+/// mark left standing claimed the next same-named file the server made,
+/// as it landed, and deleting that file here then removed the server's
+/// own file from the server. `unclaimed` is the listing as
+/// `selection::unclaimed` read it; an unclaimed, unexcluded name is in it
+/// exactly when the server listed it.
+fn returns_the_server_lost(
+    marked: &std::collections::BTreeSet<String>,
+    unclaimed: &[Vec<u8>],
+    claimed: &[Vec<u8>],
+    excluded: &crate::selection::Excludes,
+    (roots, pruned): &(
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ),
+    anchor: &std::path::Path,
+) -> Vec<String> {
+    let listed_under = |root: &str, name: &str| {
+        root == "." || walk::protect_covers(root.strip_prefix("./").unwrap_or(root), name)
+    };
+    marked
+        .iter()
+        .filter(|name| {
+            let raw = name.as_bytes();
+            roots.iter().any(|root| listed_under(root, name))
+                && !pruned.iter().any(|p| walk::protect_covers(p, name))
+                && !excluded.contains(raw)
+                && !unclaimed.iter().any(|u| u == raw)
+                && !claimed.iter().any(|c| c == raw)
+                && std::fs::symlink_metadata(anchor.join(name))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Claim the returning files a pull landed and end their return. Without
+/// the claim the file is server-born from then on: deleting it here a
+/// second time dooms nothing, and every pull brings it back. The claim
+/// comes first: an interruption between the two leaves a mark on a
+/// claimed name, which no landing reads, where the other order leaves the
+/// landed file unclaimed with no mark to claim it by.
+fn claim_returned(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    landed: &[String],
+) -> Result<()> {
+    if landed.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<Vec<u8>> = landed.iter().map(|p| p.as_bytes().to_vec()).collect();
+    ledger::store(state, anchor, &rows, &[], &[]);
+    common.end_return(landed)
+}
+
+/// What a removal the server confirmed does to the common record: the
+/// names go to None, as the channel's unlink records them
+/// (`stream::Batch::contents`), which also settles their unconfirmed
+/// sends and ends any return. Settling alone kept the last agreed
+/// content of a file that no longer exists, and a later upload under the
+/// name whose receipt was lost then read as the server's change
+/// (`moved_on_the_server`).
+fn forget_removed(common: &mut crate::baseline::State, removed: &[String]) -> Result<()> {
+    let gone = removed
+        .iter()
+        .filter(|p| {
+            common.get(p).is_some() || common.unconfirmed(p).is_some() || common.returning(p)
+        })
+        .map(|p| (p.clone(), None))
+        .collect();
+    common.record(gone)
+}
+
+/// What a dry run says of the doomed rows: those a real sync would
+/// delete, and a line for each one it would keep, split by the same
+/// judgements as `judge_doomed` without retiring anything — a dry run
+/// writes nothing. Split from the printing for the reason
+/// `slipped_past_the_ignores` is.
+fn preview_deletions(
+    doomed: Vec<String>,
+    common: &crate::baseline::State,
+    copies: &crate::baseline::Copies,
+) -> (Vec<String>, Vec<String>) {
+    let (doomed, restructured, held) = split_verdicts(doomed, copies);
+    let (foreign, doomed) = split_never_landed(doomed, common, &copies.remote);
+    let (doomed, moved) = split_moved(doomed, common, &copies.remote);
+    let kept = restructured
+        .iter()
+        .map(|p| format!("kept: {p} (the server changed the structure of its path: {}; ulak leaves it there and stops tracking it)", copies.structural[p]))
+        .chain(held.iter().map(|p| {
+            format!("kept: {p} (the server's copy cannot be read right now: {}; the next sync tries again)", copies.held[p].why)
+        }))
+        .chain(foreign.iter().map(|p| {
+            format!("kept: {p} (ulak's own send of it never landed; the server's file comes home)")
+        }))
+        .chain(moved.iter().map(|p| {
+            format!("kept: {p} (changed on the server since it was last synced; the server's copy comes home)")
+        }))
+        .collect();
+    (doomed, kept)
+}
+
+/// Whether a claimed row stands only on a send whose receipt was lost
+/// (`baseline::State::unconfirmed`) and the server holds something else
+/// under the name: the send never landed, the claim was never true, and
+/// the file there is the server's own. Deleting it on the claim's word
+/// would destroy server work; `retire_never_landed` retires the claim
+/// instead and leaves the file for a pull to bring home.
+fn never_landed(
+    common: Option<&String>,
+    sent: Option<&std::collections::BTreeSet<String>>,
+    remote: Option<&String>,
+) -> bool {
+    common.is_none() && matches!((sent, remote), (Some(s), Some(r)) if !s.contains(r))
+}
+
+/// What a batch would put under the names it claims fresh, recorded as
+/// unconfirmed BEFORE the exchange: a receipt lost to the network, a
+/// fence that cannot reach the server, or a process killed mid-exchange
+/// all leave the claim standing with the record beside it. A definite
+/// answer settles it — a refusal at once, an applied batch by recording
+/// the agreed content, an rsync fallback by the survey's confirmation.
+///
+/// A name counts when its claim is fresh or when an earlier send of it is
+/// still unconfirmed: a retry whose receipt is lost again may be the copy
+/// that arrived (measured — the second upload was judged
+/// server-born and would have come back after a local delete).
+fn unconfirmed_sends(
+    fresh: &[String],
+    common: &crate::baseline::State,
+    accepted: &crate::baseline::Contents,
+) -> std::collections::BTreeMap<String, String> {
+    accepted
+        .iter()
+        .filter(|(p, _)| fresh.contains(p) || common.unconfirmed(p).is_some())
+        .filter_map(|(p, c)| Some((p.clone(), c.clone()?)))
+        .collect()
+}
+
+/// Every content a batch tried to put on the server, for the record a
+/// LOST receipt leaves. `unconfirmed_sends` records fresh claims before
+/// the exchange; a replace of a claimed leaf is recorded only here, after
+/// the loss, so an acknowledged save writes no extra state. Without it
+/// the record keeps the older content while the server may hold the
+/// upload, and a local delete before the next survey reads that upload
+/// as the server's change (`moved_on_the_server`) and brings it back.
+///
+/// Only a name with agreed content counts, the one case
+/// `moved_on_the_server` reads the record for. A claim with no agreed
+/// content stands on the ledger's word; recording a lost replace of it
+/// made `never_landed` read the claim as a send that never arrived, keep
+/// the server's copy and bring a deleted file back unclaimed.
+fn attempted(
+    common: &crate::baseline::State,
+    accepted: &crate::baseline::Contents,
+) -> std::collections::BTreeMap<String, String> {
+    accepted
+        .iter()
+        .filter(|(p, _)| common.get(p).is_some())
+        .filter_map(|(p, c)| Some((p.clone(), c.clone()?)))
+        .collect()
+}
+
+/// `doomed` split by `never_landed`: the rows it names first, then the
+/// rows whose deletion stands.
+fn split_never_landed(
+    doomed: Vec<String>,
+    common: &crate::baseline::State,
+    remote: &crate::baseline::Contents,
+) -> (Vec<String>, Vec<String>) {
+    doomed.into_iter().partition(|p| {
+        never_landed(
+            common.get(p),
+            common.unconfirmed(p),
+            remote.get(p).and_then(Option::as_ref),
+        )
+    })
+}
+
+/// `doomed` without the rows `never_landed` names, whose claims are
+/// retired and whose unconfirmed sends are settled here. The file there
+/// is the server's own, so it comes home unclaimed and any return under
+/// the name ends.
+fn retire_never_landed(
+    state: &crate::config::WorkspaceStateKey,
+    anchor: &std::path::Path,
+    common: &mut crate::baseline::State,
+    remote: &crate::baseline::Contents,
+    doomed: Vec<String>,
+) -> Result<Vec<String>> {
+    let (foreign, doomed) = split_never_landed(doomed, common, remote);
+    if !foreign.is_empty() {
+        ledger::store(state, anchor, &[], &foreign, &[]);
+        common.settle(&foreign)?;
+        common.end_return(&foreign)?;
+        for p in &foreign {
+            ui::dim(&format!(
+                "{p} stays on the server: ulak's own send of it never landed there"
+            ));
+        }
+    }
+    Ok(doomed)
+}
+
+/// The leaves a push sends over a differing server copy with no common
+/// content on record — what `[sync] no_history = "send"` decided. Split
+/// from the warning for the reason `slipped_past_the_ignores` is.
+fn sent_without_history<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+    base: &crate::baseline::Contents,
+    local: &crate::baseline::Contents,
+    remote: &crate::baseline::Contents,
+) -> Vec<&'a String> {
+    names
+        .into_iter()
+        .filter(|p| {
+            base.get(*p).and_then(Option::as_ref).is_none()
+                && local.get(*p).is_some_and(Option::is_some)
+                && remote.get(*p).is_some_and(Option::is_some)
+                && remote.get(*p) != local.get(*p)
+        })
+        .collect()
+}
+
+/// Said out loud, per file, on every path that sends: the server held
+/// different bytes with no shared history, and this machine's copy is
+/// going over them.
+fn say_what_no_history_sends<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+    base: &crate::baseline::Contents,
+    local: &crate::baseline::Contents,
+    remote: &crate::baseline::Contents,
+) {
+    for p in sent_without_history(names, base, local, remote) {
+        ui::warn(&format!(
+            "sync: {p} — no shared history; the local copy is sent over the server's (set [sync] no_history = \"hold\" to keep both instead)"
+        ));
+    }
+}
+
+fn content_conflict(detail: &str) -> anyhow::Error {
+    fail!("sync preserved differing copies: {detail}")
+        .now("compare the local and server files, preserve the desired edits on both sides, then run ulak sync")
+        .into_err()
+}
+
+fn event_paths(events: &[Event]) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Push(p) if !p.ends_with('/') => Some(p.as_bytes().to_vec()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn remember_common(
+    common: &mut crate::baseline::State,
+    ssh: &Ssh,
+    project: &Project,
+    fp: &Footprint,
+    names: &[Vec<u8>],
+    deadline: &crate::proc::Budget,
+) -> Result<()> {
+    let remote = crate::baseline::remote(ssh, &project.remote_dir(), names, deadline)?;
+    let local = crate::baseline::local(&fp.anchor, names)?;
+    common.record(crate::baseline::equal(&local, &remote))
 }
 
 /// What the ledger must claim after a push: the walk's answer PLUS
@@ -420,9 +2725,12 @@ fn claim(kept: &[Vec<u8>], kept_dirs: &[Vec<u8>], events: &[Event]) -> Vec<Vec<u
 /// So the pull is two rsync passes, and that shape is the fix. Pass one
 /// carries `--existing`: it refreshes what is here and creates nothing,
 /// not even a directory (measured). Pass two carries
-/// `--ignore-existing` and hands rsync every FILE row the ledger holds
-/// as an exclude: it can only ever create, and only what ulak never
-/// put there.
+/// `--ignore-existing` and receives only remote leaves absent from the
+/// ledger. Membership is evaluated by selection.rs, not an ordered rsync
+/// filter list: a large ledger otherwise makes every remote candidate
+/// visit thousands of exclusion rules. Only the creation pass uses
+/// non-recursive `--files-from`; the existing-file pass traverses the
+/// footprint with its ordinary filters (see the module header).
 ///
 /// **Why it had to be structural.** This used to be one pass with a hold
 /// list — the paths the ledger claims that are gone from disk, worked
@@ -441,23 +2749,18 @@ fn claim(kept: &[Vec<u8>], kept_dirs: &[Vec<u8>], events: &[Event]) -> Vec<Vec<u
 /// the transfer cannot win that race, so the rule is structural instead.
 /// Neither pass asks what is on disk right now. `--existing` puts that
 /// question to rsync at the instant of transfer, and pass two takes its
-/// exclude list from the ledger instead.
+/// candidate set from the ledger instead.
 ///
-/// That second half is only safe under the per-workspace lock, which is
-/// where `reconcile_once` reads it. `passthrough::run` does NOT hold it:
-/// it drops the lock before every compose subcommand that is in
-/// neither `READ_ONLY` nor `TREE_READERS` (`exec`, `stop`, `kill`,
-/// `rm`, `cp`, …) and pulls afterwards, unlocked — so the service can
-/// be inside `reconcile_once` at that moment, rewriting the same ledger
-/// file. A read that came back SHORT used to be the danger there: rows
-/// missing from pass two's exclude list are rows `--ignore-existing` is
-/// free to create, re-creating the file the user just deleted.
-/// `ledger::store` now writes through a rename, so what this read gets is
-/// always one whole ledger — the one before that write or the one after,
-/// never half of either. What is still open is the other order: the
-/// unlocked writer's own read-modify-write can lose the concurrent
-/// writer's rows, because nothing serialises the two. Closing that means
-/// holding the per-workspace lock across the passthrough pull.
+/// That second half is only safe under the per-workspace lock, and so is
+/// the ledger write a pull makes itself (`claim_returned`). Every caller
+/// holds it: `reconcile_once` and the service reconcile under it, and a
+/// command that gave it up while it ran takes it again before `pull_back`
+/// (`passthrough::run` after `exec`, `stop` and the like;
+/// `runspec::pull_home` after a foreground run). Unlocked, a service tick
+/// could be inside `reconcile_once` at that moment, rewriting the same
+/// ledger file, and either writer's read-modify-write could lose the
+/// other's rows. `nothing_reaches_the_ledger_without_the_workspace_lock`
+/// pins it.
 ///
 /// `--prune-empty-dirs` stays on both, for the directory half of the
 /// same rule: a directory whose every file was filtered out does not
@@ -484,16 +2787,18 @@ fn claim(kept: &[Vec<u8>], kept_dirs: &[Vec<u8>], events: &[Event]) -> Vec<Vec<u
 /// The cost is one stat per synced path, on inodes the walk has just
 /// touched, plus the second pass: measured on a mid-sized workspace,
 /// 0.66 s became 1.47 s.
-pub fn pull_back(
+#[allow(clippy::too_many_arguments)]
+fn pull(
     project: &Project,
     fp: &Footprint,
     ssh: &Ssh,
     quiet: bool,
+    survey: &mut Survey,
     deadline: &crate::proc::Budget,
     since: Option<std::time::SystemTime>,
+    channel: &mut Option<crate::stream::Client>,
 ) -> Result<SyncReport> {
     let rsync_bin = local_rsync()?;
-    let plan = checked_plan(project, fp)?;
     let state = project.state_key(&ssh.dest);
     // Every hold is lifted to the highest ancestor that is missing here.
     // `touched_since` names a file that existed when it was stat-ed, and
@@ -502,51 +2807,163 @@ pub fn pull_back(
     // suite. Excluding just the file would let the footprint's
     // `+ dir/***` create the empty parent HERE.
     let mut held_back: Vec<String> = since
-        .map(|since| touched_since(&fp.anchor, &plan.kept, since))
+        .map(|since| touched_since(&fp.anchor, &survey.plan.kept, since))
         .unwrap_or_default()
         .iter()
         .map(|rel| hold_at_the_highest_gap(&fp.anchor, rel))
         .collect();
+    let (held, selected) = pull_selection(&survey.common.entries, &survey.local, &survey.remote);
+    held_back.extend(held);
+    survey
+        .common
+        .record(crate::baseline::equal(&survey.local, &survey.remote))?;
     held_back.sort();
     held_back.dedup();
 
     // Pass one: refresh what is already here. `--existing` is the whole
     // guarantee — it creates nothing at all, so no deletion can be
-    // undone by it, whenever the deletion happens to land.
-    let mut events = rsync_pass_dir(
-        &rsync_bin,
-        project,
-        fp,
-        ssh,
-        &plan.excludes,
-        &held_back,
-        &["--update", "--existing", "--prune-empty-dirs"],
-        Direction::Down,
-        deadline,
-    )?
-    .or_fail()?;
-    // Pass two: bring home what the stack invented. It can only create
-    // (`--ignore-existing`), and every path ulak itself put in the
-    // workspace is excluded, so the only thing it can create is the
-    // container's own work. The exclude list rides the same stdin channel
-    // as the ignores, which already outranks the footprint's includes —
-    // so no filter rule had to move.
-    let mut unclaimed = plan.excludes.clone();
-    unclaimed.extend(ledger::synced_files(&state));
-    let invented = rsync_pass_dir(
-        &rsync_bin,
-        project,
-        fp,
-        ssh,
-        &unclaimed,
-        &held_back,
-        &["--ignore-existing", "--prune-empty-dirs"],
-        Direction::Down,
-        deadline,
-    )?
-    .or_fail()?;
+    // undone by it, whenever the deletion happens to land. The survey
+    // names the leaves the server rewrote; the tree is traversed only
+    // when that list is long.
+    let refresh = ["--checksum", "--update", "--existing", "--prune-empty-dirs"];
+    let excluded = crate::selection::Excludes::new(
+        survey
+            .plan
+            .excludes
+            .iter()
+            .cloned()
+            .chain(held_back.iter().map(|p| p.as_bytes().to_vec())),
+    );
+    let names: Vec<Vec<u8>> = selected.iter().map(|p| p.as_bytes().to_vec()).collect();
+    // Small leaves come home over the channel, landed only over the stamp
+    // the survey read them under; the rest, or a refused batch, by rsync.
+    let readable: Vec<&Vec<u8>> = names.iter().filter(|n| !excluded.contains(n)).collect();
+    let mut streamed = None;
+    if !readable.is_empty() && readable.len() <= 64 {
+        let mut batch = crate::stream::Batch::new();
+        if readable
+            .iter()
+            .all(|n| String::from_utf8(n.to_vec()).is_ok_and(|n| batch.read(n).is_some()))
+            && let Sent::Applied(applied) = channel_send(project, ssh, channel, batch)?
+        {
+            let mut landed = Vec::new();
+            let mut agreed = crate::baseline::Contents::new();
+            for pulled in &applied.pulled {
+                let Some(expected) = survey.cache.stamp_of(&pulled.path) else {
+                    continue;
+                };
+                if crate::stream::land(&fp.anchor, pulled, Some(expected))?.is_some() {
+                    landed.push(Event::Push(pulled.path.clone()));
+                    agreed.insert(pulled.path.clone(), Some(pulled.content.clone()));
+                }
+            }
+            survey.common.record(agreed.clone())?;
+            survey.local.extend(agreed.clone());
+            survey.remote.extend(agreed);
+            streamed = Some(landed);
+        }
+    }
+    let refreshed_by_rsync = streamed.is_none();
+    let mut events = match streamed {
+        Some(landed) => landed,
+        None => rsync_pass_dir(
+            &rsync_bin,
+            project,
+            fp,
+            ssh,
+            &survey.plan.excludes,
+            &held_back,
+            &refresh,
+            Direction::Down,
+            (selected.len() <= EXACT_PASS_LIMIT).then_some(names.as_slice()),
+            deadline,
+        )?
+        .or_fail()?,
+    };
+    // Ownership is checked once per candidate, before rsync sees the list.
+    // `--ignore-existing` still checks the receiving path at transfer time.
+    let (listing, marked) = match survey.listing.take() {
+        Some(listing) => (listing, std::mem::take(&mut survey.returning_when_listed)),
+        None => {
+            let marked = survey.common.returning_names();
+            let listing = remote_files(project, fp, ssh, &survey.plan.excludes, deadline)?;
+            (listing, marked)
+        }
+    };
+    let claimed = ledger::synced_files(&state);
+    let unclaimed = crate::selection::unclaimed(&listing, &claimed, &excluded)?;
+    // Nearly always nothing is returning, and the scope stats every exclude.
+    if !marked.is_empty() {
+        let lost = returns_the_server_lost(
+            &marked,
+            &unclaimed,
+            &claimed,
+            &excluded,
+            &inventory_scope(&project.config.sync.protect, fp, &survey.plan.excludes),
+            &fp.anchor,
+        );
+        survey.common.end_return(&lost)?;
+    }
+    // Server-born leaves come home the same way: read over the channel and
+    // landed only into a name still absent here — `--ignore-existing`
+    // decided at the instant of writing — or by rsync for what the
+    // channel will not carry.
+    let mut created = None;
+    if !unclaimed.is_empty() && unclaimed.len() <= 64 {
+        let mut batch = crate::stream::Batch::new();
+        if unclaimed
+            .iter()
+            .all(|n| String::from_utf8(n.clone()).is_ok_and(|n| batch.read(n).is_some()))
+            && let Sent::Applied(applied) = channel_send(project, ssh, channel, batch)?
+        {
+            let mut landed = Vec::new();
+            let mut agreed = crate::baseline::Contents::new();
+            for pulled in &applied.pulled {
+                if crate::stream::land(&fp.anchor, pulled, None)?.is_some() {
+                    landed.push(Event::Push(pulled.path.clone()));
+                    agreed.insert(pulled.path.clone(), Some(pulled.content.clone()));
+                }
+            }
+            survey.common.record(agreed.clone())?;
+            survey.local.extend(agreed.clone());
+            survey.remote.extend(agreed);
+            created = Some(landed);
+        }
+    }
+    let created_by_rsync = created.is_none();
+    let invented = match created {
+        Some(landed) => landed,
+        None => rsync_pass_dir(
+            &rsync_bin,
+            project,
+            fp,
+            ssh,
+            &survey.plan.excludes,
+            &held_back,
+            &["--ignore-existing", "--prune-empty-dirs"],
+            Direction::Down,
+            Some(&unclaimed),
+            deadline,
+        )?
+        .or_fail()?,
+    };
     say_what_slipped_past_the_ignores(project, fp, &invented);
+    // The channel's receipts already said what landed; only what rsync
+    // moved is read again on both ends.
+    let mut confirm = Vec::new();
+    if created_by_rsync {
+        confirm.extend(event_paths(&invented));
+    }
+    if refreshed_by_rsync {
+        confirm.extend(event_paths(&events));
+    }
+    let landed = landed_back(&survey.common, &invented);
     events.extend(invented);
+    survey.confirm(ssh, project, fp, &confirm, deadline)?;
+    // Claimed again only now, beside the content just recorded for them.
+    // A confirmation that fails leaves them returning: the next push
+    // claims what is still here, and the next pull what is not.
+    claim_returned(&state, &fp.anchor, &mut survey.common, &landed)?;
 
     let mut report = SyncReport::default();
     for e in &events {
@@ -569,6 +2986,32 @@ pub fn pull_back(
             report.pulled
         ));
     }
+    Ok(report)
+}
+
+/// The standalone way down, for a caller that has no survey in hand: the
+/// passthrough pulls after a command whose whole purpose was to write.
+pub fn pull_back(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    quiet: bool,
+    deadline: &crate::proc::Budget,
+    since: Option<std::time::SystemTime>,
+) -> Result<SyncReport> {
+    let plan = checked_plan(project, fp)?;
+    let mut survey = Survey::take(project, fp, ssh, plan, true, deadline)?;
+    let report = pull(
+        project,
+        fp,
+        ssh,
+        quiet,
+        &mut survey,
+        deadline,
+        since,
+        &mut None,
+    )?;
+    survey.finish()?;
     Ok(report)
 }
 
@@ -677,60 +3120,6 @@ fn touched_since(
         .collect()
 }
 
-/// The push's mirror of `touched_since`: the saves that rsync's quick
-/// check cannot see, and the only ones worth asking about twice.
-///
-/// rsync decides what to send from size and mtime-TO-THE-SECOND, and the
-/// copy on the server carries the mtime the local file had when it was
-/// read. So a same-size save made in that same second is indistinguishable
-/// from what is already up there, and stays that way for good: rsync
-/// exits 0 having sent nothing, every pass.
-///
-/// The question is not "what changed" — the quick check answers that
-/// correctly for everything else. It is two, and a file has to answer
-/// both:
-///
-/// 1. **Written in a second the last push was reading in?** If not, the
-///    server's copy carries a different second and the quick check
-///    catches it unaided. Asked in whole seconds, because that is what
-///    rsync compares.
-/// 2. **Written after that push began?** If not, the push read this
-///    exact content and the server HAS it. Asked as instants, and it is
-///    what keeps the answer small — measured before it existed: the
-///    second sync of the ten-thousand file workspace re-offered every
-///    file and reported thousands of changes for a no-op.
-///
-/// Together they are the causal condition: a save can hide only if it
-/// landed after the push began (or it would BE the copy) and inside a
-/// second the push was reading in (or rsync would see the difference).
-/// Question 2 assumes mtimes finer than a second — APFS, ext4, xfs and
-/// btrfs all qualify; on one that does not, the hole stays as it was.
-///
-/// Cost: one stat per synced path, the same one `touched_since` makes on
-/// the way down, plus one rsync over a handful of names when the answer
-/// is not empty. That is what keeps `--checksum` off the main pass.
-fn hidden_by_the_quick_check(
-    anchor: &std::path::Path,
-    kept: &[Vec<u8>],
-    window: (std::time::SystemTime, u64),
-) -> Vec<String> {
-    let (from, to) = window;
-    kept.iter()
-        .filter_map(|rel| std::str::from_utf8(rel).ok())
-        .filter(|rel| {
-            std::fs::symlink_metadata(anchor.join(rel))
-                .and_then(|m| m.modified())
-                .ok()
-                .is_some_and(|m| {
-                    m >= from
-                        && m.duration_since(std::time::UNIX_EPOCH)
-                            .is_ok_and(|d| d.as_secs() <= to)
-                })
-        })
-        .map(str::to_string)
-        .collect()
-}
-
 /// What to hold back, expressed so rsync cannot sneak the parent in.
 ///
 /// Excluding `site/gone/inner.txt` still lets the footprint's
@@ -815,16 +3204,37 @@ fn delete_remote(
 /// COMPONENT, never the substring — `v1..v2.patch` and `2024..2025.csv`
 /// are legal names, and a substring test left them doomed on every sync
 /// forever while the summary claimed the workspace was clean.
+///
+/// `linked` keeps a row when any directory on its way is now a symlink,
+/// checked right before its `rm -f` or `rmdir -p`: both resolve every
+/// component, so a row under a parent the server replaced with a symlink
+/// reached through it, and `rmdir -p` removed an empty directory from
+/// wherever it pointed. The judgement already leaves such rows alone
+/// (`spare_dirs_above`); this holds even when the server changes the path
+/// after the judgement, or a directory row outlives the file row that
+/// revealed the symlink.
 fn removal_script(remote_dir: &str, doomed: &[String], doomed_dirs: &[String]) -> String {
     // "" and /* keep the rm inside the workspace; the four `..` shapes
     // are the traversal, spelled as components so a name that merely
     // CONTAINS two dots is not caught with them.
     const OUTSIDE: &str = "\"\"|/*|..|../*|*/../*|*/..";
     let mut script = format!("cd {} || exit 1\nn=0\n", sh_quote(remote_dir));
+    // Every proper prefix of $1, deepest first; the row's own last
+    // component is left out, since `rm -f` removes a symlink leaf itself.
+    script.push_str(
+        "linked() {\n\
+         q=$1\n\
+         while :; do\n\
+         case $q in */*) q=${q%/*} ;; *) return 1 ;; esac\n\
+         [ -L \"$q\" ] && return 0\n\
+         done\n\
+         }\n",
+    );
     script.push_str(&set_args(doomed));
     script.push_str(&format!(
         "for p in \"$@\"; do\n\
          case \"$p\" in {OUTSIDE}) printf 'ULAK_KEPT_FILE %s\\n' \"$p\"; continue ;; esac\n\
+         if linked \"$p\"; then printf 'ULAK_KEPT_FILE %s\\n' \"$p\"; continue; fi\n\
          if rm -f -- \"$p\"; then n=$((n+1)); else printf 'ULAK_KEPT_FILE %s\\n' \"$p\"; fi\n\
          d=${{p%/*}}\n\
          [ \"$d\" != \"$p\" ] && rmdir -p -- \"$d\" 2>/dev/null\n\
@@ -836,6 +3246,7 @@ fn removal_script(remote_dir: &str, doomed: &[String], doomed_dirs: &[String]) -
     script.push_str(&format!(
         "for p in \"$@\"; do\n\
          case \"$p\" in {OUTSIDE}) printf 'ULAK_KEPT_DIR %s\\n' \"$p\"; continue ;; esac\n\
+         if linked \"$p\"; then printf 'ULAK_KEPT_DIR %s\\n' \"$p\"; continue; fi\n\
          if rmdir -p -- \"$p\" 2>/dev/null; then n=$((n+1))\n\
          elif [ -d \"$p\" ]; then printf 'ULAK_KEPT_DIR %s\\n' \"$p\"\n\
          fi\n\
@@ -976,8 +3387,19 @@ pub fn push_no_delete(project: &Project, fp: &Footprint, ssh: &Ssh) -> Result<(S
     // points the user at `ulak doctor`, so that was the ordinary first
     // population of a workspace — every file of it unclaimed, hence
     // undeletable, hence free to come back after the user deleted it.
-    let events = push_and_claim(&rsync_bin, project, fp, ssh, &plan, &state, &deadline)?;
-    let pending = !ledger::doomed(&state, &fp.anchor, &plan.kept).is_empty();
+    let mut survey = Survey::take(project, fp, ssh, plan, false, &deadline)?;
+    let events = push_and_claim(
+        &rsync_bin,
+        project,
+        fp,
+        ssh,
+        &mut survey,
+        &state,
+        &deadline,
+        &mut None,
+    )?;
+    survey.finish()?;
+    let pending = !doomed_files(project, &state, &fp.anchor, &survey.plan.kept).is_empty();
     let report = render_events(&events, true);
     Ok((report, pending))
 }
@@ -1035,17 +3457,310 @@ fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
     plan.kept.dedup();
     plan.kept_dirs.sort();
     plan.kept_dirs.dedup();
-    if !plan.bad_names.is_empty() {
-        let sample = plan.bad_names.iter().take(5).cloned().collect::<Vec<_>>();
+    refuse_bad_names(&plan)?;
+    Ok(plan)
+}
+
+fn refuse_bad_names(plan: &walk::WalkReport) -> Result<()> {
+    if plan.bad_names.is_empty() {
+        return Ok(());
+    }
+    let sample = plan.bad_names.iter().take(5).cloned().collect::<Vec<_>>();
+    Err(fail!(
+        "{} file name(s) cannot be synced safely (newlines or non-UTF8 bytes in the name): {}",
+        plan.bad_names.len(),
+        sample.join(", ")
+    )
+    .now("rename those files, or add them to [sync] exclude in ulak.toml")
+    .into_err())
+}
+
+/// The walker's answer for the directories the notices name, spliced into
+/// the last full plan. The walker stays the only selection policy: each
+/// scope is walked with the same matchers, seeded with the same ignore
+/// files from the anchor down, and every previous entry under it is
+/// replaced by that walk. A notice names a leaf, whose parent is the
+/// scope, or a directory the previous plan already kept — some watcher
+/// backends report the directory rather than its changed child — which is
+/// rescanned itself. A directory the plan does not know is reported
+/// through its parent, whose rescan either excludes it (rsync's own
+/// `.ulak-partial` staging, a builtin the literal list cannot name before
+/// it exists) or lists it, after which its leaves have no known parent and
+/// `reconcile_structure` sends them to the full path. A leaf whose parent
+/// is gone is reported through its nearest surviving ancestor: rsync's
+/// staging directory vanishes with its temporary before the notice is
+/// read, and a kept directory that really went is missing from that
+/// rescan, which the ledger's doomed directories then send to the full
+/// path. A leaf under a directory the walk excludes — by the literal list
+/// it produced, or by the rules themselves for a directory born since, such
+/// as rsync's staging — is not walked at all. A full walk and stamp of a
+/// large tree on every structural change cost far more than rescanning the
+/// one directory a notice names. Pinned by
+/// `a_rescanned_directory_answers_as_the_full_walk_would`.
+fn rescanned_plan(
+    cfg: &crate::config::SyncCfg,
+    fp: &Footprint,
+    previous: &walk::WalkReport,
+    paths: &std::collections::BTreeSet<PathBuf>,
+) -> Result<Option<(walk::WalkReport, Vec<PathBuf>)>> {
+    let sync_dirs = fp.sync_dirs();
+    let build = fp.build_filter();
+    let excluded = crate::selection::Excludes::new(previous.excludes.iter().cloned());
+    let known = |dir: &std::path::Path| {
+        sync_dirs.iter().any(|d| d == dir)
+            || crate::invocation::anchor_rel(&fp.anchor, dir)
+                .is_some_and(|rel| previous.kept_dirs.contains(&rel.into_bytes()))
+    };
+    let mut scopes = std::collections::BTreeSet::new();
+    for path in paths {
+        let scope = if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) && known(path) {
+            path.as_path()
+        } else {
+            let mut parent = path.parent();
+            while let Some(dir) = parent
+                && !dir.is_dir()
+            {
+                parent = dir.parent();
+            }
+            let Some(parent) = parent.filter(|p| p.starts_with(&fp.anchor)) else {
+                return Ok(None);
+            };
+            parent
+        };
+        if !sync_dirs.iter().any(|d| scope.starts_with(d)) {
+            continue;
+        }
+        let Some(rel) = crate::invocation::anchor_rel(&fp.anchor, scope) else {
+            return Ok(None);
+        };
+        if rel != "." && excluded.contains(rel.as_bytes()) {
+            continue;
+        }
+        // A directory the previous walk never saw is judged by the rules
+        // it would have applied; a kept one was judged then, include
+        // rescues and all.
+        if !known(scope) && walk::is_ignored(&fp.anchor, scope, cfg, &build)? {
+            continue;
+        }
+        scopes.insert(scope.to_path_buf());
+    }
+    let scopes: Vec<PathBuf> = scopes
+        .iter()
+        .filter(|s| !scopes.iter().any(|o| o != *s && s.starts_with(o)))
+        .cloned()
+        .collect();
+    let within = |raw: &Vec<u8>| {
+        std::str::from_utf8(raw).is_ok_and(|r| {
+            let p = fp.anchor.join(r);
+            scopes.iter().any(|s| p.starts_with(s))
+        })
+    };
+    let mut plan = walk::WalkReport {
+        excludes: previous
+            .excludes
+            .iter()
+            .filter(|r| !within(r))
+            .cloned()
+            .collect(),
+        bad_names: Vec::new(),
+        kept: previous
+            .kept
+            .iter()
+            .filter(|r| !within(r))
+            .cloned()
+            .collect(),
+        kept_dirs: previous
+            .kept_dirs
+            .iter()
+            .filter(|r| !within(r))
+            .cloned()
+            .collect(),
+    };
+    for scope in &scopes {
+        let part = walk::plan_in(&fp.anchor, scope, cfg, &build)?;
+        plan.excludes.extend(part.excludes);
+        plan.bad_names.extend(part.bad_names);
+        plan.kept.extend(part.kept);
+        plan.kept_dirs.extend(part.kept_dirs);
+        // The walker lists a directory's children, never the directory
+        // itself; a scope the previous plan kept stays kept.
+        if let Some(rel) = crate::invocation::anchor_rel(&fp.anchor, scope)
+            && previous.kept_dirs.contains(&rel.as_bytes().to_vec())
+        {
+            plan.kept_dirs.push(rel.into_bytes());
+        }
+    }
+    plan.kept.sort();
+    plan.kept.dedup();
+    plan.kept_dirs.sort();
+    plan.kept_dirs.dedup();
+    plan.excludes.sort();
+    plan.excludes.dedup();
+    refuse_bad_names(&plan)?;
+    Ok(Some((plan, scopes)))
+}
+
+/// Enumerate only footprint roots, without following symlinks. `find`
+/// supplies names, never ownership or deletion decisions. The byte index
+/// in selection.rs makes those decisions locally. Directory exclusions
+/// are pruned remotely so a protected database or ignored dependency tree
+/// is not scanned merely to discover that none of it may come home.
+fn remote_files(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    excludes: &[Vec<u8>],
+    deadline: &crate::proc::Budget,
+) -> Result<Vec<u8>> {
+    let (cmd, script) = inventory_command(project, fp, ssh, excludes);
+    inventory_run(cmd, script, ssh.dest.clone(), deadline)
+}
+
+/// The same listing, started beside the survey's hashing (see `Survey`).
+fn inventory_in_background(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    excludes: &[Vec<u8>],
+    deadline: &crate::proc::Budget,
+) -> std::thread::JoinHandle<Result<Vec<u8>>> {
+    let (cmd, script) = inventory_command(project, fp, ssh, excludes);
+    let dest = ssh.dest.clone();
+    let limit = deadline.remaining().min(crate::proc::SCRIPT);
+    std::thread::spawn(move || inventory_run(cmd, script, dest, &crate::proc::Budget::new(limit)))
+}
+
+fn inventory_command(
+    project: &Project,
+    fp: &Footprint,
+    ssh: &Ssh,
+    excludes: &[Vec<u8>],
+) -> (Command, String) {
+    let script = inventory_script(
+        &project.remote_dir(),
+        &project.config.sync.protect,
+        fp,
+        excludes,
+    );
+    let mut cmd = ssh.command();
+    cmd.arg("--").arg(&ssh.dest).arg("sh -s");
+    (cmd, script)
+}
+
+fn inventory_run(
+    mut cmd: Command,
+    script: String,
+    dest: String,
+    deadline: &crate::proc::Budget,
+) -> Result<Vec<u8>> {
+    let out = crate::proc::run_bounded(
+        &mut cmd,
+        Some(script.into_bytes()),
+        deadline.remaining().min(crate::proc::SCRIPT),
+    )?;
+    crate::audit::record_command("ssh", &cmd, out.status.code());
+    if out.timed_out || !out.status.success() {
         return Err(fail!(
-            "{} file name(s) cannot be synced safely (newlines or non-UTF8 bytes in the name): {}",
-            plan.bad_names.len(),
-            sample.join(", ")
+            "cannot list sync candidates on {}: {}",
+            dest,
+            String::from_utf8_lossy(&out.stderr).trim()
         )
-        .now("rename those files, or add them to [sync] exclude in ulak.toml")
+        .now(format!(
+            "check the connection: ssh {} true",
+            sh_quote(&dest)
+        ))
+        .now("rerun ulak sync when the server is available")
         .into_err());
     }
-    Ok(plan)
+    Ok(out.stdout)
+}
+
+fn inventory_script(
+    remote_dir: &str,
+    protect: &[String],
+    fp: &Footprint,
+    excludes: &[Vec<u8>],
+) -> String {
+    let (roots, pruned) = inventory_scope(protect, fp, excludes);
+    // find -path has glob syntax even when its argv word is shell-quoted.
+    let literal = |p: &str| -> String {
+        p.chars()
+            .flat_map(|c| {
+                if "\\*?[]".contains(c) {
+                    vec!['\\', c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect()
+    };
+    let mut prune = "-name .ulak-partial".to_string();
+    for p in pruned {
+        prune.push_str(&format!(
+            " -o -path {}",
+            sh_quote(&literal(&format!("./{p}")))
+        ));
+    }
+    let mut script = format!("cd {} || exit\n", sh_quote(remote_dir));
+    for root in roots {
+        let root = sh_quote(&root);
+        script.push_str(&format!("if [ -e {root} ] || [ -L {root} ]; then find {root} \\( {prune} \\) -prune -o ! -type d -print0 || exit; fi\n"));
+    }
+    script
+}
+
+fn inventory_scope(
+    protect: &[String],
+    fp: &Footprint,
+    excludes: &[Vec<u8>],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    use std::collections::BTreeSet;
+    let mut roots: BTreeSet<String> = fp
+        .sync_dirs()
+        .iter()
+        .filter_map(|p| crate::invocation::anchor_rel(&fp.anchor, p))
+        .map(|p| {
+            if p == "." {
+                ".".to_string()
+            } else {
+                format!("./{p}")
+            }
+        })
+        .collect();
+    if fp.whole_anchor {
+        roots.insert(".".to_string());
+    }
+    for e in &fp.entries {
+        if !e.is_dir
+            && e.exists
+            && let Some(p) = crate::invocation::anchor_rel(&fp.anchor, &e.local)
+        {
+            roots.insert(format!("./{p}"));
+        }
+    }
+    if roots.contains(".") {
+        roots = BTreeSet::from([".".to_string()]);
+    }
+    let mut pruned: BTreeSet<String> = protect
+        .iter()
+        .filter_map(|p| walk::protect_entry(p))
+        .collect();
+    for p in excludes {
+        if let Ok(p) = std::str::from_utf8(p)
+            && fp.anchor.join(p).is_dir()
+        {
+            pruned.insert(p.to_string());
+        }
+    }
+    roots.retain(|root| {
+        !pruned
+            .iter()
+            .any(|p| walk::protect_covers(p, root.strip_prefix("./").unwrap_or(root)))
+    });
+    (roots, pruned)
 }
 
 fn confirm_deletions(doomed: &[String], budget: crate::config::DeleteBudget) -> Result<bool> {
@@ -1100,20 +3815,22 @@ fn rsync_pass(
     fp: &Footprint,
     ssh: &Ssh,
     excludes: &[Vec<u8>],
+    held_back: &[String],
     extra: &[&str],
     deadline: &crate::proc::Budget,
 ) -> Result<Pass> {
-    // Nothing is held back going UP: a path that is not on disk here has
-    // nothing to send, and the push removes it on the server itself.
+    // Differing remote edits are held before footprint includes, just as
+    // unsent local edits are held on the return trip.
     rsync_pass_dir(
         rsync_bin,
         project,
         fp,
         ssh,
         excludes,
-        &[],
+        held_back,
         extra,
         Direction::Up,
+        None,
         deadline,
     )
 }
@@ -1160,6 +3877,7 @@ fn rsync_pass_dir(
     held_back: &[String],
     extra: &[&str],
     dir: Direction,
+    selected: Option<&[Vec<u8>]>,
     deadline: &crate::proc::Budget,
 ) -> Result<Pass> {
     let mut cmd = Command::new(rsync_bin);
@@ -1180,11 +3898,36 @@ fn rsync_pass_dir(
         // came back on its own.
         "--timeout=60",
     ]);
-    cmd.args(filter_args(
+    let excluded = crate::selection::Excludes::new(
+        excludes
+            .iter()
+            .cloned()
+            .chain(held_back.iter().map(|p| p.as_bytes().to_vec())),
+    );
+    let selected = selected.map(|paths| {
+        paths
+            .iter()
+            .filter(|p| !excluded.contains(p))
+            .collect::<Vec<_>>()
+    });
+    if selected.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(Pass {
+            events: Vec::new(),
+            failed: None,
+        });
+    }
+    let mut filters = filter_args(
         &project.config.sync.protect,
-        held_back,
+        if selected.is_some() { &[] } else { held_back },
         fp.filter_rules(),
-    ));
+    );
+    if selected.is_some() {
+        // Exact leaves only. Recursing a selected directory would reopen
+        // every ignored child that the walker already refused.
+        cmd.args(["--no-recursive", "--files-from=-", "--ignore-missing-args"]);
+        filters.retain(|arg| arg != "--exclude-from=-");
+    }
+    cmd.args(filters);
     cmd.args(extra);
     cmd.arg("-e").arg(ssh.rsync_transport());
     let local = format!("{}/", fp.anchor.display());
@@ -1196,14 +3939,20 @@ fn rsync_pass_dir(
     };
     // The NUL-delimited literal exclude list travels on stdin, so the
     // flag's POSITION above is what fixes its rank in the filter chain.
-    let payload: Vec<u8> = excludes
-        .iter()
-        .flat_map(|e| {
-            let mut v = walk::rsync_exclude_pattern(e);
-            v.push(0);
-            v
-        })
-        .collect();
+    let payload: Vec<u8> = match selected {
+        Some(paths) => paths
+            .iter()
+            .flat_map(|p| p.iter().copied().chain([0]))
+            .collect(),
+        None => excludes
+            .iter()
+            .flat_map(|e| {
+                let mut v = walk::rsync_exclude_pattern(e);
+                v.push(0);
+                v
+            })
+            .collect(),
+    };
     let out = crate::proc::run_bounded(&mut cmd, Some(payload), deadline.remaining())?;
     crate::audit::record_command("rsync", &cmd, out.status.code());
     if out.timed_out {
@@ -1349,19 +4098,6 @@ struct Pass {
 }
 
 impl Pass {
-    /// Fold a follow-up pass into this one. A path both carried is ONE
-    /// change: counting it twice would report "2 change(s)" for one save.
-    fn also(&mut self, other: Pass) {
-        for e in other.events {
-            if !self.events.contains(&e) {
-                self.events.push(e);
-            }
-        }
-        if let Some(e) = other.failed {
-            self.failed.get_or_insert(e);
-        }
-    }
-
     /// The rows, for a caller that has nothing to record and only needs
     /// the failure raised.
     fn or_fail(self) -> Result<Vec<Event>> {
@@ -1518,15 +4254,19 @@ fn ensure_workspace(ssh: &Ssh, project: &Project) -> Result<Layout> {
 
     // No `--` separator: busybox tools lack it, and these paths are ours
     // (always ".ulak/workspaces/..." — never dash-led).
+    // The previous transfer leases are retired in this same round trip:
+    // every full push passes through here, and rsync must never write
+    // behind a helper that is still applying an earlier batch (stream.rs).
     let script = format!(
         "umask 077 && mkdir -p {dir} && chmod 700 {b} {ns} {ws} {dir} && \
-         if [ -f {m} ]; then cat {m}; else printf '%s' {json} > {m} && cat {m}; fi",
+         if [ -f {m} ]; then cat {m}; else printf '%s' {json} > {m} && cat {m}; fi && {fence}",
         dir = sh_quote(&remote_dir),
         b = sh_quote(base),
         ns = sh_quote(&namespace_dir),
         ws = sh_quote(&workspace_dir),
         m = sh_quote(&manifest_path),
         json = sh_quote(&candidate_json),
+        fence = crate::stream::fence_script(&workspace_dir),
     );
     let out = ssh.run_checked(&script, "preparing the workspace")?;
     let clean = crate::management::root_command(project, &["clean"]);
@@ -1918,6 +4658,260 @@ pub fn parse_rsync_version(text: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
+    /// Atomic saves change the containing directory's mtime. After the leaf
+    /// was acknowledged, that alone must not schedule another full-tree sync.
+    /// A genuinely new child still invalidates the cached selection.
+    #[test]
+    fn background_audits_distinguish_acknowledged_saves_from_new_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"before").unwrap();
+        let mut session = Session::default();
+        session.observed.insert(
+            dir.path().into(),
+            crate::selection::Stamp::read(dir.path()).unwrap(),
+        );
+        session
+            .children
+            .insert(dir.path().into(), directory_children(dir.path()).unwrap());
+        let temporary = dir.path().join("temporary");
+        std::fs::write(&temporary, b"after").unwrap();
+        std::fs::rename(&temporary, &path).unwrap();
+        session
+            .observed
+            .insert(path.clone(), crate::selection::Stamp::read(&path).unwrap());
+        session.audit();
+        assert!(session.audit.take().unwrap().join().unwrap().is_empty());
+        std::fs::write(dir.path().join("new"), b"born locally").unwrap();
+        session.audit();
+        assert_eq!(
+            session.audit.take().unwrap().join().unwrap(),
+            std::collections::BTreeSet::from([dir.path().to_path_buf()])
+        );
+        std::fs::write(&path, b"not acknowledged").unwrap();
+        session.audit();
+        assert!(
+            session
+                .audit
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .contains(&path)
+        );
+    }
+
+    fn inventory_footprint(anchor: &std::path::Path) -> Footprint {
+        Footprint {
+            anchor: anchor.to_path_buf(),
+            entries: Vec::new(),
+            server_refs: Vec::new(),
+            whole_anchor: true,
+            contexts: Vec::new(),
+            pinned: Vec::new(),
+            model_json: String::new(),
+        }
+    }
+
+    /// Enumerating an anchor used to spell it `./.`, which made every
+    /// generated name fail the relative-path validation. Pruning also has
+    /// to quote find's glob dialect, independently of shell quoting.
+    #[test]
+    fn inventory_names_are_relative_and_protected_globs_remain_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (path, bytes) in [
+            ("kept/x", "ok"),
+            ("data[*]/secret", "secret"),
+            ("data1/safe", "yes"),
+            (".ulak-partial/blob", "partial"),
+        ] {
+            let p = root.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+        std::os::unix::fs::symlink("kept", root.join("link")).unwrap();
+        let fp = inventory_footprint(root);
+        let script = inventory_script(root.to_str().unwrap(), &["data[*]".into()], &fp, &[]);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-s");
+        let out =
+            crate::proc::run_bounded(&mut cmd, Some(script.into_bytes()), crate::proc::SCRIPT)
+                .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let names =
+            crate::selection::unclaimed(&out.stdout, &[], &crate::selection::Excludes::new([]))
+                .unwrap();
+        assert_eq!(
+            names,
+            [b"data1/safe".to_vec(), b"kept/x".to_vec(), b"link".to_vec()]
+        );
+    }
+
+    /// A byte-identical metadata observation may be acknowledged, but a
+    /// same-length save or a rename preserving mtime must remain pending.
+    #[test]
+    fn warm_selection_detects_same_size_saves_and_rename_over_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file");
+        std::fs::write(&path, b"one").unwrap();
+        let original_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let observed = std::collections::BTreeMap::from([(
+            path.clone(),
+            crate::selection::Stamp::read(&path).unwrap(),
+        )]);
+        let paths = std::collections::BTreeSet::from([path.clone()]);
+        assert!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &paths
+            )
+            .unwrap()
+            .is_empty()
+        );
+        std::fs::write(&path, b"two").unwrap();
+        assert_eq!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &paths
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let staged = tmp.path().join("staged");
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::File::open(&staged)
+            .unwrap()
+            .set_modified(original_time)
+            .unwrap();
+        std::fs::rename(staged, &path).unwrap();
+        assert_eq!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &paths
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &paths
+            )
+            .is_none()
+        );
+    }
+
+    /// Both accepting and invalidating transitions matter: a cached
+    /// known file must never let a new path or an ignore edit bypass the
+    /// walker that decides whether it may travel.
+    #[test]
+    fn warm_selection_reconciles_new_paths_and_changed_ignore_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, b"old").unwrap();
+        let observed = std::collections::BTreeMap::from([(
+            path.clone(),
+            crate::selection::Stamp::read(&path).unwrap(),
+        )]);
+        std::fs::write(&path, b"new-rule").unwrap();
+        assert!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &std::collections::BTreeSet::from([path])
+            )
+            .is_none()
+        );
+        let new = tmp.path().join("new");
+        std::fs::write(&new, b"new").unwrap();
+        assert!(
+            changed_leaves(
+                tmp.path(),
+                &Session {
+                    observed: observed.clone(),
+                    ..Session::default()
+                },
+                &std::collections::BTreeSet::from([new])
+            )
+            .is_none()
+        );
+    }
+
+    /// An atomic editor save reports the temporary sibling and its parent
+    /// as well as the file. Treating every absent unknown path as a delete
+    /// forced a full scan on every ordinary save.
+    #[test]
+    fn an_atomic_save_selects_the_file_but_a_new_sibling_requires_a_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("file");
+        let staging = root.join("temporary");
+        std::fs::write(&file, b"before").unwrap();
+        let session = Session {
+            observed: [root.to_path_buf(), file.clone()]
+                .into_iter()
+                .map(|p| {
+                    let stamp = crate::selection::Stamp::read(&p).unwrap();
+                    (p, stamp)
+                })
+                .collect(),
+            children: std::collections::BTreeMap::from([(
+                root.to_path_buf(),
+                directory_children(root).unwrap(),
+            )]),
+            owned: std::collections::BTreeSet::from([file.clone()]),
+            ..Session::default()
+        };
+        std::fs::write(&staging, b"after").unwrap();
+        std::fs::rename(&staging, &file).unwrap();
+        let events =
+            std::collections::BTreeSet::from([root.to_path_buf(), file.clone(), staging.clone()]);
+        let changed = changed_leaves(root, &session, &events).unwrap();
+        assert_eq!(changed.keys().collect::<Vec<_>>(), [&file]);
+        assert!(
+            changed_leaves(
+                root,
+                &session,
+                &std::collections::BTreeSet::from([root.to_path_buf()])
+            )
+            .is_none(),
+            "a directory-only notification is not proof that its contents are unchanged"
+        );
+        std::fs::write(&staging, b"a real new file").unwrap();
+        assert!(changed_leaves(root, &session, &events).is_none());
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            changed_leaves(root, &session, &std::collections::BTreeSet::from([file])).is_none()
+        );
+    }
+
     /// Run a removal round the way the server runs it: `sh -s` with the
     /// script on stdin (ssh.rs:script_attempt), in a real directory.
     ///
@@ -2125,9 +5119,14 @@ mod tests {
         // directory took the ledger out from under this guard silently —
         // the call still deleted the ledger, the table just no longer
         // named it. A door is only pinned once it is written down here.
+        //
+        // `pull_back(` joined when the pull began claiming the files it
+        // brings home after the server's edit won (`claim_returned`).
         const DOORS: &[&str] = &[
             "run_sync(",
             "reconcile_once(",
+            "reconcile_changes(",
+            "pull_back(",
             "ledger::store(",
             "ledger::forget(",
             "invocation::forget_workspace_destination(",
@@ -2165,9 +5164,14 @@ mod tests {
             }
         }
         // A guard that stopped finding call sites would pass forever.
-        // Eight doors today, across seven files; the floor is under that
-        // so a refactor that merges two of them is not a false alarm.
-        assert!(checked >= 6, "expected several call sites, found {checked}");
+        // Thirteen call sites today, across seven files, five of them
+        // `pull_back`; the floor is under that so a refactor that merges
+        // two of them is not a false alarm, and over what is left without
+        // the pull's.
+        assert!(
+            checked >= 10,
+            "expected several call sites, found {checked}"
+        );
 
         // The one exception, and both halves of it. `push_no_delete`
         // takes the lock itself because its only caller is a whole-
@@ -2300,6 +5304,16 @@ mod tests {
             "push_and_claim raises the rsync failure before it claims, so everything \
              a partial transfer DID put on the server is left unclaimed"
         );
+        // The channel's way up keeps the same order: a create the helper
+        // applied without a receipt would otherwise be a file nobody can retire.
+        let at = mine
+            .find("fn stream_structure")
+            .expect("the channel's way up");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        assert!(
+            body.find("ledger::store").expect("it claims") < body.find(".send(").expect("it sends"),
+            "stream_structure sends before it claims"
+        );
     }
 
     /// The start of the function an offset sits in: the nearest
@@ -2415,6 +5429,7 @@ mod tests {
             include: Vec::new(),
             protect: Vec::new(),
             max_delete: crate::config::DeleteBudget::Limit(0),
+            no_history: crate::config::NoHistory::Send,
         };
 
         let invented = vec![
@@ -2687,9 +5702,10 @@ mod tests {
     /// The hole itself, put to the real rsync rather than described.
     /// Both saves are stamped with the SAME second on purpose, which is
     /// the only thing a burst ever does by accident, so it runs every
-    /// time on every machine. Two claims: ulak's push flags lose the
-    /// edit, and `--checksum` recovers it. If some future rsync closes
-    /// this on its own, the first half is what will say so.
+    /// time on every machine. Two claims: rsync's own quick check loses
+    /// the edit, and `--checksum` recovers it — which is why the exact
+    /// passes carry it over the survey's differing names. If some future
+    /// rsync closes this on its own, the first half is what will say so.
     #[test]
     fn a_same_size_save_inside_one_second_is_invisible_to_the_quick_check() {
         let rsync = local_rsync().expect("rsync >= 3.2 — ulak states the same requirement");
@@ -2738,89 +5754,50 @@ mod tests {
             std::fs::read_to_string(to.join("index.html")).unwrap(),
             "<h1>service-edit-v3</h1>",
             "rsync's quick check is size + mtime-to-the-second: if this \
-             now says v5, rsync has changed and `offer_again` can go"
+             now says v5, rsync has changed and the exact passes can drop \
+             `--checksum`"
         );
 
-        // And the catch-up's one flag, which is the whole fix.
+        // And the exact passes' one flag, which is the whole fix.
         push(&["--checksum"]);
         assert_eq!(
             std::fs::read_to_string(to.join("index.html")).unwrap(),
             "<h1>service-edit-v5</h1>",
-            "--checksum is what the second pass carries, and it has to be \
+            "--checksum is what the exact passes carry, and it has to be \
              enough on its own"
         );
     }
 
-    /// Which files the catch-up asks about, and which it does not.
-    /// Dropping either half is a real bug with no symptom a type could
-    /// catch: without the second, saves the push never looked at are
-    /// re-offered forever; without the first, every file a push sent is
-    /// re-offered on the next one — measured, that turned the
-    /// ten-thousand file no-op sync into thousands of changes.
+    /// The full push judges by content, and only the exact passes carry
+    /// `--checksum`. Two things a later edit could quietly undo, and
+    /// neither would fail a behavioural test on macOS, where the hole never
+    /// opens — so the shape is pinned here rather than trusted to a green
+    /// run: a traversal under `--checksum` on every reconcile is the cost
+    /// the survey exists to avoid, and a selected pass without it lets a
+    /// same-size save in the same second stay hidden for good.
     #[test]
-    fn a_save_is_asked_about_only_if_it_landed_mid_push_and_shares_its_second() {
-        let tmp = tempfile::tempdir().unwrap();
-        let anchor = tmp.path();
-        std::fs::create_dir_all(anchor.join("site")).unwrap();
-        let at = |name: &str, secs: u64, nanos: u32| {
-            write_at(&anchor.join(name), b"x", secs, nanos);
-            name.as_bytes().to_vec()
-        };
-        // A push that began half a second into 100 and was still reading
-        // in 102.
-        let window = (
-            std::time::UNIX_EPOCH + std::time::Duration::new(100, 500_000_000),
-            102,
-        );
-        let kept = vec![
-            // Written in one of the push's seconds, but BEFORE it began:
-            // what the push sent is what is on disk, so nothing is
-            // hiding. This is the ten-thousand file case.
-            at("site/already-sent.txt", 100, 100_000_000),
-            at("site/mid-push.txt", 100, 900_000_000),
-            at("site/during.txt", 101, 0),
-            at("site/last-second.txt", 102, 0),
-            // After the push stopped reading: the server's copy carries
-            // an earlier second, so the quick check catches this one.
-            at("site/after.txt", 103, 0),
-            // Gone from disk between the walk and the question. Naming it
-            // to rsync would only earn a "file has vanished".
-            b"site/deleted.txt".to_vec(),
-        ];
-
-        let asked = hidden_by_the_quick_check(anchor, &kept, window);
-        assert_eq!(
-            asked,
-            vec![
-                "site/mid-push.txt".to_string(),
-                "site/during.txt".to_string(),
-                "site/last-second.txt".to_string(),
-            ],
-            "a save can hide only if it landed after the push began and \
-             inside a second the push was still reading in"
-        );
-    }
-
-    /// The catch-up is not optional, and it is not the main pass. Two
-    /// things a later edit could quietly undo, and neither would fail a
-    /// behavioural test on macOS, where the hole never opens — so the
-    /// shape is pinned here rather than trusted to a green run.
-    #[test]
-    fn the_catch_up_skips_the_quick_check_and_the_main_pass_does_not() {
+    fn the_survey_selects_by_content_and_only_the_exact_passes_checksum() {
         let mine = include_str!("sync.rs");
         let body = |name: &str| {
             let at = mine.find(name).unwrap_or_else(|| panic!("{name} exists"));
             &mine[at..][..mine[at..].find("\n}\n").expect("it ends")]
         };
 
-        let catch_up = body("fn offer_again");
+        let push = body("fn push_and_claim");
+        assert!(
+            push.contains("push_selection(") && push.contains("dir_selection("),
+            "the push must take its names from the survey, never from a traversal alone"
+        );
         for flag in ["--checksum", "--files-from=-", "--from0"] {
             assert!(
-                catch_up.contains(flag),
-                "the catch-up pass has to carry {flag}: without it the \
-                 hidden save is judged by size and second all over again"
+                body("fn offer_again").contains(flag),
+                "the warm catch-up pass has to carry {flag}"
             );
         }
+        assert!(
+            body("fn pull(").contains("--checksum") && body("fn pull(").contains("pull_selection("),
+            "the exact pull judges the selected names by content"
+        );
 
         let main = body("fn rsync_pass_dir");
         for flag in ["--ignore-times", "--checksum"] {
@@ -2831,13 +5808,2442 @@ mod tests {
                  every reconcile and the service gets turned off"
             );
         }
+        // Spelled at runtime so this test does not match itself.
+        for gone in [
+            format!("hidden_by_{}", "the_quick_check"),
+            format!("push_{}", "window"),
+        ] {
+            assert!(
+                !mine.contains(&gone),
+                "{gone} came back: a content survey needs no catch-up"
+            );
+        }
+    }
 
-        let push = body("fn push_and_claim");
-        assert!(
-            push.contains("offer_again") && push.contains("record_push_window"),
-            "a push that does not re-offer, or does not say which seconds it \
-             read in, leaves the same save hiding for good"
+    /// The survey decides the transfer. A push sends what differs and may
+    /// be sent, never a leaf whose server copy moved; a pull takes server
+    /// output onto a local copy that is still the common ancestor, never
+    /// over an edit. Both hold unknown divergence, and neither names a
+    /// leaf that vanished between the walk and the hash.
+    #[test]
+    fn the_survey_selects_exactly_the_differing_leaves_each_side_may_take() {
+        let v = |s: &str| Some(s.to_owned());
+        let rows = [
+            // (name, base, local, remote)
+            ("same", v("a"), v("a"), v("a")),
+            ("edited", v("a"), v("b"), v("a")),
+            ("new", None, v("b"), None),
+            ("generated", v("a"), v("a"), v("c")),
+            ("conflict", v("a"), v("b"), v("c")),
+            ("vanished", v("a"), None, v("a")),
+            ("unknown", None, v("b"), v("c")),
+            ("restore", v("a"), v("a"), None),
+        ];
+        let column = |index: usize| {
+            rows.iter()
+                .map(|(name, base, local, remote)| {
+                    let value = [base, local, remote][index].clone();
+                    ((*name).to_owned(), value)
+                })
+                .collect::<crate::baseline::Contents>()
+        };
+        let base = column(0);
+        let local = column(1);
+        let remote = column(2);
+
+        let (held, selected) =
+            push_selection(crate::config::NoHistory::Hold, &base, &local, &remote);
+        assert_eq!(selected, ["edited", "new", "restore"]);
+        assert_eq!(held, ["conflict", "generated", "unknown"]);
+        // The default sends what has no history; a recorded conflict stays held.
+        let (held, selected) =
+            push_selection(crate::config::NoHistory::Send, &base, &local, &remote);
+        assert_eq!(selected, ["edited", "new", "restore", "unknown"]);
+        assert_eq!(held, ["conflict", "generated"]);
+
+        let (held, selected) = pull_selection(&base, &local, &remote);
+        assert_eq!(selected, ["generated"]);
+        assert_eq!(held, ["conflict", "edited", "new", "unknown", "vanished"]);
+
+        // Directories: named only when absent or re-moded on the server.
+        let dirs = |rows: &[(&str, Option<&str>)]| {
+            rows.iter()
+                .map(|(p, v)| ((*p).to_owned(), v.map(str::to_owned)))
+                .collect::<crate::baseline::Contents>()
+        };
+        let local_dirs = dirs(&[
+            ("same", Some("d:755")),
+            ("remoded", Some("d:750")),
+            ("missing", Some("d:755")),
+            ("gone", None),
+        ]);
+        let remote_dirs = dirs(&[
+            ("same", Some("d:755")),
+            ("remoded", Some("d:755")),
+            ("missing", None),
+            ("gone", Some("d:755")),
+        ]);
+        assert_eq!(
+            dir_selection(&local_dirs, &remote_dirs),
+            ["missing", "remoded"]
         );
+    }
+
+    /// rsync 3.5.0, measured: a directory named in `--files-from` under
+    /// `--no-recursive` is created on the receiver with its mode and
+    /// WITHOUT its contents, and the missing parents of a named file are
+    /// created too. The exact push relies on both — every synced
+    /// directory rides along with the differing leaves — so a future
+    /// rsync that skips named directories must fail here, not in a
+    /// workspace where an empty directory quietly never arrives.
+    #[test]
+    fn a_directory_named_to_a_selected_pass_is_created_without_recursing() {
+        use std::os::unix::fs::PermissionsExt;
+        let rsync = local_rsync().expect("rsync >= 3.2 — ulak states the same requirement");
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(from.join("site/empty")).unwrap();
+        std::fs::create_dir_all(from.join("site/deep/er")).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("site/deep/er/f.txt"), b"f").unwrap();
+        std::fs::write(from.join("site/deep/er/skip.txt"), b"s").unwrap();
+        std::fs::set_permissions(
+            from.join("site/empty"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+
+        let mut cmd = Command::new(&rsync);
+        cmd.args([
+            "--recursive",
+            "--links",
+            "--perms",
+            "--times",
+            "--itemize-changes",
+            "--from0",
+            "--no-recursive",
+            "--files-from=-",
+            "--ignore-missing-args",
+            "--checksum",
+        ]);
+        cmd.arg("--")
+            .arg(format!("{}/", from.display()))
+            .arg(format!("{}/", to.display()));
+        let out = crate::proc::run_bounded(
+            &mut cmd,
+            Some(b"site/empty\0site/deep/er/f.txt\0".to_vec()),
+            crate::proc::PROBE,
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(0), "rsync itself must not fail");
+        assert_eq!(
+            std::fs::metadata(to.join("site/empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750,
+            "a named directory arrives with its mode"
+        );
+        assert_eq!(std::fs::read(to.join("site/deep/er/f.txt")).unwrap(), b"f");
+        assert!(
+            !to.join("site/deep/er/skip.txt").exists(),
+            "naming a directory must not recurse into it"
+        );
+    }
+
+    /// Which ledger-claimed, locally deleted files the server may lose. A
+    /// copy the server changed since the last agreed content is kept; one
+    /// with no agreed content at all — an older ulak's claim, a lost
+    /// confirmation — is retired on the ledger's word, as before content
+    /// records existed. Measured: refusing it left a file created and
+    /// deleted within one confirmation round trip undeletable for good.
+    /// A server copy ulak itself sent without a receipt is not a change:
+    /// calling it one warned that the server had edited the file and
+    /// brought the user's own deleted upload back.
+    #[test]
+    fn only_a_known_change_on_the_server_keeps_a_deleted_file_there() {
+        let a = "f:420:a".to_owned();
+        let b = "f:420:b".to_owned();
+        let sent_b = std::collections::BTreeSet::from([b.clone()]);
+        let sent_a = std::collections::BTreeSet::from([a.clone()]);
+        assert!(moved_on_the_server(Some(&a), None, Some(&b)));
+        assert!(
+            moved_on_the_server(Some(&a), Some(&sent_a), Some(&b)),
+            "a send of other bytes does not explain the server's copy"
+        );
+        assert!(
+            !moved_on_the_server(Some(&a), Some(&sent_b), Some(&b)),
+            "the server holds ulak's own unconfirmed upload"
+        );
+        assert!(!moved_on_the_server(Some(&a), None, Some(&a)));
+        assert!(!moved_on_the_server(None, None, Some(&b)));
+        assert!(!moved_on_the_server(Some(&a), None, None));
+        assert!(!moved_on_the_server(None, None, None));
+    }
+
+    /// The deletion flow splits by that one rule: a row the server changed
+    /// since the last agreed content is spared, and every other row —
+    /// unchanged, never agreed on, already gone from the server, or holding
+    /// ulak's own upload whose receipt was lost — is still deleted. One
+    /// spared row used to stop the whole sync.
+    #[test]
+    fn only_the_rows_the_server_changed_are_spared_and_the_rest_are_deleted() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let (a, b, c) = (
+            "f:420:a".to_string(),
+            "f:420:b".to_string(),
+            "f:420:c".to_string(),
+        );
+        common
+            .record(crate::baseline::Contents::from([
+                ("edited.rs".into(), Some(a.clone())),
+                ("gone.rs".into(), Some(a.clone())),
+                ("same.rs".into(), Some(a.clone())),
+                ("uploaded.rs".into(), Some(a.clone())),
+            ]))
+            .unwrap();
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "uploaded.rs".to_string(),
+                c.clone(),
+            )]))
+            .unwrap();
+        let remote = crate::baseline::Contents::from([
+            ("edited.rs".into(), Some(b.clone())),
+            ("gone.rs".into(), None),
+            ("same.rs".into(), Some(a.clone())),
+            ("unagreed.rs".into(), Some(b.clone())),
+            ("uploaded.rs".into(), Some(c.clone())),
+        ]);
+        let doomed = [
+            "edited.rs",
+            "gone.rs",
+            "same.rs",
+            "unagreed.rs",
+            "uploaded.rs",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (deleted, spared) = split_moved(doomed, &common, &remote);
+        assert_eq!(
+            deleted,
+            ["gone.rs", "same.rs", "unagreed.rs", "uploaded.rs"]
+        );
+        assert_eq!(spared, ["edited.rs"]);
+    }
+
+    /// Rescanning the directories the notices name and splicing the walk's
+    /// answer into the previous plan must give exactly the full walk's
+    /// answer: the same kept leaves, kept directories and literal excludes,
+    /// under the same ignore files. A notice naming a directory, or a leaf
+    /// whose parent is gone, is not rescanned but sent to the full path; a
+    /// leaf under an excluded directory changes nothing.
+    #[test]
+    fn a_rescanned_directory_answers_as_the_full_walk_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = tmp.path();
+        let write = |rel: &str| {
+            let p = anchor.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+            p
+        };
+        std::fs::write(anchor.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        for rel in [
+            "app/src/a.rs",
+            "app/src/b.rs",
+            "app/src/old.log",
+            "app/build/out.o",
+            "lib/c.rs",
+            "docs/d.md",
+        ] {
+            write(rel);
+        }
+        let cfg = crate::config::SyncCfg {
+            exclude: vec![],
+            include: vec![],
+            protect: vec![],
+            max_delete: crate::config::DeleteBudget::Limit(25),
+            no_history: crate::config::NoHistory::Send,
+        };
+        let fp = inventory_footprint(anchor);
+        let full = || {
+            let mut plan = walk::plan_in(anchor, anchor, &cfg, &fp.build_filter()).unwrap();
+            plan.kept.sort();
+            plan.kept_dirs.sort();
+            plan.excludes.sort();
+            plan
+        };
+        let previous = full();
+        assert!(previous.kept.contains(&b"app/src/a.rs".to_vec()));
+        assert!(previous.excludes.contains(&b"app/build".to_vec()));
+
+        // Leaves appear, vanish and turn out ignored in two directories.
+        let new = write("app/src/new.rs");
+        let log = write("app/src/new.log");
+        let gone = anchor.join("lib/c.rs");
+        std::fs::remove_file(&gone).unwrap();
+        let paths = [new, log, gone].into_iter().collect();
+        let (plan, scopes) = rescanned_plan(&cfg, &fp, &previous, &paths)
+            .unwrap()
+            .expect("leaves under known directories are rescanned");
+        assert_eq!(scopes, [anchor.join("app/src"), anchor.join("lib")]);
+        let expected = full();
+        assert_eq!(plan.kept, expected.kept);
+        assert_eq!(plan.kept_dirs, expected.kept_dirs);
+        assert_eq!(plan.excludes, expected.excludes);
+        assert!(plan.kept.contains(&b"app/src/new.rs".to_vec()));
+        assert!(!plan.kept.contains(&b"lib/c.rs".to_vec()));
+        assert!(plan.excludes.contains(&b"app/src/new.log".to_vec()));
+
+        // A leaf under an excluded directory is not walked; nothing changes.
+        let ignored = write("app/build/more.o");
+        let (same, scopes) = rescanned_plan(&cfg, &fp, &previous, &[ignored].into_iter().collect())
+            .unwrap()
+            .unwrap();
+        assert!(scopes.is_empty());
+        assert_eq!(same.kept, previous.kept);
+
+        // A known directory reported instead of its changed child is
+        // rescanned itself; an unknown one is reported through its parent,
+        // where the walker's builtin excludes still apply; a leaf whose
+        // parent is gone belongs to the full path.
+        let (again, scopes) = rescanned_plan(
+            &cfg,
+            &fp,
+            &previous,
+            &[anchor.join("app/src")].into_iter().collect(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(scopes, [anchor.join("app/src")]);
+        let mut only_app_src = previous.kept.clone();
+        only_app_src.push(b"app/src/new.rs".to_vec());
+        only_app_src.sort();
+        assert_eq!(
+            again.kept, only_app_src,
+            "a rescan of app/src learns its new leaf and nothing about lib/"
+        );
+        std::fs::create_dir(anchor.join("app/src/.ulak-partial")).unwrap();
+        std::fs::write(anchor.join("app/src/.ulak-partial/tmp"), "half").unwrap();
+        let (staged, scopes) = rescanned_plan(
+            &cfg,
+            &fp,
+            &previous,
+            &[anchor.join("app/src/.ulak-partial")].into_iter().collect(),
+        )
+        .unwrap()
+        .expect("rsync's staging directory is excluded by the parent's rescan");
+        assert_eq!(scopes, [anchor.join("app/src")]);
+        assert_eq!(staged.kept, only_app_src);
+        assert!(staged.excludes.contains(&b"app/src/.ulak-partial".to_vec()));
+        std::fs::create_dir(anchor.join("app/src/sub")).unwrap();
+        std::fs::write(anchor.join("app/src/sub/deep.rs"), "x").unwrap();
+        let (grown, _) = rescanned_plan(
+            &cfg,
+            &fp,
+            &previous,
+            &[anchor.join("app/src/sub")].into_iter().collect(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            grown.kept_dirs.contains(&b"app/src/sub".to_vec())
+                && grown.kept.contains(&b"app/src/sub/deep.rs".to_vec()),
+            "a new directory is listed by the parent's rescan; its leaves have no known parent yet"
+        );
+        // A leaf inside a directory the rules exclude but the literal list
+        // could not name yet (rsync's staging) is never walked; once that
+        // directory has vanished with its temporary, the notice is read
+        // through the nearest surviving ancestor.
+        let temporary = [anchor.join("app/src/.ulak-partial/gone.tmp")]
+            .into_iter()
+            .collect();
+        let (untouched, scopes) = rescanned_plan(&cfg, &fp, &previous, &temporary)
+            .unwrap()
+            .unwrap();
+        assert!(scopes.is_empty());
+        assert_eq!(untouched.kept, previous.kept);
+        std::fs::remove_dir_all(anchor.join("app/src/.ulak-partial")).unwrap();
+        let (_, scopes) = rescanned_plan(&cfg, &fp, &previous, &temporary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scopes, [anchor.join("app/src")]);
+    }
+
+    /// A refused push batch is not an invitation to rsync the same
+    /// selection: only a create's missing parent is. A leaf
+    /// the server changed
+    /// since the survey is held, and a claim made fresh for a leaf the
+    /// exchange never sent is retired — otherwise a later local delete
+    /// would license removing the server's own file.
+    #[test]
+    fn a_refused_batch_holds_what_moved_and_retires_what_it_never_sent() {
+        let selected: Vec<String> = ["a.rs", "app/first.rs", "b.rs", "big.bin", "new.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let refused = vec![
+            // A first population: the root `app/` is not on the server yet.
+            ("app/first.rs".to_string(), "missing parent".to_string()),
+            ("b.rs".to_string(), "differs".to_string()),
+            ("big.bin".to_string(), "needs rsync".to_string()),
+            ("new.rs".to_string(), "exists".to_string()),
+        ];
+        let (rsync, held) = split_refusal(&selected, &refused);
+        assert_eq!(rsync, ["a.rs", "app/first.rs"]);
+        assert_eq!(
+            held.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["b.rs", "big.bin", "new.rs"]
+        );
+
+        let written = [b"a.rs".to_vec(), b"new.rs".to_vec()];
+        let fresh = fresh_claims(&written, |name| name == "a.rs");
+        assert_eq!(
+            fresh,
+            ["new.rs"],
+            "only a claim the ledger did not hold before is fresh"
+        );
+
+        // Pinned on the source: both exchanges retire fresh claims when
+        // nothing was applied, and do so before the error is raised.
+        let mine = include_str!("sync.rs");
+        for name in ["fn stream_structure", "fn push_and_claim"] {
+            let at = mine.find(name).unwrap();
+            let body = &mine[at..][..mine[at..].find("\n}\n").unwrap()];
+            assert!(
+                body.contains("fresh_claims(") && body.matches("ledger::store(").count() >= 2,
+                "{name} must claim before the exchange and retire the fresh claims after a refusal"
+            );
+        }
+    }
+
+    /// A project whose anchor is `local`, bound to a destination that is
+    /// never contacted: the exchange under test goes to the real helper
+    /// serving `remote` instead.
+    fn helper_project(local: &std::path::Path) -> (Project, Ssh) {
+        std::fs::write(local.join("compose.yaml"), "services: {}\n").unwrap();
+        let inv =
+            crate::invocation::Invocation::capture_in(local, &[], Default::default()).unwrap();
+        let project = Project {
+            config_home: local.to_path_buf(),
+            anchor: local.to_path_buf(),
+            name: "channel".into(),
+            identity: "channel".into(),
+            stack_pin: None,
+            config: Default::default(),
+            workspace_key: crate::config::WorkspaceKey::from_namespace("channel", local).unwrap(),
+            inv,
+        };
+        let ssh = Ssh::new_in("unused", &Default::default(), false, local).unwrap();
+        (project, ssh)
+    }
+
+    /// The helper refusing a replace because the server's copy moved since
+    /// the survey is a conflict, not an invitation: the answer names the
+    /// refusal, and the server's new work is still there afterwards.
+    /// Measured: the refusal collapsed into the rsync fallback,
+    /// which sent the stale selection and wrote over the server's change.
+    #[test]
+    fn a_content_refusal_over_the_channel_is_a_conflict_not_an_rsync_fallback() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let rel = "file.rs";
+        let rp = remote.path().join(rel);
+        std::fs::write(&rp, b"common ancestor").unwrap();
+        let ancestor = crate::baseline::fingerprint(&rp).unwrap();
+        let lp = local.path().join(rel);
+        std::fs::write(&lp, b"local edit").unwrap();
+        let surveyed = std::collections::BTreeMap::from([(rel.to_string(), ancestor)]);
+        let replace = || {
+            let mut batch = crate::stream::Batch::new();
+            batch
+                .add(
+                    local.path(),
+                    &lp,
+                    &crate::selection::Stamp::read(&lp).unwrap(),
+                    false,
+                )
+                .unwrap();
+            // The cold push guards on the survey's view of the server, so
+            // a file with no common record still goes (no_history = send).
+            batch.guard(&surveyed);
+            batch
+        };
+        let mut channel = Some(crate::stream::local_helper(remote.path()));
+        // The accepting case first: the server still holds what was surveyed.
+        let sent = channel_send(&project, &ssh, &mut channel, replace()).unwrap();
+        assert!(
+            matches!(sent, Sent::Applied(_)),
+            "an unmoved server copy is replaced"
+        );
+        assert_eq!(std::fs::read(&rp).unwrap(), b"local edit");
+        // Then the server writes between the survey and the exchange.
+        std::fs::write(&rp, b"new server work").unwrap();
+        let sent = channel_send(&project, &ssh, &mut channel, replace()).unwrap();
+        let Sent::Refused(refused) = sent else {
+            panic!("a content refusal must come back by name, never as the rsync fallback");
+        };
+        assert_eq!(refused[0].0, rel);
+        assert_ne!(refused[0].1, "needs rsync");
+        assert_eq!(std::fs::read(&rp).unwrap(), b"new server work");
+        let selected = vec![rel.to_string()];
+        let (rsync, held) = split_refusal(&selected, &refused);
+        assert!(rsync.is_empty(), "nothing of this batch may go to rsync");
+        assert_eq!(held[0].0, rel);
+    }
+
+    /// A server copy past the channel's size limit is compared before the
+    /// helper answers. Unchanged since the survey, the small local bytes
+    /// replace it over the channel with no rsync at all; grown past the
+    /// limit since the survey, it is a server that moved and is held.
+    /// Measured: the helper answered "needs rsync" before
+    /// comparing, and the stale selection went to rsync over the change.
+    #[test]
+    fn a_large_server_copy_is_compared_before_the_channel_answers() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let (rp, lp) = (remote.path().join("file.rs"), local.path().join("file.rs"));
+        let send = |surveyed: &crate::baseline::Contents| {
+            let mut batch = crate::stream::Batch::new();
+            batch
+                .add(
+                    local.path(),
+                    &lp,
+                    &crate::selection::Stamp::read(&lp).unwrap(),
+                    false,
+                )
+                .unwrap();
+            batch.guard(surveyed);
+            batch
+        };
+        let mut channel = Some(crate::stream::local_helper(remote.path()));
+
+        // Accepting: a large server copy, unchanged since it was surveyed.
+        std::fs::write(&rp, vec![b'S'; 1024 * 1024 + 1]).unwrap();
+        let surveyed = std::collections::BTreeMap::from([(
+            "file.rs".to_string(),
+            crate::baseline::fingerprint(&rp).unwrap(),
+        )]);
+        std::fs::write(&lp, b"local edit").unwrap();
+        let sent = channel_send(&project, &ssh, &mut channel, send(&surveyed)).unwrap();
+        assert!(
+            matches!(sent, Sent::Applied(_)),
+            "an unmoved large copy is replaced"
+        );
+        assert_eq!(std::fs::read(&rp).unwrap(), b"local edit");
+
+        // Refusing: small when surveyed, grown past the limit since.
+        let surveyed = std::collections::BTreeMap::from([(
+            "file.rs".to_string(),
+            crate::baseline::fingerprint(&rp).unwrap(),
+        )]);
+        let remote_work = vec![b'R'; 1024 * 1024 + 1];
+        std::fs::write(&rp, &remote_work).unwrap();
+        std::fs::write(&lp, b"a second local edit").unwrap();
+        let Sent::Refused(refused) =
+            channel_send(&project, &ssh, &mut channel, send(&surveyed)).unwrap()
+        else {
+            panic!("a server copy that moved must be refused");
+        };
+        assert_eq!(std::fs::read(&rp).unwrap(), remote_work);
+        assert_eq!(refused[0].1, "differs", "compared, not waved on by size");
+        let (rsync, held) = split_refusal(&["file.rs".to_string()], &refused);
+        assert!(
+            rsync.is_empty(),
+            "the move must not reach rsync: {refused:?}"
+        );
+        assert_eq!(held[0].0, "file.rs");
+    }
+
+    /// A lost receipt proves nothing about what the helper applied, so the
+    /// fresh claim stands and the send is kept as unconfirmed. Deleting
+    /// the local copy then retires the server's copy — the upload — rather
+    /// than leaving it unclaimed for a pull to bring back. Measured: the
+    /// claim was retired on the transport error, and the
+    /// locally deleted upload became an unclaimed pull candidate.
+    #[test]
+    fn a_lost_receipt_keeps_the_claim_and_remembers_what_was_sent() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, mut ssh) = helper_project(local.path());
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        std::fs::write(&lp, b"local new file").unwrap();
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let mut session = Session {
+            stream: Some(crate::stream::local_helper_losing_receipts(remote.path())),
+            ..Session::default()
+        };
+        let observed = std::collections::BTreeMap::from([(
+            lp.clone(),
+            crate::selection::Stamp::read(&lp).unwrap(),
+        )]);
+        let result = stream_structure(
+            &project,
+            &inventory_footprint(local.path()),
+            &ssh,
+            &mut session,
+            &mut common,
+            &state,
+            &[b"new.rs".to_vec()],
+            &[],
+            &observed,
+            true,
+        );
+        assert!(result.is_err(), "no receipt is an error");
+        assert_eq!(
+            std::fs::read(remote.path().join("new.rs")).unwrap(),
+            b"local new file",
+            "the helper applied the create before its receipt was lost"
+        );
+        std::fs::remove_file(&lp).unwrap();
+        let unclaimed = crate::selection::unclaimed(
+            b"new.rs\0",
+            &ledger::synced_files(&state),
+            &crate::selection::Excludes::new([]),
+        )
+        .unwrap();
+        assert!(
+            unclaimed.is_empty(),
+            "the upload must not look server-born: {unclaimed:?}"
+        );
+        let sent = common.unconfirmed("new.rs").cloned();
+        assert!(sent.is_some(), "what was sent is remembered");
+        assert!(common.get("new.rs").is_none(), "and is not common content");
+
+        // The deletion that follows: the server holds what was sent, so
+        // the row is doomed like any other.
+        let server = crate::baseline::fingerprint(&remote.path().join("new.rs")).unwrap();
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, ["new.rs"]);
+        let remote_view = crate::baseline::Contents::from([("new.rs".to_string(), server)]);
+        let kept =
+            retire_never_landed(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+        assert_eq!(kept, ["new.rs"], "the upload is ulak's to delete");
+    }
+
+    /// The restart's push keeps the same record as the warm path. Here the
+    /// server makes its own file after the survey, the helper refuses the
+    /// create, and the refusal is lost with the network down: the claim
+    /// stands, and after a restart and a local delete the server's file is
+    /// still not ulak's to delete — the unconfirmed record, written before
+    /// the exchange, says what ulak sent, and the server holds something
+    /// else. Measured: the cold path recorded nothing, and the
+    /// deletion was authorized even with no_history = hold.
+    #[test]
+    fn a_lost_refusal_on_the_restart_push_never_licenses_deleting_server_work() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (mut project, mut ssh) = helper_project(local.path());
+        project.config.sync.no_history = crate::config::NoHistory::Hold;
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        std::fs::write(&lp, b"local new file").unwrap();
+        let mut cache = crate::hashcache::Cache::open(&state, local.path());
+        let local_content = cache.fingerprint(local.path(), "new.rs").unwrap();
+        let mut survey = Survey {
+            plan: walk::WalkReport {
+                kept: vec![b"new.rs".to_vec()],
+                ..Default::default()
+            },
+            local: crate::baseline::Contents::from([("new.rs".into(), local_content)]),
+            remote: crate::baseline::Contents::from([("new.rs".into(), None)]),
+            local_dirs: Default::default(),
+            remote_dirs: Default::default(),
+            listing: None,
+            returning_when_listed: Default::default(),
+            common: crate::baseline::State::load(&state, local.path()).unwrap(),
+            cache,
+        };
+        let rp = remote.path().join("new.rs");
+        std::fs::write(&rp, b"server's own work").unwrap();
+        let mut channel = Some(crate::stream::local_helper_losing_receipts(remote.path()));
+        let result = push_and_claim(
+            &PathBuf::from("rsync-not-invoked"),
+            &project,
+            &inventory_footprint(local.path()),
+            &ssh,
+            &mut survey,
+            &state,
+            &crate::proc::Budget::new(crate::proc::RECONCILE),
+            &mut channel,
+        );
+        assert!(result.is_err(), "the fence cannot reach an offline server");
+        assert_eq!(std::fs::read(&rp).unwrap(), b"server's own work");
+        std::fs::remove_file(&lp).unwrap();
+        // A restart reloads durable state and takes the real deletion path.
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        assert!(
+            common.unconfirmed("new.rs").is_some(),
+            "recorded before the exchange"
+        );
+        let remote_view = crate::baseline::Contents::from([(
+            "new.rs".into(),
+            crate::baseline::fingerprint(&rp).unwrap(),
+        )]);
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, ["new.rs"], "the claim stands until it is judged");
+        let doomed =
+            retire_never_landed(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+        assert!(doomed.is_empty(), "the server's own file is never deleted");
+    }
+
+    /// A survey of one local file, `new.rs`, against the server copy the
+    /// caller names, as the restart's push would take it.
+    fn one_file_survey(project: &Project, ssh: &Ssh, remote: Option<String>) -> Survey {
+        let state = project.state_key(&ssh.dest);
+        let mut cache = crate::hashcache::Cache::open(&state, &project.anchor);
+        let local = cache.fingerprint(&project.anchor, "new.rs").unwrap();
+        Survey {
+            plan: walk::WalkReport {
+                kept: vec![b"new.rs".to_vec()],
+                ..Default::default()
+            },
+            local: crate::baseline::Contents::from([("new.rs".into(), local)]),
+            remote: crate::baseline::Contents::from([("new.rs".into(), remote)]),
+            local_dirs: Default::default(),
+            remote_dirs: Default::default(),
+            listing: None,
+            returning_when_listed: Default::default(),
+            common: crate::baseline::State::load(&state, &project.anchor).unwrap(),
+            cache,
+        }
+    }
+
+    /// The protective record is written before the claim, so a record
+    /// that cannot be written leaves no claim behind — not a claim that,
+    /// once storage recovers and the local copy is deleted, licenses
+    /// deleting a server file ulak never wrote. Measured with a
+    /// read-only common-content directory and a writable ledger; here a
+    /// FILE stands where the record's directory belongs, which fails the
+    /// write for root as well.
+    #[test]
+    fn a_protective_record_that_cannot_be_written_leaves_no_claim() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (mut project, mut ssh) = helper_project(local.path());
+        project.config.sync.no_history = crate::config::NoHistory::Hold;
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        std::fs::write(&lp, b"local new file").unwrap();
+        let mut survey = one_file_survey(&project, &ssh, None);
+        survey
+            .common
+            .record(crate::baseline::Contents::from([(
+                "unrelated.rs".into(),
+                None,
+            )]))
+            .unwrap();
+        let common_dir = crate::intent::workspace_state_dir_path(&state)
+            .unwrap()
+            .join("common");
+        let journal = std::fs::read_dir(common_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let parked = journal.with_extension("parked");
+        std::fs::rename(&journal, &parked).unwrap();
+        std::fs::write(&journal, b"not a directory").unwrap();
+        let rp = remote.path().join("new.rs");
+        std::fs::write(&rp, b"server's own work").unwrap();
+        let result = push_and_claim(
+            &PathBuf::from("rsync-not-invoked"),
+            &project,
+            &inventory_footprint(local.path()),
+            &ssh,
+            &mut survey,
+            &state,
+            &crate::proc::Budget::new(crate::proc::RECONCILE),
+            &mut Some(crate::stream::local_helper(remote.path())),
+        );
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::rename(&parked, &journal).unwrap();
+        assert!(result.is_err(), "the record could not be written");
+        assert_eq!(std::fs::read(&rp).unwrap(), b"server's own work");
+        std::fs::remove_file(&lp).unwrap();
+        assert!(
+            ledger::doomed(&state, local.path(), &[]).is_empty(),
+            "no claim was made without its record"
+        );
+    }
+
+    /// A retry whose receipt is lost again adds its content to the record
+    /// instead of leaving the first attempt's: the second upload is the
+    /// one on the server, and it must still be ulak's to delete, not a
+    /// server-born file a pull would bring back.
+    #[test]
+    fn a_retry_whose_receipt_is_lost_again_is_recorded_too() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, mut ssh) = helper_project(local.path());
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        let rp = remote.path().join("new.rs");
+        for bytes in [b"first upload".as_slice(), b"second upload".as_slice()] {
+            std::fs::write(&lp, bytes).unwrap();
+            let surveyed = crate::baseline::fingerprint(&rp).unwrap();
+            let mut survey = one_file_survey(&project, &ssh, surveyed);
+            let result = push_and_claim(
+                &PathBuf::from("rsync-not-invoked"),
+                &project,
+                &inventory_footprint(local.path()),
+                &ssh,
+                &mut survey,
+                &state,
+                &crate::proc::Budget::new(crate::proc::RECONCILE),
+                &mut Some(crate::stream::local_helper_losing_receipts(remote.path())),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&rp).unwrap(), bytes, "the helper applied it");
+        }
+        std::fs::remove_file(&lp).unwrap();
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let remote_view = crate::baseline::Contents::from([(
+            "new.rs".into(),
+            crate::baseline::fingerprint(&rp).unwrap(),
+        )]);
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        let kept =
+            retire_never_landed(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+        assert_eq!(kept, ["new.rs"], "the second upload is ulak's to delete");
+        let unclaimed = crate::selection::unclaimed(
+            b"new.rs\0",
+            &ledger::synced_files(&state),
+            &crate::selection::Excludes::new([]),
+        )
+        .unwrap();
+        assert!(unclaimed.is_empty(), "and never a pull candidate");
+    }
+
+    /// The other outcome of a lost receipt: the send never landed and the
+    /// server holds its own file under the name. That file is not deleted
+    /// on the unconfirmed claim's word; the claim is retired instead.
+    #[test]
+    fn an_unconfirmed_send_the_server_never_received_dooms_nothing() {
+        let a = "f:420:aa".to_string();
+        let b = "f:420:bb".to_string();
+        let sent = std::collections::BTreeSet::from([a.clone()]);
+        let both = std::collections::BTreeSet::from([a.clone(), b.clone()]);
+        assert!(never_landed(None, Some(&sent), Some(&b)));
+        assert!(
+            !never_landed(None, Some(&sent), Some(&a)),
+            "ours: deletable"
+        );
+        assert!(
+            !never_landed(None, Some(&both), Some(&b)),
+            "any attempt is ours"
+        );
+        assert!(
+            !never_landed(None, Some(&sent), None),
+            "gone: nothing to protect"
+        );
+        assert!(
+            !never_landed(None, None, Some(&b)),
+            "no send on record: the ledger's word"
+        );
+        assert!(
+            !never_landed(Some(&b), Some(&sent), Some(&b)),
+            "agreement outranks a guess"
+        );
+
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        ledger::store(&state, local.path(), &[b"theirs.rs".to_vec()], &[], &[]);
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "theirs.rs".to_string(),
+                a.clone(),
+            )]))
+            .unwrap();
+        let remote_view =
+            crate::baseline::Contents::from([("theirs.rs".to_string(), Some(b.clone()))]);
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, ["theirs.rs"], "the claim dooms it until judged");
+        let kept =
+            retire_never_landed(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+        assert!(kept.is_empty(), "the server's own file is never deleted");
+        assert!(
+            ledger::doomed(&state, local.path(), &[]).is_empty(),
+            "claim retired"
+        );
+        assert!(
+            common.unconfirmed("theirs.rs").is_none(),
+            "and the send settled"
+        );
+    }
+
+    /// A create the helper refused because the server already held a
+    /// different file leaves no ledger claim behind: otherwise deleting
+    /// the local copy later would doom the server's own file, even under
+    /// no_history = hold. Measured with exactly this sequence.
+    #[test]
+    fn a_refused_create_leaves_no_claim_that_could_doom_the_servers_file() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (mut project, ssh) = helper_project(local.path());
+        project.config.sync.no_history = crate::config::NoHistory::Hold;
+        let rel = "file.rs";
+        let rp = remote.path().join(rel);
+        std::fs::write(&rp, b"server's own file").unwrap();
+        let lp = local.path().join(rel);
+        std::fs::write(&lp, b"local edit").unwrap();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let mut session = Session {
+            stream: Some(crate::stream::local_helper(remote.path())),
+            ..Session::default()
+        };
+        let fp = inventory_footprint(local.path());
+        let observed = std::collections::BTreeMap::from([(
+            lp.clone(),
+            crate::selection::Stamp::read(&lp).unwrap(),
+        )]);
+        let result = stream_structure(
+            &project,
+            &fp,
+            &ssh,
+            &mut session,
+            &mut common,
+            &state,
+            &[rel.as_bytes().to_vec()],
+            &[],
+            &observed,
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "the create is refused: the server holds different bytes"
+        );
+        assert_eq!(std::fs::read(&rp).unwrap(), b"server's own file");
+        assert!(common.get(rel).is_none());
+        std::fs::remove_file(&lp).unwrap();
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert!(
+            !doomed.contains(&rel.to_string()),
+            "a claim the exchange never honoured must not survive it: {doomed:?}"
+        );
+    }
+
+    /// A doomed row the SSH user may not read is refused as "unreadable"
+    /// and handed to the rsync fallback, which holds it and deletes the
+    /// rest; the channel survives. Measured: the helper raised on the
+    /// permission error, the channel ended, and every structural batch that
+    /// named the row failed its service tick until the file became readable.
+    #[test]
+    fn a_doomed_row_the_ssh_user_cannot_read_goes_to_the_rsync_fallback_not_a_dead_channel() {
+        use std::os::unix::fs::PermissionsExt;
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let fp = inventory_footprint(local.path());
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let locked = remote.path().join("master.key");
+        std::fs::write(&locked, b"agreed").unwrap();
+        common
+            .record(crate::baseline::Contents::from([(
+                "master.key".into(),
+                crate::baseline::fingerprint(&locked).unwrap(),
+            )]))
+            .unwrap();
+        ledger::store(&state, local.path(), &[b"master.key".to_vec()], &[], &[]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut session = Session {
+            stream: Some(crate::stream::local_helper(remote.path())),
+            ..Session::default()
+        };
+        let answer = stream_structure(
+            &project,
+            &fp,
+            &ssh,
+            &mut session,
+            &mut common,
+            &state,
+            &[],
+            &["master.key".to_string()],
+            &Default::default(),
+            true,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            matches!(answer, Ok(Structure::Rsync)),
+            "the row goes to the rsync fallback, not an error"
+        );
+        assert!(session.stream.is_some(), "the channel survives");
+        assert_eq!(std::fs::read(&locked).unwrap(), b"agreed");
+        assert_eq!(ledger::doomed(&state, local.path(), &[]), ["master.key"]);
+    }
+
+    /// A claimed file deleted here whose server copy changed since the last
+    /// agreed content no longer stops the sync. Over the channel the helper
+    /// refuses that unlink and the warm path steps aside with nothing
+    /// applied; the full path then retires the claim, so the pull's
+    /// creating pass sees a server-born file and brings the server's edit
+    /// home. A row the server left alone is still deleted. Both paths used
+    /// to return a conflict error, on every sync, until someone reconciled
+    /// the file by hand.
+    #[test]
+    fn a_deleted_file_the_server_changed_comes_back_instead_of_stopping_the_sync() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let fp = inventory_footprint(local.path());
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        // Both files were synced, then deleted here: claimed, agreed on,
+        // and absent from this machine.
+        let mut agreed = crate::baseline::Contents::new();
+        for name in ["edited.rs", "untouched.rs"] {
+            let rp = remote.path().join(name);
+            std::fs::write(&rp, b"agreed").unwrap();
+            agreed.insert(name.into(), crate::baseline::fingerprint(&rp).unwrap());
+            ledger::store(&state, local.path(), &[name.as_bytes().to_vec()], &[], &[]);
+        }
+        common.record(agreed).unwrap();
+        // The server then edits one of them.
+        let edited = remote.path().join("edited.rs");
+        std::fs::write(&edited, b"server edit").unwrap();
+        let mut session = Session {
+            stream: Some(crate::stream::local_helper(remote.path())),
+            ..Session::default()
+        };
+        let mut unlink = |common: &mut crate::baseline::State, name: &str| {
+            stream_structure(
+                &project,
+                &fp,
+                &ssh,
+                &mut session,
+                common,
+                &state,
+                &[],
+                &[name.to_string()],
+                &Default::default(),
+                true,
+            )
+            .unwrap()
+        };
+
+        // Accepting: the untouched server copy is deleted over the channel.
+        let applied = unlink(&mut common, "untouched.rs");
+        assert!(matches!(applied, Structure::Applied(ref r) if r.deleted == 1));
+        assert!(!remote.path().join("untouched.rs").exists());
+        // Refusing: the edited copy stays and nothing fails; the warm path
+        // steps aside with the claim untouched, for the full path to judge.
+        let refused = unlink(&mut common, "edited.rs");
+        assert!(matches!(refused, Structure::Full));
+        assert_eq!(std::fs::read(&edited).unwrap(), b"server edit");
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, ["edited.rs"]);
+
+        // The full path's judgement, over the server's copy as it reads it.
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "edited.rs".into(),
+                "f:420:lost".into(),
+            )]))
+            .unwrap();
+        assert!(common.unconfirmed("edited.rs").is_some());
+        let remote_view = crate::baseline::Contents::from([(
+            "edited.rs".into(),
+            crate::baseline::fingerprint(&edited).unwrap(),
+        )]);
+        let doomed = retire_moved(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+        assert!(doomed.is_empty(), "the server's edit is never deleted");
+        assert!(
+            crate::baseline::State::load(&state, local.path())
+                .unwrap()
+                .returning("edited.rs"),
+            "and it is marked for the pull that lands it, whichever that is"
+        );
+        assert_eq!(std::fs::read(&edited).unwrap(), b"server edit");
+        assert!(
+            ledger::doomed(&state, local.path(), &[]).is_empty(),
+            "the claim is retired"
+        );
+        assert!(
+            common.unconfirmed("edited.rs").is_none(),
+            "and any unconfirmed send under the name settled"
+        );
+        let unclaimed = crate::selection::unclaimed(
+            b"edited.rs\0",
+            &ledger::synced_files(&state),
+            &crate::selection::Excludes::new([]),
+        )
+        .unwrap();
+        assert_eq!(
+            unclaimed,
+            [b"edited.rs".to_vec()],
+            "the pull's creating pass brings the server's copy home"
+        );
+
+        // Pinned on the source: the full push judges the rows before the
+        // budget counts them — a spared row was counted, prompted for and
+        // recorded as pending, and a service over budget never retired its
+        // claim — and before it lists or removes the rest. A moved row
+        // never stops it.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn push(").expect("the full push");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("the full push lost `{needle}`"))
+        };
+        for later in [
+            "budget.allows(",
+            "report.pending_deletions = doomed.len()",
+            "confirm_deletions(",
+            "ui::dim(&format!(\"- {p}\"))",
+            "delete_remote(",
+        ] {
+            assert!(
+                at("judge_doomed(") < at(later),
+                "the full push must judge the rows before `{later}`"
+            );
+        }
+        assert!(!body.contains("content_conflict("));
+        let at = mine.find("\nfn judge_doomed(").expect("the judgement");
+        let judge = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        for judged in ["retire_never_landed(", "retire_moved("] {
+            assert!(judge.contains(judged), "the judgement lost `{judged}`");
+        }
+    }
+
+    /// A file `retire_moved` spared is marked returning in the
+    /// common-content state, so whichever pull lands it claims it again:
+    /// this sync's, a passthrough's `pull_back`, or the service's warm
+    /// pull, in this process or a later one. The mark used to be a list
+    /// handed from push to pull in memory, which only `ulak sync` did:
+    /// after `ulak docker compose up` the file landed unclaimed, the
+    /// second local deletion doomed nothing, and every command's pull
+    /// brought it back without a word. Only a returning name that landed
+    /// is claimed; one held back stays marked for a later pull. The e2e
+    /// test `a_deleted_file_the_server_changed_comes_back_and_the_sync_goes_on`
+    /// drives the second deletion through `ulak sync` and through a
+    /// passthrough.
+    #[test]
+    fn a_returning_file_any_later_pull_lands_is_claimed_again_so_a_second_deletion_goes_through() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let (a, b) = ("f:420:a".to_string(), "f:420:b".to_string());
+        // Synced and agreed on, deleted here, then edited on the server.
+        let mut agreed = crate::baseline::Contents::new();
+        for name in ["edited.rs", "held.rs"] {
+            ledger::store(&state, local.path(), &[name.as_bytes().to_vec()], &[], &[]);
+            agreed.insert(name.into(), Some(a.clone()));
+        }
+        common.record(agreed).unwrap();
+        let remote = crate::baseline::Contents::from([
+            ("edited.rs".into(), Some(b.clone())),
+            ("held.rs".into(), Some(b.clone())),
+        ]);
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        let doomed = retire_moved(&state, local.path(), &mut common, &remote, doomed).unwrap();
+        assert!(doomed.is_empty());
+        drop(common);
+
+        // A later command's pull, which holds nothing of the push in
+        // memory: its creating pass lands edited.rs and a file the server
+        // made, holds held.rs back, records what landed and claims.
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let created = [
+            Event::Push("edited.rs".into()),
+            Event::Push("theirs.rs".into()),
+            Event::Push("dir/".into()),
+        ];
+        let landed = landed_back(&common, &created);
+        assert_eq!(landed, ["edited.rs"], "only a returning name that landed");
+        common
+            .record(crate::baseline::Contents::from([(
+                "edited.rs".into(),
+                Some(b.clone()),
+            )]))
+            .unwrap();
+        claim_returned(&state, local.path(), &mut common, &landed).unwrap();
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        assert!(!common.returning("edited.rs"), "its return ended");
+        assert!(
+            common.returning("held.rs"),
+            "one that did not land stays marked"
+        );
+        let unclaimed = crate::selection::unclaimed(
+            b"edited.rs\0held.rs\0theirs.rs\0",
+            &ledger::synced_files(&state),
+            &crate::selection::Excludes::new([]),
+        )
+        .unwrap();
+        assert_eq!(
+            unclaimed,
+            [b"held.rs".to_vec(), b"theirs.rs".to_vec()],
+            "the landed file is claimed again, and nothing else is"
+        );
+
+        // Deleted here again: doomed, and deleted this time.
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, ["edited.rs"], "the claim is back");
+        let doomed = retire_moved(&state, local.path(), &mut common, &remote, doomed).unwrap();
+        assert_eq!(
+            doomed,
+            ["edited.rs"],
+            "the server's copy is the one both ends agreed on"
+        );
+
+        // Pinned on the source: both pulls that land created files claim
+        // the returning ones after recording what landed, and no list of
+        // spared rows travels from the push any more.
+        let mine = include_str!("sync.rs");
+        let body = |head: &str| {
+            let at = mine.find(head).unwrap_or_else(|| panic!("{head} is gone"));
+            &mine[at..][..mine[at..].find("\n}\n").expect("it ends")]
+        };
+        for (head, recorded) in [
+            ("\nfn pull(", "survey.confirm("),
+            ("\nfn pull_changes(", "remember_common("),
+        ] {
+            let body = body(head);
+            let find = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("{head} lost `{needle}`"))
+            };
+            assert!(find("landed_back(") < find("claim_returned("), "{head}");
+            assert!(
+                find(recorded) < find("claim_returned("),
+                "{head} claims before it records what landed"
+            );
+        }
+        assert!(body("\npub fn pull_back(").contains("pull("));
+        assert!(!body("\nfn transfer(").contains("spared"));
+    }
+
+    /// Every claim a push makes ends a return, and so do the two ways a
+    /// name stops being ulak's: a removal the server confirmed, and a
+    /// claim `never_landed` finds was never true. A mark that outlived
+    /// them would claim a same-named file the server makes later, and a
+    /// claim is a licence to delete it.
+    #[test]
+    fn a_return_ends_when_the_name_is_claimed_removed_or_found_to_be_the_servers() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let (a, b) = ("f:420:a".to_string(), "f:420:b".to_string());
+        common
+            .record(crate::baseline::Contents::from([(
+                "removed.rs".into(),
+                Some(a.clone()),
+            )]))
+            .unwrap();
+        let names = ["removed.rs", "foreign.rs", "kept.rs"].map(String::from);
+        common.mark_returning(&names).unwrap();
+
+        forget_removed(&mut common, &["removed.rs".to_string()]).unwrap();
+        // Claimed with a lost send and no agreed content, while the
+        // server holds something else.
+        ledger::store(&state, local.path(), &[b"foreign.rs".to_vec()], &[], &[]);
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "foreign.rs".to_string(),
+                a.clone(),
+            )]))
+            .unwrap();
+        let remote = crate::baseline::Contents::from([("foreign.rs".into(), Some(b.clone()))]);
+        let doomed = retire_never_landed(
+            &state,
+            local.path(),
+            &mut common,
+            &remote,
+            vec!["foreign.rs".to_string()],
+        )
+        .unwrap();
+        assert!(doomed.is_empty());
+        let common = crate::baseline::State::load(&state, local.path()).unwrap();
+        assert!(!common.returning("removed.rs"), "removed on the server");
+        assert!(!common.returning("foreign.rs"), "the server's own file");
+        assert!(common.returning("kept.rs"), "nothing ended the third");
+
+        // Pinned on the source: every function that claims rows in the
+        // ledger also ends their returns.
+        let mine = include_str!("sync.rs");
+        let code = &mine[..mine.find("\n#[cfg(test)]").expect("the tests")];
+        let mut claims = 0;
+        for (at, _) in code.match_indices("ledger::store(") {
+            if in_a_comment(code, at) {
+                continue;
+            }
+            let args = &code[at + "ledger::store(".len()..];
+            let mut depth = 0;
+            let mut commas = Vec::new();
+            for (i, c) in args.char_indices() {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' if depth == 0 => {
+                        commas.push(i);
+                        break;
+                    }
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => commas.push(i),
+                    _ => {}
+                }
+            }
+            let claimed = args[commas[1] + 1..commas[2]].trim();
+            if claimed == "&[]" {
+                continue;
+            }
+            let head = enclosing_fn(code, at);
+            let body = &code[head..][..code[head..].find("\n}\n").expect("it ends")];
+            assert!(
+                body.contains("end_return("),
+                "a claim of `{claimed}` that leaves any return standing:\n{}",
+                body.lines().nth(1).unwrap_or_default()
+            );
+            claims += 1;
+        }
+        assert!(claims >= 4, "expected the claim sites, found {claims}");
+    }
+
+    /// A return ends once the server is seen without the file. A mark
+    /// whose file the server lost before any pull landed it used to stand
+    /// for good: nothing else ended it, so the next file of that name the
+    /// server made was claimed as it landed, and deleting it here then
+    /// removed the server's own file from the server. A listing ends only
+    /// the marks it can answer: made before it was asked for, for a name it
+    /// covers, and absent here. A later file of that name lands unclaimed,
+    /// as server work does. A deletion notice ends a return on the warm
+    /// path too.
+    #[test]
+    fn a_return_ends_when_the_server_is_seen_without_the_file_so_a_later_one_lands_unclaimed() {
+        let local = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (mut project, ssh) = helper_project(local.path());
+        project.config.sync.protect = vec!["data".into()];
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let fp = inventory_footprint(local.path());
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        // Synced and agreed on, deleted here, then edited on the server:
+        // the deletion is not applied, and the file is marked returning.
+        let rp = server.path().join("gen.rs");
+        std::fs::write(&rp, b"agreed").unwrap();
+        common
+            .record(crate::baseline::Contents::from([(
+                "gen.rs".into(),
+                crate::baseline::fingerprint(&rp).unwrap(),
+            )]))
+            .unwrap();
+        ledger::store(&state, local.path(), &[b"gen.rs".to_vec()], &[], &[]);
+        std::fs::write(&rp, b"server edit").unwrap();
+        let remote = crate::baseline::local_remote(server.path(), &[b"gen.rs".to_vec()]).unwrap();
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert!(
+            retire_moved(&state, local.path(), &mut common, &remote, doomed)
+                .unwrap()
+                .is_empty()
+        );
+        // Marks the listing cannot answer: under a protected path, a file
+        // this machine holds, and one made after the listing was asked for.
+        std::fs::write(local.path().join("here.rs"), b"mine").unwrap();
+        common
+            .mark_returning(&["data/db".into(), "here.rs".into()])
+            .unwrap();
+        let listed = common.returning_names();
+        common.mark_returning(&["late.rs".into()]).unwrap();
+        // The server loses gen.rs before any pull lands it.
+        std::fs::remove_file(&rp).unwrap();
+        drop(common);
+
+        let pull_with = |returning_when_listed| {
+            let script = inventory_script(
+                server.path().to_str().unwrap(),
+                &project.config.sync.protect,
+                &fp,
+                &[],
+            );
+            let mut sh = Command::new("sh");
+            sh.arg("-s");
+            let listed =
+                crate::proc::run_bounded(&mut sh, Some(script.into_bytes()), crate::proc::SCRIPT)
+                    .unwrap();
+            assert!(listed.status.success());
+            let mut survey = Survey {
+                plan: walk::WalkReport {
+                    // The test helper keeps its control files in the
+                    // project; the real one keeps them beside it.
+                    excludes: vec![b".control".to_vec()],
+                    ..Default::default()
+                },
+                local: Default::default(),
+                remote: Default::default(),
+                local_dirs: Default::default(),
+                remote_dirs: Default::default(),
+                listing: Some(listed.stdout),
+                returning_when_listed,
+                common: crate::baseline::State::load(&state, local.path()).unwrap(),
+                cache: crate::hashcache::Cache::open(&state, local.path()),
+            };
+            let mut channel = Some(crate::stream::local_helper(server.path()));
+            let budget = crate::proc::Budget::new(crate::proc::RECONCILE);
+            pull(
+                &project,
+                &fp,
+                &ssh,
+                true,
+                &mut survey,
+                &budget,
+                None,
+                &mut channel,
+            )
+            .unwrap();
+            survey.finish().unwrap();
+        };
+        pull_with(listed);
+        let common = crate::baseline::State::load(&state, local.path()).unwrap();
+        assert!(
+            !common.returning("gen.rs"),
+            "the server was seen without it"
+        );
+        for kept in ["data/db", "here.rs", "late.rs"] {
+            assert!(
+                common.returning(kept),
+                "{kept}: the listing cannot answer it"
+            );
+        }
+
+        // Later the server makes a gen.rs of its own.
+        std::fs::write(&rp, b"the server's own work").unwrap();
+        pull_with(common.returning_names());
+        let lp = local.path().join("gen.rs");
+        assert_eq!(std::fs::read(&lp).unwrap(), b"the server's own work");
+        assert!(
+            !ledger::synced_files(&state).contains(&b"gen.rs".to_vec()),
+            "server work lands unclaimed"
+        );
+        std::fs::remove_file(&lp).unwrap();
+        assert!(
+            ledger::doomed(&state, local.path(), &[]).is_empty(),
+            "deleting it here dooms nothing on the server"
+        );
+
+        // Pinned on the source: the warm pull ends a return on the
+        // server's deletion notice for it before it moves on.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn pull_changes(").expect("the warm pull");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        let deleted = body
+            .find("if notice.deleted {")
+            .expect("the deletion notice");
+        let skipped = deleted + body[deleted..].find("continue;").expect("it moves on");
+        assert!(
+            body[deleted..skipped].contains(".end_return("),
+            "a deletion notice for a returning file must end its return"
+        );
+    }
+
+    /// A deletion a person confirmed at the over-budget prompt is judged
+    /// again right before the removal. The prompt waits with no time
+    /// limit and the removal script's `rm -f` compares nothing, so a server
+    /// edit made while the list was open met a judgement taken before it,
+    /// and was deleted. Over a fresh read the edited row is spared and
+    /// marked returning, and the untouched one still goes.
+    #[test]
+    fn a_deletion_confirmed_at_the_prompt_is_judged_again_right_before_the_removal() {
+        let local = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let mut agreed = crate::baseline::Contents::new();
+        for name in ["migration.py", "old.py"] {
+            let rp = server.path().join(name);
+            std::fs::write(&rp, b"agreed").unwrap();
+            agreed.insert(name.into(), crate::baseline::fingerprint(&rp).unwrap());
+            ledger::store(&state, local.path(), &[name.as_bytes().to_vec()], &[], &[]);
+        }
+        common.record(agreed).unwrap();
+        let judged = |common: &mut crate::baseline::State, doomed: Vec<String>| {
+            let copies = crate::baseline::local_verdicts(server.path(), &doomed).unwrap();
+            judge_doomed(&state, local.path(), common, &copies, doomed).unwrap()
+        };
+
+        // Before the prompt, nothing has moved.
+        let doomed = judged(&mut common, ledger::doomed(&state, local.path(), &[]));
+        assert_eq!(doomed, ["migration.py", "old.py"]);
+        // While the list is open, the stack regenerates one of them.
+        std::fs::write(server.path().join("migration.py"), b"regenerated").unwrap();
+        let doomed = judged(&mut common, doomed);
+        assert_eq!(doomed, ["old.py"], "the regenerated file is not removed");
+        assert!(common.returning("migration.py"));
+        assert_eq!(
+            ledger::doomed(&state, local.path(), &[]),
+            ["old.py"],
+            "and its claim is retired"
+        );
+
+        // Pinned on the source: after the prompt, the push judges again
+        // before it removes anything.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn push(").expect("the full push");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        let prompt = body.find("confirm_deletions(").expect("the prompt");
+        let again = body[prompt..]
+            .find("judge_doomed(")
+            .map(|i| prompt + i)
+            .expect("a confirmed list is judged again");
+        assert!(again < body.find("delete_remote(").expect("the removal"));
+    }
+
+    /// One read judges every doomed row, and no row stops the others. A
+    /// row whose path the server restructured (a parent turned into a
+    /// symlink or a file, a leaf turned into a FIFO) stays on the server
+    /// and leaves ulak's tracking, named in one warning. A row that cannot
+    /// be read right now (a file being written, one the SSH user may not
+    /// read) is held: not deleted, still claimed, so the pull's creating
+    /// pass never offers it, and named with its reason. Every other row is
+    /// judged and deleted as usual, and no directory row above a row left
+    /// alone is removed. Every such row used to count as restructured: a
+    /// file caught mid-write lost its claim for good, a file the SSH user
+    /// could not read became a creating-pass candidate that failed every
+    /// later pull, and `rmdir -p` of a directory row under the symlinked
+    /// parent removed an empty directory from the volume it pointed to. A
+    /// dry run previews the same split without retiring anything.
+    #[test]
+    fn a_restructured_row_is_untracked_an_unreadable_one_is_held_and_the_rest_are_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        let local = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let volume = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let fp = inventory_footprint(local.path());
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let rp = |name: &str| server.path().join(name);
+        // Synced once and agreed on, then deleted here, with the directory
+        // rows the sync claimed on the way.
+        let rows = [
+            "busy.bin",
+            "data/a.txt",
+            "edited.txt",
+            "gone.txt",
+            "locked.key",
+            "pipe",
+            "plain/b.txt",
+        ];
+        for name in ["edited.txt", "gone.txt"] {
+            std::fs::write(rp(name), b"agreed").unwrap();
+        }
+        let agreed = crate::baseline::fingerprint(&rp("gone.txt")).unwrap();
+        for name in rows {
+            ledger::store(&state, local.path(), &[name.as_bytes().to_vec()], &[], &[]);
+            common
+                .record(crate::baseline::Contents::from([(
+                    name.to_string(),
+                    agreed.clone(),
+                )]))
+                .unwrap();
+        }
+        ledger::store(
+            &state,
+            local.path(),
+            &[b"data/".to_vec(), b"data/cache/".to_vec()],
+            &[],
+            &[],
+        );
+        // Then the server changes: `data/` becomes a symlink to a volume
+        // holding an empty `cache/`, `plain` a file, `pipe` a FIFO; a
+        // watcher rewrites `busy.bin` as it is read, `locked.key` is made
+        // unreadable to the SSH user, and `edited.txt` is edited.
+        std::fs::write(volume.path().join("a.txt"), b"volume data").unwrap();
+        std::fs::create_dir(volume.path().join("cache")).unwrap();
+        std::os::unix::fs::symlink(volume.path(), rp("data")).unwrap();
+        std::fs::write(rp("plain"), b"a file now").unwrap();
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(rp("pipe"))
+            .status()
+            .expect("mkfifo, from coreutils, to make a FIFO on the test server");
+        assert!(fifo.success(), "mkfifo failed");
+        std::fs::write(
+            rp("busy.bin"),
+            format!("{} generated", crate::baseline::REWRITTEN),
+        )
+        .unwrap();
+        std::fs::write(rp("locked.key"), b"the server's own key").unwrap();
+        std::fs::set_permissions(rp("locked.key"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::File::open(rp("locked.key")).is_err(),
+            "a mode-000 file is readable here: run the tests as a user other than root"
+        );
+        std::fs::write(rp("edited.txt"), b"server edit").unwrap();
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed, rows);
+        let doomed_dirs = ledger::doomed_dirs(&state, local.path());
+        assert_eq!(doomed_dirs, ["data/cache", "data"]);
+
+        let copies = crate::baseline::local_verdicts_after(
+            &crate::baseline::rewritten_while_read(&rp("busy.bin")),
+            server.path(),
+            &doomed,
+        )
+        .unwrap();
+        let restructured = ["data/a.txt", "pipe", "plain/b.txt"].map(String::from);
+        let held = ["busy.bin", "locked.key"].map(String::from);
+        assert_eq!(
+            copies.structural.keys().collect::<Vec<_>>(),
+            restructured.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            copies.held.keys().collect::<Vec<_>>(),
+            held.iter().collect::<Vec<_>>()
+        );
+
+        // A dry run previews the same split and retires nothing.
+        let (deleted, kept) = preview_deletions(doomed.clone(), &common, &copies);
+        assert_eq!(deleted, ["gone.txt"]);
+        let kept_as = |row: &str, why: &str| {
+            kept.iter()
+                .any(|l| l.starts_with(&format!("kept: {row} ")) && l.contains(why))
+        };
+        for row in &restructured {
+            assert!(
+                kept_as(row, "changed the structure of its path"),
+                "{row}: {kept:?}"
+            );
+        }
+        for row in &held {
+            assert!(kept_as(row, "cannot be read right now"), "{row}: {kept:?}");
+        }
+        assert!(kept_as("edited.txt", "changed on the server"), "{kept:?}");
+        assert_eq!(
+            ledger::doomed(&state, local.path(), &[]),
+            rows,
+            "a preview retires nothing"
+        );
+
+        // One warning names the restructured rows, each with its reason.
+        let warning = restructured_warning(&copies, &restructured);
+        for needed in [
+            "data/a.txt (data is a symlink)",
+            "pipe (pipe is a special file)",
+            "plain/b.txt (plain is a file)",
+            "stopped tracking them",
+        ] {
+            assert!(warning.contains(needed), "lost {needed:?}: {warning}");
+        }
+        // One names the held rows with theirs, and offers `[sync] protect`
+        // for the one the SSH user may not read, and only for it.
+        let warning = held_warning(&copies, &held).expect("the held rows are named");
+        for needed in [
+            "busy.bin (it changed while it was read)",
+            "locked.key (the SSH user may not read it)",
+            "the next sync tries again",
+            "if the server owns locked.key, add it to [sync] protect in ulak.toml",
+        ] {
+            assert!(warning.contains(needed), "lost {needed:?}: {warning}");
+        }
+        let warning = held_warning(&copies, &held[..1]).expect("the held row is named");
+        assert!(!warning.contains("protect"), "{warning}");
+        assert!(held_warning(&copies, &[]).is_none());
+
+        // The judgement: only the unrelated row's deletion stands.
+        let doomed = judge_doomed(&state, local.path(), &mut common, &copies, doomed).unwrap();
+        assert_eq!(doomed, ["gone.txt"], "the unrelated row is still deleted");
+        assert_eq!(
+            ledger::doomed(&state, local.path(), &[]),
+            ["busy.bin", "gone.txt", "locked.key"],
+            "the restructured rows are no longer tracked, and the held ones still are"
+        );
+        let reloaded = crate::baseline::State::load(&state, local.path()).unwrap();
+        for row in restructured.iter().chain(&held) {
+            assert!(!reloaded.returning(row), "{row}: nothing is coming back");
+        }
+        assert!(
+            reloaded.returning("edited.txt"),
+            "the server's edit comes back"
+        );
+
+        // The pull's creating pass offers the server's own files and never
+        // a held row, whose claim still stands.
+        let script = inventory_script(server.path().to_str().unwrap(), &[], &fp, &[]);
+        let mut sh = Command::new("sh");
+        sh.arg("-s");
+        let listed =
+            crate::proc::run_bounded(&mut sh, Some(script.into_bytes()), crate::proc::SCRIPT)
+                .unwrap();
+        assert!(listed.status.success());
+        let candidates = crate::selection::unclaimed(
+            &listed.stdout,
+            &ledger::synced_files(&state),
+            &crate::selection::Excludes::new([]),
+        )
+        .unwrap();
+        for row in &held {
+            assert!(
+                !candidates.contains(&row.as_bytes().to_vec()),
+                "{row} is offered to the creating pass"
+            );
+        }
+        for own in ["edited.txt", "plain"] {
+            assert!(
+                candidates.contains(&own.as_bytes().to_vec()),
+                "{own}: the server's own file is not offered"
+            );
+        }
+
+        // No directory row above a row left alone is removed. What the
+        // push hands the removal script:
+        let doomed_dirs = spare_dirs_above(doomed_dirs, &copies);
+        assert_eq!(doomed_dirs, ["data/cache"]);
+        let out = run_removal(server.path(), home.path(), &["gone.txt"], &["data/cache"]);
+        assert!(out.contains("DELETED 1"), "{out}");
+        assert!(!rp("gone.txt").exists());
+        assert_eq!(
+            std::fs::read(volume.path().join("a.txt")).unwrap(),
+            b"volume data",
+            "nothing is deleted through the symlink"
+        );
+        assert!(
+            volume.path().join("cache").is_dir(),
+            "no directory is removed through the symlink: {out}"
+        );
+        let removal = parse_removal(&out, &doomed, &["data/cache".to_string()]);
+        assert!(removal.dirs.is_empty(), "the directory row stays claimed");
+        assert_eq!(std::fs::read(rp("plain")).unwrap(), b"a file now");
+        assert_eq!(std::fs::read(rp("edited.txt")).unwrap(), b"server edit");
+        for row in ["busy.bin", "locked.key", "pipe"] {
+            assert!(rp(row).exists(), "{row} was removed");
+        }
+
+        // Pinned on the source: both judgements in the push read the rows
+        // this way, a failed read returns before anything is listed,
+        // prompted for or recorded as pending, and each judgement spares
+        // the directories before the removal.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn push(").expect("the full push");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        let judged = body.matches("judge_doomed(").count();
+        assert_eq!(judged, 2, "both judgements");
+        assert_eq!(
+            body.matches("read_doomed(ssh, project, &doomed, deadline)?")
+                .count(),
+            judged,
+            "every judgement reads the rows first, and stops on a failed read"
+        );
+        assert_eq!(
+            body.matches("doomed_dirs = spare_dirs_above(doomed_dirs, &copies);")
+                .count(),
+            judged,
+            "every judgement spares the directories above what it left alone"
+        );
+        assert!(body.rfind("spare_dirs_above(").unwrap() < body.find("delete_remote(").unwrap());
+        let at = mine.find("\nfn judge_doomed(").expect("the judgement");
+        let judge = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        assert!(
+            judge
+                .find("set_aside(")
+                .expect("unjudged rows are set aside")
+                < judge
+                    .find("retire_never_landed(")
+                    .expect("then the rest are judged")
+        );
+    }
+
+    /// More rows than the old one-by-one fallback read, all under one
+    /// parent the server turned into a symlink, are judged in the same
+    /// single request as any round, and the sync goes on. Past 64 such
+    /// rows the round used to stop every sync, pull and compose command
+    /// with advice that could not work for rows under that parent.
+    #[test]
+    fn more_than_64_rows_under_a_restructured_parent_no_longer_stop_the_sync() {
+        let local = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let volume = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let under: Vec<String> = (0..100).map(|i| format!("data/{i:03}.txt")).collect();
+        for row in &under {
+            std::fs::write(volume.path().join(&row[5..]), b"volume data").unwrap();
+        }
+        std::os::unix::fs::symlink(volume.path(), server.path().join("data")).unwrap();
+        std::fs::write(server.path().join("gone.txt"), b"agreed").unwrap();
+        let rows: Vec<Vec<u8>> = under
+            .iter()
+            .map(String::as_str)
+            .chain(["gone.txt"])
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        ledger::store(&state, local.path(), &rows, &[], &[]);
+        let doomed = ledger::doomed(&state, local.path(), &[]);
+        assert_eq!(doomed.len(), 101);
+
+        let copies = crate::baseline::local_verdicts(server.path(), &doomed).unwrap();
+        assert_eq!(copies.structural.len(), 100);
+        let doomed = judge_doomed(&state, local.path(), &mut common, &copies, doomed).unwrap();
+        assert_eq!(doomed, ["gone.txt"]);
+        assert_eq!(ledger::doomed(&state, local.path(), &[]), ["gone.txt"]);
+        let out = run_removal(server.path(), home.path(), &["gone.txt"], &[]);
+        assert!(out.contains("DELETED 1"), "{out}");
+        assert_eq!(std::fs::read_dir(volume.path()).unwrap().count(), 100);
+
+        // Pinned on the source: the read is one request, whatever its size.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn read_doomed(").expect("the doomed read");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        assert_eq!(body.matches("crate::baseline::verdicts(").count(), 1);
+        assert!(!body.contains("for ") && !body.contains("loop"), "{body}");
+    }
+
+    /// The removal script keeps any row with a symlink on its way, checked
+    /// right before its `rm -f` or `rmdir -p`, even for a row the judgement
+    /// never saw restructured. Both commands resolve every component, and a
+    /// directory row under a parent the server replaced with a symlink
+    /// removed an empty directory from wherever the symlink pointed. A
+    /// symlink LEAF is still removed itself, and a kept row stays claimed.
+    #[test]
+    fn the_removal_script_keeps_every_row_with_a_symlink_on_its_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("workspace");
+        let volume = tmp.path().join("volume");
+        touch(&volume.join("a.txt"));
+        std::fs::create_dir_all(volume.join("cache")).unwrap();
+        touch(&ws.join("real/b.txt"));
+        std::fs::create_dir_all(ws.join("real/empty")).unwrap();
+        std::os::unix::fs::symlink(&volume, ws.join("data")).unwrap();
+        std::os::unix::fs::symlink(&volume, ws.join("real/link")).unwrap();
+        std::os::unix::fs::symlink(&volume, ws.join("leaf")).unwrap();
+        let files = ["data/a.txt", "leaf", "real/b.txt", "real/link/a.txt"];
+        let dirs = ["data/cache", "real/empty", "real/link/cache"];
+
+        let out = run_removal(&ws, tmp.path(), &files, &dirs);
+        assert!(
+            volume.join("a.txt").exists(),
+            "a file went through a symlink: {out}"
+        );
+        assert!(
+            volume.join("cache").is_dir(),
+            "a directory went through a symlink: {out}"
+        );
+        assert!(
+            std::fs::symlink_metadata(ws.join("leaf")).is_err(),
+            "a symlink leaf is removed itself: {out}"
+        );
+        assert!(
+            !ws.join("real/b.txt").exists() && !ws.join("real/empty").exists(),
+            "{out}"
+        );
+        for kept in [
+            "ULAK_KEPT_FILE data/a.txt",
+            "ULAK_KEPT_FILE real/link/a.txt",
+            "ULAK_KEPT_DIR data/cache",
+            "ULAK_KEPT_DIR real/link/cache",
+        ] {
+            assert!(out.lines().any(|l| l == kept), "{kept} missing: {out}");
+        }
+        let own = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let removal = parse_removal(&out, &own(&files), &own(&dirs));
+        assert_eq!(removal.files, ["leaf", "real/b.txt"]);
+        assert_eq!(removal.dirs, ["real/empty"]);
+        assert_eq!(removal.kept_files, 2);
+    }
+
+    /// A directory row is spared while any row under it is left alone this
+    /// round, restructured or held, and only such a directory: a prefix
+    /// that is not a parent (`datax` beside `data`) still goes.
+    #[test]
+    fn a_directory_above_a_row_left_alone_is_spared_that_round() {
+        let copies = crate::baseline::Copies {
+            structural: std::collections::BTreeMap::from([(
+                "data/cache/a.txt".to_string(),
+                "data is a symlink".to_string(),
+            )]),
+            held: std::collections::BTreeMap::from([(
+                "keep/k".to_string(),
+                crate::baseline::Held::default(),
+            )]),
+            ..Default::default()
+        };
+        let dirs = ["data/cache", "data", "datax", "keep", "other"].map(String::from);
+        assert_eq!(spare_dirs_above(dirs.to_vec(), &copies), ["datax", "other"]);
+        assert_eq!(
+            spare_dirs_above(dirs.to_vec(), &Default::default()),
+            dirs,
+            "nothing left alone spares nothing"
+        );
+    }
+
+    /// A claimed row under a `[sync] protect` path is never doomed, even
+    /// one claimed before the path was protected. The hold warning for a
+    /// file the SSH user may not read advises exactly that entry, and
+    /// without this it changed nothing: the row stayed doomed, was held
+    /// and named on every sync, and was deleted as soon as it could be
+    /// read. Every place that asks what a sync would delete asks here.
+    #[test]
+    fn a_path_protected_after_it_was_claimed_is_never_doomed() {
+        let local = tempfile::tempdir().unwrap();
+        let (mut project, ssh) = helper_project(local.path());
+        let state = project.state_key(&ssh.dest);
+        ledger::store(
+            &state,
+            local.path(),
+            &[
+                b"config/".to_vec(),
+                b"config/master.key".to_vec(),
+                b"gone.txt".to_vec(),
+            ],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            doomed_files(&project, &state, local.path(), &[]),
+            ["config/master.key", "gone.txt"]
+        );
+        assert_eq!(
+            doomed_directories(&project, &state, local.path()),
+            ["config"]
+        );
+        project.config.sync.protect = vec!["/config/".into()];
+        assert_eq!(
+            doomed_files(&project, &state, local.path(), &[]),
+            ["gone.txt"]
+        );
+        assert!(doomed_directories(&project, &state, local.path()).is_empty());
+
+        // Pinned on the source: nothing else in the engine asks the ledger.
+        let mine = include_str!("sync.rs");
+        let code = &mine[..mine.find("\n#[cfg(test)]").expect("the tests")];
+        let mut asked = 0;
+        for (needle, owner) in [
+            ("ledger::doomed(", "fn doomed_files("),
+            ("ledger::doomed_dirs(", "fn doomed_directories("),
+        ] {
+            for (at, _) in code.match_indices(needle) {
+                if in_a_comment(code, at) {
+                    continue;
+                }
+                let head = enclosing_fn(code, at);
+                assert!(
+                    code[head..].trim_start().starts_with(owner),
+                    "`{needle}` outside `{owner}`: {}",
+                    line_at(code, at)
+                );
+                asked += 1;
+            }
+        }
+        assert_eq!(asked, 2);
+    }
+
+    /// A lost replace is recorded as ulak's own send only under a name
+    /// with agreed content, the one case `moved_on_the_server` reads the
+    /// record for. A claim with no agreed content, such as one made before
+    /// content records existed, stays the ledger's word. Recording its
+    /// replace made `never_landed` read the claim as a send that never
+    /// arrived: the deletion was not applied, and the server's copy came
+    /// home unclaimed. Driven on all three channel paths, with the server
+    /// still holding its own copy, as when the batch never arrived.
+    #[test]
+    fn a_lost_replace_of_a_claim_with_no_agreed_content_stays_the_ledgers_word() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let (a, l) = ("f:420:a".to_string(), "f:420:l".to_string());
+        common
+            .record(crate::baseline::Contents::from([(
+                "agreed.rs".into(),
+                Some(a.clone()),
+            )]))
+            .unwrap();
+        let accepted = crate::baseline::Contents::from([
+            ("agreed.rs".into(), Some(l.clone())),
+            ("unagreed.rs".into(), Some(l.clone())),
+            ("unlinked.rs".into(), None),
+        ]);
+        assert_eq!(
+            attempted(&common, &accepted),
+            std::collections::BTreeMap::from([("agreed.rs".to_string(), l.clone())])
+        );
+        drop((local, common));
+
+        for path in ["transfer_changed", "stream_structure", "push_and_claim"] {
+            let local = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let (project, mut ssh) = helper_project(local.path());
+            ssh.offline();
+            let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+            let state = project.state_key(&ssh.dest);
+            let fp = inventory_footprint(local.path());
+            let (lp, rp) = (
+                local.path().join("config.yml"),
+                remote.path().join("config.yml"),
+            );
+            // Claimed, with no agreed content on record; the copies differ.
+            std::fs::write(&rp, b"server copy").unwrap();
+            let server = crate::baseline::fingerprint(&rp).unwrap();
+            ledger::store(&state, local.path(), &[b"config.yml".to_vec()], &[], &[]);
+            std::fs::write(&lp, b"local copy").unwrap();
+            let stamp = crate::selection::Stamp::read(&lp).unwrap();
+            let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+            let losing = || crate::stream::local_helper_losing_receipts(remote.path());
+            let failed = match path {
+                "transfer_changed" => {
+                    let mut session = Session {
+                        stream: Some(losing()),
+                        common: Some(common),
+                        ..Session::default()
+                    };
+                    let changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    transfer_changed(&project, &fp, &ssh, &mut session, &changed).is_err()
+                }
+                "stream_structure" => {
+                    let mut session = Session {
+                        stream: Some(losing()),
+                        owned: std::collections::BTreeSet::from([lp.clone()]),
+                        ..Session::default()
+                    };
+                    let observed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    stream_structure(
+                        &project,
+                        &fp,
+                        &ssh,
+                        &mut session,
+                        &mut common,
+                        &state,
+                        &[b"config.yml".to_vec()],
+                        &[],
+                        &observed,
+                        true,
+                    )
+                    .is_err()
+                }
+                _ => {
+                    let mut survey = Survey {
+                        plan: walk::WalkReport {
+                            kept: vec![b"config.yml".to_vec()],
+                            ..Default::default()
+                        },
+                        local: crate::baseline::Contents::from([(
+                            "config.yml".into(),
+                            crate::baseline::fingerprint(&lp).unwrap(),
+                        )]),
+                        remote: crate::baseline::Contents::from([(
+                            "config.yml".into(),
+                            server.clone(),
+                        )]),
+                        local_dirs: Default::default(),
+                        remote_dirs: Default::default(),
+                        listing: None,
+                        returning_when_listed: Default::default(),
+                        common,
+                        cache: crate::hashcache::Cache::open(&state, local.path()),
+                    };
+                    let failed = push_and_claim(
+                        &PathBuf::from("rsync-not-invoked"),
+                        &project,
+                        &fp,
+                        &ssh,
+                        &mut survey,
+                        &state,
+                        &crate::proc::Budget::new(crate::proc::RECONCILE),
+                        &mut Some(losing()),
+                    )
+                    .is_err();
+                    // The cold push guards on the surveyed copy, so this
+                    // helper applied the replace before it went silent;
+                    // the batch that never arrived leaves the server's.
+                    std::fs::write(&rp, b"server copy").unwrap();
+                    failed
+                }
+            };
+            assert!(failed, "{path}: no receipt is an error");
+            assert_eq!(std::fs::read(&rp).unwrap(), b"server copy", "{path}");
+            let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+            assert!(
+                common.unconfirmed("config.yml").is_none(),
+                "{path}: a replace under no agreed content is recorded as a send"
+            );
+            // Deleted here: the ledger's word stands, and the row goes.
+            std::fs::remove_file(&lp).unwrap();
+            let doomed = ledger::doomed(&state, local.path(), &[]);
+            let remote_view = crate::baseline::Contents::from([("config.yml".into(), server)]);
+            let kept = retire_never_landed(&state, local.path(), &mut common, &remote_view, doomed)
+                .unwrap();
+            assert_eq!(kept, ["config.yml"], "{path}");
+        }
+    }
+
+    /// The warm path's rsync fallback reads and judges its doomed rows after
+    /// the upload and right before the removal script, and steps aside for
+    /// a row the server changed since the last agreed content before it
+    /// writes anything: that script is an unconditional `rm -f`, and only
+    /// the full reconcile's pull brings the server's edit home
+    /// (`retire_moved`). The rows baseline.py could not judge are left
+    /// alone here as in the full push (`set_aside`), and a read the helper
+    /// never answers is an error, not a deferral. The fallback used to
+    /// judge the rows before the upload, so a file a watcher regenerated
+    /// because of that upload was removed by the `rm -f` that followed.
+    /// The selected files are still read before the upload, for
+    /// `may_push`. Nothing drives the fallback in a unit test — it needs
+    /// rsync and a server — so the order is pinned on the source, like the
+    /// full push's.
+    #[test]
+    fn the_warm_rsync_fallback_judges_its_doomed_rows_after_the_upload_and_before_the_removal() {
+        let mine = include_str!("sync.rs");
+        let at = mine
+            .find("\nfn reconcile_structure(")
+            .expect("the warm structural path");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        let code = |needle: &str| {
+            body.match_indices(needle)
+                .map(|(i, _)| i)
+                .find(|i| !in_a_comment(body, *i))
+                .unwrap_or_else(|| panic!("the warm structural path lost `{needle}`"))
+        };
+        let pushable = code("may_push(");
+        let upload = code("rsync_pass_dir(");
+        let remembered = code("remember_common(");
+        let read = code("read_doomed(ssh, project, &doomed, &deadline)?");
+        let moved = code("split_moved(");
+        let aside = code("set_aside(");
+        let never = code("retire_never_landed(");
+        let removal = code("delete_remote(");
+        assert!(
+            body[..upload].contains("crate::baseline::remote(") && pushable < upload,
+            "the selected files are read and checked before the upload"
+        );
+        for (earlier, later, what) in [
+            (upload, read, "the doomed rows are read after the upload"),
+            (remembered, read, "and after the upload is recorded"),
+            (read, moved, "then a moved row sends the batch away"),
+            (moved, aside, "before anything is written"),
+            (aside, never, "the unjudged rows are left alone"),
+            (never, removal, "before the removal"),
+        ] {
+            assert!(earlier < later, "{what}");
+        }
+        let stepped: Vec<usize> = body[read..removal]
+            .match_indices("return Ok(None)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            stepped.len(),
+            1,
+            "a moved row must send the batch to the full reconcile, not merely be noticed"
+        );
+    }
+
+    /// A removal the server confirmed leaves no agreed content behind, and
+    /// settles any unconfirmed send under the name, as the channel's
+    /// unlink does. Settling alone kept the last agreed content of the
+    /// deleted file: a later upload under the name whose receipt was lost
+    /// then read as the server's change, and deleting it brought it back.
+    #[test]
+    fn a_removal_the_server_confirmed_leaves_no_agreed_content_behind() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let (a, c) = ("f:420:a".to_string(), "f:420:c".to_string());
+        common
+            .record(crate::baseline::Contents::from([
+                ("f.rs".into(), Some(a.clone())),
+                ("other.rs".into(), Some(a.clone())),
+            ]))
+            .unwrap();
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "g.rs".to_string(),
+                c.clone(),
+            )]))
+            .unwrap();
+        let removed = ["f.rs", "g.rs", "never.rs"].map(String::from);
+        forget_removed(&mut common, &removed).unwrap();
+        let reloaded = crate::baseline::State::load(&state, local.path()).unwrap();
+        for state in [&common, &reloaded] {
+            assert!(state.get("f.rs").is_none(), "no ancestor outlives the file");
+            assert!(state.unconfirmed("g.rs").is_none(), "the send is settled");
+            assert_eq!(state.get("other.rs"), Some(&a), "the rest stands");
+            assert!(
+                !state.entries.contains_key("never.rs"),
+                "a name with nothing on record gains nothing"
+            );
+        }
+
+        // Pinned on the source: both removal rounds record what the server
+        // confirmed losing this way, after the round.
+        let mine = include_str!("sync.rs");
+        for head in ["\nfn push(", "\nfn reconcile_structure("] {
+            let at = mine.find(head).expect("a removal round");
+            let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+            assert!(
+                body.find("delete_remote(").expect("it removes")
+                    < body.find("forget_removed(").unwrap_or(0),
+                "{head}: a confirmed removal must leave no agreed content behind"
+            );
+        }
+    }
+
+    /// A replace of a claimed leaf whose receipt is lost is recorded as
+    /// ulak's own unconfirmed send, on all three channel paths. Without it
+    /// the record kept the older content while the server held the
+    /// upload, so deleting the file here before the next survey read the
+    /// upload as the server's change, warned that the server had edited
+    /// it, and brought the deleted file back.
+    #[test]
+    fn a_replace_whose_receipt_is_lost_stays_ulaks_own_to_delete() {
+        for path in ["transfer_changed", "stream_structure", "push_and_claim"] {
+            let local = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let (project, mut ssh) = helper_project(local.path());
+            ssh.offline();
+            let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+            let state = project.state_key(&ssh.dest);
+            let fp = inventory_footprint(local.path());
+            let (lp, rp) = (local.path().join("new.rs"), remote.path().join("new.rs"));
+            // Synced and agreed on, claimed, then saved here.
+            std::fs::write(&rp, b"agreed").unwrap();
+            let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+            common
+                .record(crate::baseline::Contents::from([(
+                    "new.rs".into(),
+                    crate::baseline::fingerprint(&rp).unwrap(),
+                )]))
+                .unwrap();
+            ledger::store(&state, local.path(), &[b"new.rs".to_vec()], &[], &[]);
+            std::fs::write(&lp, b"local save").unwrap();
+            let stamp = crate::selection::Stamp::read(&lp).unwrap();
+            let losing = || crate::stream::local_helper_losing_receipts(remote.path());
+            let failed = match path {
+                "transfer_changed" => {
+                    let mut session = Session {
+                        stream: Some(losing()),
+                        common: Some(common),
+                        ..Session::default()
+                    };
+                    let changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    transfer_changed(&project, &fp, &ssh, &mut session, &changed).is_err()
+                }
+                "stream_structure" => {
+                    let mut session = Session {
+                        stream: Some(losing()),
+                        owned: std::collections::BTreeSet::from([lp.clone()]),
+                        ..Session::default()
+                    };
+                    let observed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    stream_structure(
+                        &project,
+                        &fp,
+                        &ssh,
+                        &mut session,
+                        &mut common,
+                        &state,
+                        &[b"new.rs".to_vec()],
+                        &[],
+                        &observed,
+                        true,
+                    )
+                    .is_err()
+                }
+                _ => {
+                    let surveyed = crate::baseline::fingerprint(&rp).unwrap();
+                    let mut survey = one_file_survey(&project, &ssh, surveyed);
+                    push_and_claim(
+                        &PathBuf::from("rsync-not-invoked"),
+                        &project,
+                        &fp,
+                        &ssh,
+                        &mut survey,
+                        &state,
+                        &crate::proc::Budget::new(crate::proc::RECONCILE),
+                        &mut Some(losing()),
+                    )
+                    .is_err()
+                }
+            };
+            assert!(failed, "{path}: no receipt is an error");
+            assert_eq!(
+                std::fs::read(&rp).unwrap(),
+                b"local save",
+                "{path}: the helper applied the replace before its receipt was lost"
+            );
+            // Deleted here before any survey confirms the upload.
+            std::fs::remove_file(&lp).unwrap();
+            let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+            let server = crate::baseline::fingerprint(&rp).unwrap();
+            assert!(
+                common
+                    .unconfirmed("new.rs")
+                    .zip(server.as_ref())
+                    .is_some_and(|(sent, server)| sent.contains(server)),
+                "{path}: the upload is remembered as ulak's own send"
+            );
+            let remote_view = crate::baseline::Contents::from([("new.rs".into(), server)]);
+            let doomed = ledger::doomed(&state, local.path(), &[]);
+            assert_eq!(doomed, ["new.rs"], "{path}");
+            let doomed =
+                retire_moved(&state, local.path(), &mut common, &remote_view, doomed).unwrap();
+            assert_eq!(
+                doomed,
+                ["new.rs"],
+                "{path}: ulak's own upload is deleted, not brought back as the server's edit"
+            );
+            assert!(!common.returning("new.rs"), "{path}");
+        }
+    }
+
+    /// A dry run lists the rows a real sync would keep apart from its
+    /// deletions and leaves them out of the count. The over-budget error
+    /// sends people to `ulak sync --dry-run` to review the list, and that
+    /// list named a file the sync would bring home instead. It judges over
+    /// the state it reads and retires nothing.
+    #[test]
+    fn a_dry_run_lists_the_rows_a_sync_would_keep_apart_from_its_deletions() {
+        let local = tempfile::tempdir().unwrap();
+        let (project, ssh) = helper_project(local.path());
+        let state = project.state_key(&ssh.dest);
+        let mut common = crate::baseline::State::load(&state, local.path()).unwrap();
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|x| format!("f:420:{x}"));
+        common
+            .record(crate::baseline::Contents::from([
+                ("edited.rs".into(), Some(a.clone())),
+                ("gone.rs".into(), Some(a.clone())),
+            ]))
+            .unwrap();
+        common
+            .record_unconfirmed(std::collections::BTreeMap::from([(
+                "theirs.rs".to_string(),
+                c.clone(),
+            )]))
+            .unwrap();
+        let remote = crate::baseline::Contents::from([
+            ("edited.rs".into(), Some(b.clone())),
+            ("gone.rs".into(), Some(a.clone())),
+            ("theirs.rs".into(), Some(d.clone())),
+            ("unagreed.rs".into(), Some(b.clone())),
+        ]);
+        let doomed = ["edited.rs", "gone.rs", "theirs.rs", "unagreed.rs"]
+            .map(String::from)
+            .to_vec();
+        let copies = crate::baseline::Copies {
+            remote,
+            ..Default::default()
+        };
+        let (deleted, kept) = preview_deletions(doomed, &common, &copies);
+        assert_eq!(deleted, ["gone.rs", "unagreed.rs"]);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(
+            kept.iter()
+                .any(|l| l.starts_with("kept: edited.rs ") && l.contains("changed on the server")),
+            "{kept:?}"
+        );
+        assert!(
+            kept.iter()
+                .any(|l| l.starts_with("kept: theirs.rs ") && l.contains("never landed")),
+            "{kept:?}"
+        );
+        let reloaded = crate::baseline::State::load(&state, local.path()).unwrap();
+        assert!(
+            reloaded.unconfirmed("theirs.rs").is_some(),
+            "nothing was settled"
+        );
+
+        // Pinned on the source: the dry run counts only what the judgement
+        // leaves, and still lists everything when it cannot judge.
+        let mine = include_str!("sync.rs");
+        let at = mine.find("\nfn dry_run(").expect("the dry run");
+        let body = &mine[at..][..mine[at..].find("\n}\n").expect("it ends")];
+        assert!(
+            body.find("preview_deletions(").expect("the dry run judges")
+                < body.find("report.deleted += 1").expect("and counts"),
+        );
+        assert!(!body.contains("retire_"), "a dry run retires nothing");
+    }
+
+    /// `[sync] no_history = "send"` names each file it sends over a
+    /// differing server copy, on every path that sends: the full push and
+    /// both warm rsync fallbacks. Only the full push used to say so; the
+    /// warm fallbacks sent over the server's bytes without a word.
+    #[test]
+    fn no_history_send_names_each_file_it_sends_over_on_every_path() {
+        let (a, b) = ("f:420:a".to_string(), "f:420:b".to_string());
+        let names = ["agreed.rs", "gone.rs", "new.rs", "over.rs", "same.rs"]
+            .map(String::from)
+            .to_vec();
+        let base = crate::baseline::Contents::from([("agreed.rs".into(), Some(b.clone()))]);
+        let local = crate::baseline::Contents::from([
+            ("agreed.rs".into(), Some(a.clone())),
+            ("gone.rs".into(), None),
+            ("new.rs".into(), Some(a.clone())),
+            ("over.rs".into(), Some(a.clone())),
+            ("same.rs".into(), Some(a.clone())),
+        ]);
+        let remote = crate::baseline::Contents::from([
+            ("agreed.rs".into(), Some(b.clone())),
+            ("gone.rs".into(), Some(b.clone())),
+            ("new.rs".into(), None),
+            ("over.rs".into(), Some(b.clone())),
+            ("same.rs".into(), Some(a.clone())),
+        ]);
+        // Named: over.rs alone. The others have a common record, nothing
+        // local to send, no server copy, or the same bytes on both ends.
+        assert_eq!(
+            sent_without_history(&names, &base, &local, &remote),
+            [&"over.rs".to_string()]
+        );
+
+        // Every function that decides a push by `may_push`, directly or
+        // through `push_selection`, and then sends, says so.
+        let mine = include_str!("sync.rs");
+        let code = &mine[..mine.find("\n#[cfg(test)]").expect("the tests")];
+        let mut checked = 0;
+        for needle in [format!("{}(", "may_push"), format!("{}(", "push_selection")] {
+            for (at, _) in code.match_indices(&needle) {
+                if in_a_comment(code, at) || code[..at].trim_end().ends_with("fn") {
+                    continue;
+                }
+                let head = enclosing_fn(code, at);
+                let body = &code[head..][..code[head..].find("\n}\n").expect("it ends")];
+                // The selection itself sends nothing; its caller is checked.
+                if body.trim_start().starts_with("fn push_selection(") {
+                    continue;
+                }
+                assert!(
+                    body.contains("say_what_no_history_sends("),
+                    "a push decided by may_push sends without naming the no-history files:\n{}",
+                    body.lines().nth(1).unwrap_or_default()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 3, "expected three pushes, found {checked}");
     }
 
     /// What the ledger is allowed to forget after a removal round.

@@ -22,7 +22,7 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{Chain, TestServer, Workspace, extract_remote_dir};
 
@@ -596,6 +596,10 @@ fn scenario_a_file_born_mid_sync_is_still_deletable(
 ) {
     let _ = std::fs::remove_file(ws.project.join("site/racy.txt"));
 
+    // A push over the persistent channel sends exactly the walk's answer,
+    // so a file born after the walk waits for the next sync; a push that
+    // traverses with rsync (held open here, should one run) picks it up
+    // in the same breath. Either way the sync that sends it must claim it.
     server.stall_the_push(5);
     let sync = ws
         .ulak_raw(server)
@@ -604,25 +608,25 @@ fn scenario_a_file_born_mid_sync_is_still_deletable(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn ulak sync");
-    assert!(
-        server.wait_until_the_push_starts(Duration::from_secs(180)),
-        "the push never started, so the window was never open and nothing was proved"
-    );
-    // The walk has been and gone; rsync has not yet looked at this
-    // machine. This is the save nobody thinks twice about.
+    let _ = server.wait_until_the_push_starts(Duration::from_secs(2));
     ws.write("site/racy.txt", "born-mid-sync");
     let out = sync.wait_with_output().expect("sync");
     server.stop_stalling_the_push();
     let said = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(out.status.success(), "mid-sync push failed:\n{said}");
-
+    if !server
+        .ssh(&format!("test -e {remote_dir}/site/racy.txt"))
+        .status
+        .success()
+    {
+        ws.ulak(server).arg("sync").assert().success();
+    }
     assert!(
         server
             .ssh(&format!("test -e {remote_dir}/site/racy.txt"))
             .status
             .success(),
-        "the file written inside the held window never travelled, so the ledger \
-         hole it opens cannot be reached from here:\n{said}"
+        "a file born mid-sync never travelled:\n{said}"
     );
 
     // The consequence is what matters: the server copy must still be
@@ -669,6 +673,14 @@ fn scenario_a_file_born_mid_sync_is_still_deletable(
 /// before the reconcile is overwritten by the push before the pull ever
 /// looks. Last writer wins, and inside one reconcile the push is the
 /// last writer.
+///
+/// Small files come home over the persistent channel now, which never
+/// traverses and lands only into a name still absent, so the held rsync
+/// window is opened on purpose with a file the channel will not carry: a
+/// rewrite past its size limit. The server's inventory is taken with the
+/// survey, before the push, so what the stack invents INSIDE the window
+/// comes home on the next reconcile — the service's index sees it at
+/// once — while nothing deleted inside it may ever come back.
 fn scenario_a_deletion_that_lands_mid_pull_stays_deleted(
     server: &TestServer,
     ws: &Workspace,
@@ -681,11 +693,16 @@ fn scenario_a_deletion_that_lands_mid_pull_stays_deleted(
     // directory case or only looks like it does; crossing the window
     // with a removed subtree is what answers it.
     ws.write("site/dir-removed-mid-pull/deeper/inner.txt", "dir-content");
+    ws.write(
+        "site/big-rewritten-by-the-stack.bin",
+        &"x".repeat(1_500_000),
+    );
     ws.ulak(server).arg("sync").assert().success();
     for f in [
         "deleted-mid-pull.txt",
         "rewritten-by-the-stack.txt",
         "dir-removed-mid-pull/deeper/inner.txt",
+        "big-rewritten-by-the-stack.bin",
     ] {
         assert!(
             server
@@ -709,6 +726,15 @@ fn scenario_a_deletion_that_lands_mid_pull_stays_deleted(
     // warm in the editor, or the scenario is asking ulak to tell two
     // identical things apart.
     std::thread::sleep(std::time::Duration::from_secs(2));
+    // The one thing that sends the down leg through rsync: a rewrite the
+    // channel refuses by size.
+    let rewrite = server.ssh(&format!(
+        "head -c 1500000 /dev/urandom > {remote_dir}/site/big-rewritten-by-the-stack.bin"
+    ));
+    assert!(
+        rewrite.status.success(),
+        "the stack rewrites the large file"
+    );
 
     server.stall_the_pull(20);
     let sync = ws
@@ -788,7 +814,20 @@ fn scenario_a_deletion_that_lands_mid_pull_stays_deleted(
         "a directory the user removed came back — as a shell or with its \
          contents, both are junk nothing here may delete:\n{said}"
     );
-    // The half that must not be traded away for the half above.
+    assert_ne!(
+        std::fs::read(ws.project.join("site/big-rewritten-by-the-stack.bin")).unwrap(),
+        "x".repeat(1_500_000).into_bytes(),
+        "the rewrite the window was held open for never came home:\n{said}"
+    );
+    // The half that must not be traded away for the half above: what the
+    // stack made inside the window comes home on the next reconcile, and
+    // the deletions made inside it still stand.
+    ws.ulak(server).arg("sync").assert().success();
+    assert!(
+        !ws.project.join("site/deleted-mid-pull.txt").exists()
+            && !ws.project.join("site/dir-removed-mid-pull").exists(),
+        "a deletion made mid-pull came back on the following reconcile"
+    );
     assert_eq!(
         std::fs::read_to_string(ws.project.join("site/made-by-the-stack.txt")).ok(),
         Some("made-by-the-stack".to_string()),
@@ -804,7 +843,6 @@ fn scenario_a_deletion_that_lands_mid_pull_stays_deleted(
 
     // And the deletion still reaches the server, because it is still a
     // deletion — the ledger claims a path that is no longer here.
-    ws.ulak(server).arg("sync").assert().success();
     for gone in ["deleted-mid-pull.txt", "dir-removed-mid-pull"] {
         assert!(
             server
@@ -1165,226 +1203,100 @@ fn two_ulaks_resolving_at_once_do_not_erase_each_other() {
     server.ssh(&format!("rm -rf {hash_dir}"));
 }
 
-/// Two saves inside one second, and the second one has to arrive. The
-/// hole and the fix are `sync::hidden_by_the_quick_check`.
-///
-/// `e2e_service::phase5` found it and cannot confirm it: that burst only
-/// enters the hole when the service's first push lands mid-burst, which
-/// GitHub's runner does and an 8-core box does not — measured, with the
-/// fix removed, it passed there in 0.4 s. A green that depends on losing
-/// a race is evidence about the machine.
-///
-/// So the timing is an input here. The second save is made from this
-/// test, aimed at an INSTANT inside the first save's second, while a
-/// plain `ulak sync` is running. An instant and not a delay because
-/// under load a save lands nowhere near where a sleep was told to put
-/// it: on two cores, seven attempts out of eight wrote on the far side
-/// of the boundary they were aiming inside.
-///
-/// An attempt asserts nothing until it has built all three facts — the
-/// server holds the first save, the local file holds the second, and the
-/// two share a second — and one that misses says which it missed. The
-/// shared second is the fix's precondition in disguise: the push runs
-/// between the two saves, so sharing a second means the push started
-/// inside it, which is exactly when the file falls in the window.
+/// Same length and same wire mtime, but different bytes. Construct the
+/// quick-check collision from the server's own copy instead of racing the
+/// network: on a slower SSH link the second save always reached the first
+/// push, and ninety seconds of successful transfers proved nothing. The
+/// local save is stamped into the very second the server's copy carries,
+/// which is what rsync's quick check cannot tell apart; the full survey
+/// compares content and must send it anyway.
 #[test]
 fn a_same_size_save_in_the_same_second_still_reaches_the_server() {
     let Some(server) = TestServer::shared() else {
         return;
     };
-    // This scenario is about WHEN two writes happen, so it cannot be
-    // timed next to the heavy siblings cargo runs alongside it.
     let _solo = TestServer::exclusive_sync();
     let server = &*server;
     let ws = Workspace::new();
     ws.set_host(&server.alias);
     let page = ws.project.join("site/index.html");
-
-    // Warm: the layout, the footprint cache and the ledger all exist
-    // after this, so the syncs the rounds time are the ordinary kind.
-    ws.write("site/index.html", "warming-up");
+    let first = "<h1>same-second-a</h1>";
+    let second = "<h1>same-second-b</h1>";
+    assert_eq!(first.len(), second.len());
+    ws.write("site/index.html", first);
     let out = ws.ulak(server).arg("sync").output().unwrap();
     assert!(
         out.status.success(),
-        "the warm-up sync must work:\n{}",
+        "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let remote_dir = extract_remote_dir(&String::from_utf8_lossy(&out.stderr))
-        .expect("no remote dir in the sync's output");
+    let remote_dir = extract_remote_dir(&String::from_utf8_lossy(&out.stderr)).unwrap();
+    let stamped = server.ssh(&format!("stat -c %Y {remote_dir}/site/index.html 2>/dev/null || stat -f %m {remote_dir}/site/index.html"));
+    assert!(stamped.status.success(), "the server holds the first push");
+    let wire_second: u64 = String::from_utf8(stamped.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("the server's mtime in whole seconds");
+    let written = Duration::new(wire_second, 999_999_999);
 
-    let mtime_of = |p: &std::path::Path| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .expect("the file was just written")
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("a modern mtime")
-    };
+    // POSIX touch -t works on both supported Unix server families; date's
+    // epoch conversion differs, hence the GNU/BSD alternatives. Only our
+    // own numeric epoch and fixture path reach this command.
+    let retime = server.ssh(&format!(
+        "stamp=$(date -u -d @{wire_second} +%Y%m%d%H%M.%S 2>/dev/null || date -u -r {wire_second} +%Y%m%d%H%M.%S) && TZ=UTC touch -m -t \"$stamp\" {remote_dir}/site/index.html"
+    ));
+    assert!(
+        retime.status.success(),
+        "cannot set the remote fixture mtime: {}",
+        String::from_utf8_lossy(&retime.stderr)
+    );
+    ws.write("site/index.html", second);
+    std::fs::File::open(&page)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + written)
+        .unwrap();
     let remote_says = || {
-        String::from_utf8_lossy(
-            &server
+        String::from_utf8(
+            server
                 .ssh(&format!("cat {remote_dir}/site/index.html"))
                 .stdout,
         )
-        .trim()
-        .to_string()
+        .unwrap()
     };
-    let now = || {
-        std::time::SystemTime::now()
+    assert_eq!(
+        remote_says(),
+        first,
+        "the server must still hold different bytes"
+    );
+    let stamped = server.ssh(&format!("stat -c %Y {remote_dir}/site/index.html 2>/dev/null || stat -f %m {remote_dir}/site/index.html"));
+    assert!(stamped.status.success());
+    assert_eq!(
+        String::from_utf8(stamped.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        wire_second
+    );
+    assert_eq!(
+        std::fs::metadata(&page)
+            .unwrap()
+            .modified()
+            .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-    };
-
-    // How far into the first save's second the second save is aimed.
-    // Late on purpose: everything before it is time rsync has to read the
-    // first save, which is what puts the copy on the server.
-    const AIM: Duration = Duration::from_millis(900);
-    // The first save has to land early enough to leave that room. Checked
-    // rather than assumed, and tight: rejecting costs only a write.
-    const HEAD_ROOM: u128 = 300;
-
-    // mtimes come from the kernel's coarse time, not from the clock this
-    // test reads, so a write issued just after a second begins can be
-    // stamped just BEFORE it. Measured, 200 writes: Linux stamps up to
-    // 2.46 ms behind, macOS 0.15 ms — and aiming at the boundary put
-    // every one of forty CI attempts at "998 ms into its second".
-    //
-    // Worst of five probes, because one would be timing its own write.
-    let mut lag = Duration::ZERO;
-    let probe = ws.project.join("site/.mtime-probe");
-    for i in 0..5 {
-        std::fs::write(&probe, format!("probe {i}")).expect("write the probe");
-        let stamped = mtime_of(&probe);
-        lag = lag.max(now().saturating_sub(stamped));
-    }
-    std::fs::remove_file(&probe).ok();
-    // Margin for the write itself, which the probe timed warm.
-    let clears_the_boundary = lag + Duration::from_millis(30);
-    assert!(
-        clears_the_boundary < Duration::from_millis(HEAD_ROOM as u64),
-        "the filesystem stamps mtimes {lag:?} behind this test's clock, so a save \
-         cannot be placed inside a known second at all — with a resolution that \
-         coarse the hole this test is about cannot form either"
+            .as_secs(),
+        wire_second
     );
-
-    let mut missed = Vec::new();
-    // Bounded by the clock as well as the count: a failed alignment costs
-    // a write, a failed round costs a whole sync, and only seconds bound
-    // both. Pinned to two cores like CI, six runs built the case on
-    // attempts 1, 12, 1, 2, 8 and 4 — the budget is set past the worst of
-    // those, and the numbers are here so a later edit can tell a slower
-    // runner from a harder case.
-    const BUDGET: Duration = Duration::from_secs(90);
-    let began = Instant::now();
-    for attempt in 1..=40 {
-        if began.elapsed() > BUDGET {
-            missed.push(format!(
-                "  (stopped after {BUDGET:?} with {} attempts left)",
-                40 - attempt + 1
-            ));
-            break;
-        }
-        // Just past the top of a second: sleep most of the way, spin the
-        // last stretch. Sleeping the whole way overshot far enough on two
-        // cores to land the save near the END of its second — seven CI
-        // rounds out of eight. A sleep is a lower bound; a spin is not.
-        let edge = now();
-        let target = Duration::from_secs(edge.as_secs() + 1) + clears_the_boundary;
-        if let Some(most) = target
-            .checked_sub(edge)
-            .and_then(|d| d.checked_sub(Duration::from_millis(60)))
-        {
-            std::thread::sleep(most);
-        }
-        while now() < target {
-            std::hint::spin_loop();
-        }
-
-        // Same length on purpose — a size change is the one thing the
-        // quick check cannot miss. Numbered so a later attempt cannot be
-        // satisfied by an earlier one's bytes.
-        let v1 = format!("<h1>same-second-{attempt:02}-a</h1>");
-        let v2 = format!("<h1>same-second-{attempt:02}-b</h1>");
-        assert_eq!(v1.len(), v2.len(), "the two saves must be the same size");
-
-        ws.write("site/index.html", &v1);
-        let first = mtime_of(&page);
-        if first.subsec_millis() as u128 > HEAD_ROOM {
-            // No room left for a sync and a second save. Nothing spent.
-            missed.push(format!(
-                "  attempt {attempt}: first save landed {} ms into its second, too late to aim at",
-                first.subsec_millis()
-            ));
-            continue;
-        }
-
-        // Piped and kept: a round that missed because the push FAILED
-        // reads exactly like one that missed on timing.
-        let syncing = ws
-            .ulak_raw(server)
-            .arg("sync")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("sync spawn");
-
-        // An instant, not a delay: a delay measured from where the save
-        // was SUPPOSED to land is what split the two seconds before.
-        let target = Duration::from_secs(first.as_secs()) + AIM;
-        if let Some(wait) = target.checked_sub(now()) {
-            std::thread::sleep(wait);
-        }
-        let late = now() >= Duration::from_secs(first.as_secs() + 1);
-        if !late {
-            ws.write("site/index.html", &v2);
-        }
-        let second = mtime_of(&page);
-        let done = syncing.wait_with_output().expect("sync to finish");
-
-        let landed = remote_says();
-        if !done.status.success() || late || second.as_secs() != first.as_secs() || landed != v1 {
-            // A fact the hole is made of is missing, so there is nothing
-            // to ask about. Which one is worth keeping.
-            missed.push(format!(
-                "  attempt {attempt}: exit={:?}, saves in {}, server took {landed:?}{}",
-                done.status.code(),
-                match (late, second.as_secs() == first.as_secs()) {
-                    (true, _) => "— the second ran out before the second save".to_string(),
-                    (_, true) => "one second".to_string(),
-                    _ => format!("{} then {}", first.as_secs(), second.as_secs()),
-                },
-                match done.status.success() {
-                    true => String::new(),
-                    false => format!("\n{}", String::from_utf8_lossy(&done.stderr)),
-                },
-            ));
-            continue;
-        }
-
-        // Built: same size, same second, different bytes.
-        ws.ulak(server).arg("sync").assert().success();
-        assert_eq!(
-            remote_says(),
-            v2,
-            "a same-size save made in the same second as the last push never \
-             travelled (attempt {attempt}, second {}). rsync's quick check \
-             cannot see it and never will — closing that is what \
-             `sync::offer_again` is for.\nlocal:  {:?}\nremote listing:\n{}",
-            first.as_secs(),
-            std::fs::read_to_string(&page).unwrap_or_default(),
-            String::from_utf8_lossy(&server.ssh(&format!("ls -la {remote_dir}/site")).stdout),
-        );
-        return;
-    }
-
-    panic!(
-        "no attempt got a save into the push's own second, so the case this \
-         test is about was never built and nothing here was tested. That is \
-         not a pass. This machine stamps mtimes {lag:?} behind its own clock, \
-         so every save was aimed {clears_the_boundary:?} past a second \
-         boundary — if the attempts below all landed at the END of a second, \
-         that measurement is where to look first. Every attempt:\n{}",
-        missed.join("\n")
+    ws.ulak(server).arg("sync").assert().success();
+    assert_eq!(
+        remote_says(),
+        second,
+        "the checksum catch-up must send bytes hidden by size and whole-second mtime"
     );
+    assert_eq!(std::fs::read_to_string(&page).unwrap(), second);
+    ws.forget_on_server(server);
 }
 
 /// What a wiped runner needs before its SECOND job works.
@@ -1466,4 +1378,149 @@ fn a_declared_identity_lets_a_wiped_runner_sync_again() {
     );
 
     server.ssh(&format!("rm -rf .ulak/workspaces/{namespace}"));
+}
+
+/// A file deleted here that the server changed since the last sync is not
+/// deleted there: the server's edit wins, its copy comes back home and a
+/// warning names it, while every other deletion still happens and the sync
+/// succeeds. Before, the whole sync stopped with an error that named no
+/// file, the pull never ran, and the service retried the same failure on
+/// every tick while container output stopped coming home. Deleted here a
+/// second time, the file goes: the pull claims what it brought home, and
+/// without that claim the file came back on every sync.
+///
+/// The last leg runs the same story through `ulak docker compose`, whose
+/// push and pull are two steps with the command between them. The claim
+/// used to reach only `ulak sync`'s own pull, so there the file came home
+/// unclaimed, and every later deletion of it was undone without a word.
+#[test]
+fn a_deleted_file_the_server_changed_comes_back_and_the_sync_goes_on() {
+    let Some(server) = TestServer::shared() else {
+        return;
+    };
+    let ws = Workspace::new();
+    ws.write("edited-on-server.txt", "agreed\n");
+    ws.write("gone.txt", "delete me\n");
+    ws.set_host(&server.alias);
+
+    let first = ws.ulak(&server).arg("sync").output().unwrap();
+    assert!(
+        first.status.success(),
+        "first sync failed:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let remote_dir = extract_remote_dir(&String::from_utf8_lossy(&first.stderr))
+        .expect("sync reports its remote directory");
+    let mut cleanup = RemotePathCleanup::new(&server);
+    cleanup.remember(remote_dir.clone());
+
+    // The stack rewrites one synced file; this machine deletes both.
+    let edited = format!("{remote_dir}/edited-on-server.txt");
+    assert!(
+        server
+            .ssh(&format!("printf 'server edit\\n' > {edited}"))
+            .status
+            .success(),
+        "cannot edit the file on the server"
+    );
+    std::fs::remove_file(ws.project.join("edited-on-server.txt")).unwrap();
+    std::fs::remove_file(ws.project.join("gone.txt")).unwrap();
+
+    let second = ws.ulak(&server).arg("sync").output().unwrap();
+    let said = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "the sync must go on:\n{said}");
+    // The warning's own words: the pull's "↓ edited-on-server.txt" line
+    // names the file too, so the name alone passed with no warning at all.
+    assert!(
+        said.contains(
+            "edited-on-server.txt changed on the server after it was last synced, \
+             so your deletion was not applied"
+        ),
+        "the warning names the file:\n{said}"
+    );
+    assert_eq!(
+        std::fs::read(ws.project.join("edited-on-server.txt")).unwrap(),
+        b"server edit\n",
+        "the server's copy comes home"
+    );
+    assert_eq!(
+        server.ssh(&format!("cat {edited}")).stdout,
+        b"server edit\n",
+        "the server's copy was not deleted"
+    );
+    assert!(
+        !server
+            .ssh(&format!("test -e {remote_dir}/gone.txt"))
+            .status
+            .success(),
+        "every other deletion still happens"
+    );
+
+    // Deleted here a second time, now that both ends agree on the
+    // server's copy: the file the pull brought home was claimed again, so
+    // this deletion reaches the server. Unclaimed, it counted as
+    // server-born and came back on every sync.
+    std::fs::remove_file(ws.project.join("edited-on-server.txt")).unwrap();
+    let third = ws.ulak(&server).arg("sync").output().unwrap();
+    let said = String::from_utf8_lossy(&third.stderr);
+    assert!(third.status.success(), "the third sync failed:\n{said}");
+    assert!(
+        !server.ssh(&format!("test -e {edited}")).status.success(),
+        "the second deletion never reached the server:\n{said}"
+    );
+    assert!(
+        !ws.project.join("edited-on-server.txt").exists(),
+        "the deleted file came back:\n{said}"
+    );
+
+    // Through a passthrough. `stop` finds no container to stop, and it
+    // is neither read-only nor a tree reader: it pushes, runs, and pulls
+    // back afterwards, as `up` does, without needing an image. The
+    // project name is this scenario's own, so nothing else is stopped.
+    ws.write("edited-under-compose.txt", "agreed\n");
+    let fourth = ws.ulak(&server).arg("sync").output().unwrap();
+    assert!(
+        fourth.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fourth.stderr)
+    );
+    let composed = format!("{remote_dir}/edited-under-compose.txt");
+    assert!(
+        server
+            .ssh(&format!("printf 'server edit\\n' > {composed}"))
+            .status
+            .success(),
+        "cannot edit the file on the server"
+    );
+    std::fs::remove_file(ws.project.join("edited-under-compose.txt")).unwrap();
+    let compose = || {
+        ws.ulak(&server)
+            .args(["docker", "compose", "-p", "ulak-e2e-comes-back", "stop"])
+            .output()
+            .unwrap()
+    };
+    let spared = compose();
+    let said = String::from_utf8_lossy(&spared.stderr);
+    assert!(spared.status.success(), "the passthrough failed:\n{said}");
+    assert!(
+        said.contains("edited-under-compose.txt changed on the server after it was last synced"),
+        "the warning names the file:\n{said}"
+    );
+    assert_eq!(
+        std::fs::read(ws.project.join("edited-under-compose.txt")).unwrap(),
+        b"server edit\n",
+        "the server's copy comes home in the passthrough's own pull"
+    );
+    std::fs::remove_file(ws.project.join("edited-under-compose.txt")).unwrap();
+    let again = compose();
+    let said = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "the passthrough failed:\n{said}");
+    assert!(
+        !server.ssh(&format!("test -e {composed}")).status.success(),
+        "the second deletion never reached the server:\n{said}"
+    );
+    assert!(
+        !ws.project.join("edited-under-compose.txt").exists(),
+        "the deleted file came back:\n{said}"
+    );
 }

@@ -86,6 +86,42 @@ struct RawSync {
     include: Option<Vec<String>>,
     protect: Option<Vec<String>>,
     max_delete: Option<DeleteBudget>,
+    no_history: Option<NoHistory>,
+}
+
+/// What a push does with a file that differs on both ends while no content
+/// was ever recorded as common to them — no shared history: a wiped state directory, a CI
+/// runner declaring its workspace, a second machine on one workspace, the
+/// first sync after an upgrade. `Send` sends this machine's copy, as every
+/// version before content records did, and names each file it did that
+/// to; `Hold` keeps both copies and reports the conflict, which a runner
+/// without a human can never resolve. Every file WITH a record keeps the
+/// conflict rule whatever this says — baseline.rs owns that rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoHistory {
+    Send,
+    Hold,
+}
+
+impl std::fmt::Display for NoHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoHistory::Send => "send",
+            NoHistory::Hold => "hold",
+        })
+    }
+}
+
+impl std::str::FromStr for NoHistory {
+    type Err = ();
+    fn from_str(raw: &str) -> std::result::Result<Self, ()> {
+        match raw.trim() {
+            "send" => Ok(NoHistory::Send),
+            "hold" => Ok(NoHistory::Hold),
+            _ => Err(()),
+        }
+    }
 }
 
 /// How many server-side deletions one sync may make without asking.
@@ -218,6 +254,7 @@ pub struct SyncCfg {
     pub include: Vec<String>,
     pub protect: Vec<String>,
     pub max_delete: DeleteBudget,
+    pub no_history: NoHistory,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +293,7 @@ impl Default for Config {
                 include: vec![".env".into()],
                 protect: vec![],
                 max_delete: DeleteBudget::Limit(25),
+                no_history: NoHistory::Send,
             },
             forward: ForwardCfg { auto: true },
             service: ServiceCfg {
@@ -297,6 +335,10 @@ impl Config {
             if let Some(v) = sync.max_delete {
                 self.sync.max_delete = v;
                 won.set("sync.max_delete", from);
+            }
+            if let Some(v) = sync.no_history {
+                self.sync.no_history = v;
+                won.set("sync.no_history", from);
             }
         }
         if let Some(forward) = layer.forward
@@ -1287,6 +1329,11 @@ pub(crate) const ENV_VARS: &[EnvVar] = &[
         secret: false,
     },
     EnvVar {
+        name: "ULAK_SYNC_NO_HISTORY",
+        key: Some("sync.no_history"),
+        secret: false,
+    },
+    EnvVar {
         name: "ULAK_FORWARD_AUTO",
         key: Some("forward.auto"),
         secret: false,
@@ -1379,6 +1426,19 @@ fn apply_env(config: &mut Config, env: &BTreeMap<String, String>, won: &mut Won)
             "ULAK_SYNC_INCLUDE" => config.sync.include = env_list(raw),
             "ULAK_SYNC_PROTECT" => config.sync.protect = env_list(raw),
             "ULAK_SYNC_MAX_DELETE" => config.sync.max_delete = env_budget(var.name, raw)?,
+            "ULAK_SYNC_NO_HISTORY" => {
+                config.sync.no_history = raw.parse().map_err(|()| {
+                    fail!(
+                        "{} is not a choice for a file with no shared history: `{raw}`",
+                        var.name
+                    )
+                    .now(format!(
+                        "set {}=send to send this machine's copy, or {}=hold to keep both",
+                        var.name, var.name
+                    ))
+                    .into_err()
+                })?
+            }
             "ULAK_FORWARD_AUTO" => config.forward.auto = env_bool(var.name, raw)?,
             // No warning, unlike a project TOML carrying [service]:
             // whoever sets an environment variable is the machine's owner
@@ -1877,6 +1937,7 @@ mod tests {
             let Some(key) = var.key else { continue };
             let probe = match key {
                 "sync.max_delete" => "7",
+                "sync.no_history" => "hold",
                 "forward.auto" | "service.auto" => "false",
                 _ => "probe",
             };
@@ -1888,6 +1949,7 @@ mod tests {
                 "sync.include" => got.sync.include == ["probe"],
                 "sync.protect" => got.sync.protect == ["probe"],
                 "sync.max_delete" => got.sync.max_delete == DeleteBudget::Limit(7),
+                "sync.no_history" => got.sync.no_history == NoHistory::Hold,
                 "forward.auto" => !got.forward.auto,
                 "service.auto" => !got.service.auto,
                 other => panic!("{other} has a row but this test cannot see it take effect"),
@@ -2053,6 +2115,45 @@ mod tests {
             DeleteBudget::Limit(9),
             "the pointed file replaced the global one"
         );
+    }
+
+    /// The file-with-no-shared-history rule is a decision, so it reads from
+    /// the file and the environment, defaults to sending — a wiped CI runner
+    /// has no human to resolve a hold — and refuses a value that is neither.
+    #[test]
+    fn a_file_with_no_shared_history_is_sent_unless_told_to_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(
+            load_layers_in(home, None, &BTreeMap::new())
+                .unwrap()
+                .sync
+                .no_history,
+            NoHistory::Send
+        );
+        write(
+            &home.join(PROJECT_CONFIG),
+            "[sync]\nno_history = \"hold\"\n",
+        );
+        assert_eq!(
+            load_layers_in(home, None, &BTreeMap::new())
+                .unwrap()
+                .sync
+                .no_history,
+            NoHistory::Hold
+        );
+        let from_env =
+            load_layers_in(home, None, &env(&[("ULAK_SYNC_NO_HISTORY", "send")])).unwrap();
+        assert_eq!(from_env.sync.no_history, NoHistory::Send);
+        let err = load_layers_in(home, None, &env(&[("ULAK_SYNC_NO_HISTORY", "maybe")]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ULAK_SYNC_NO_HISTORY") && err.contains("maybe"),
+            "{err}"
+        );
+        assert_eq!(NoHistory::Send.to_string(), "send");
+        assert_eq!(NoHistory::Hold.to_string(), "hold");
     }
 
     /// A discovered `ulak.toml` may be absent; this one was asked for by

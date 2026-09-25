@@ -15,7 +15,7 @@ You do not need a local Docker daemon or Docker Desktop. Ulak itself installs
 no agent and opens no additional service port on the server.
 
 ```text
-local checkout  ⇄  rsync over SSH  ⇄  remote workspace
+local checkout  ⇄  sync over SSH   ⇄  remote workspace
                                              │
                                              └── Docker / Compose
 localhost       ◀──── SSH tunnels ───────────┘
@@ -61,145 +61,93 @@ ulak docker compose down
 
 ### On your computer
 
-You need:
+You need macOS or Linux, OpenSSH and rsync 3.2 or later. Apple's built-in
+openrsync is not supported; install `rsync` with Homebrew on macOS.
 
-- macOS or Linux;
-- OpenSSH (`ssh`);
-- rsync 3.2 or later; and
-- Rust 1.89 or later to build Ulak from source.
-
-Apple's built-in openrsync is not supported. On macOS, install a current
-rsync with Homebrew first (the Homebrew formula below does this for you):
-
-```bash
-brew install rsync
-```
-
-Install the latest release (prebuilt for macOS and Linux):
+Install a prebuilt release:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/syy/ulak/releases/latest/download/ulak-installer.sh | sh
 ```
 
-Alternatives:
+Or use Homebrew (also installs rsync) or Cargo (requires Rust 1.89 or later):
 
 ```bash
-# Homebrew, on macOS or Linux; also installs rsync
 brew install syy/tap/ulak
-
-# crates.io, built from source
+# Or build from source:
 cargo install ulak
-
-# a checkout; also gives you scripts/check-server.sh and the demo
-git clone https://github.com/syy/ulak.git
-cd ulak
-cargo install --path crates/ulak
 ```
 
 ### On the server
 
-The server needs:
+The server needs key-based SSH access, Docker Engine, rsync 3.2 or later,
+and Python 3.7 or later. Compose projects also need Docker Compose v2.
+The SSH user must be able to run Docker without `sudo`.
 
-| Requirement | Check |
-|---|---|
-| SSH with key authentication | `ssh my-server true` |
-| Docker Engine | `docker --version` |
-| Docker Compose v2 (for Compose projects) | `docker compose version` |
-| rsync 3.2 or later | `rsync --version` |
-
-The SSH user must be able to run Docker without `sudo`. Ulak never runs `sudo`
-for you.
-
-Compose is optional if you only run Docker commands that do not use a Compose
-model, such as `ulak docker ps` or `ulak docker build`.
-
-Run `ulak doctor` after installation. It reports a missing requirement and
-shows the next command to run. To check a new server before you configure a
-project, run this from the cloned Ulak repository:
+Run `ulak doctor` to check the requirements and get commands to fix missing
+tools. From a cloned repository, you can check a server before configuration:
 
 ```bash
 ssh my-server 'bash -s' < scripts/check-server.sh
 ```
 
+Ulak sends Python helpers over SSH without installing them. Linux servers
+with Python 3.9 or later support prompt detection of server-side file changes;
+other supported servers use periodic comparisons.
+
 ## Why not `DOCKER_HOST=ssh://`?
 
-An SSH Docker context moves the Docker API connection. It does not move the
-filesystem.
-
-This difference matters for bind mounts. A path such as `./site` exists on your
-computer, but a remote Docker daemon looks for it on the server. A missing file
-causes an error. A missing directory can become an empty directory, so the
-container can start with no source files and no clear failure.
-
-Ulak synchronizes the required files first and then runs Compose inside the
-remote workspace. Relative bind mounts, `env_file`, `configs`, build contexts,
-and paths such as `../shared` keep their normal meaning.
+An SSH Docker context moves the Docker API connection, but bind mounts still
+refer to the server's filesystem. Ulak first synchronizes the required files,
+then runs Compose in the remote workspace. Relative bind mounts, `env_file`,
+`configs`, build contexts and sibling paths such as `../shared` keep their meaning.
 
 ## How synchronization works
 
-Ulak uses the Compose model as the boundary of a project. It asks the server's
-`docker compose config` for the resolved model and synchronizes the local paths
-that model references. It does not copy an entire repository unless the model
-needs the entire repository.
+Ulak asks the server's `docker compose config` which local paths the project
+needs. It copies those paths, including sibling directories, rather than an
+entire repository by default.
 
-This has two useful effects:
+Local edits go to the server; files created or changed by containers come back.
+If both sides changed a file differently since their last agreed content, Ulak
+keeps both copies and reports a conflict. It does not merge files.
 
-- A service in a large monorepo can synchronize only its own files.
-- A Compose file can reference a sibling directory without moving to a new
-  project root.
+**Without recorded common content, `[sync] no_history = "send"` is the default:
+the local copy replaces a differing server copy, with a warning.** Set it to
+`"hold"` to keep both copies instead. See the
+[synchronization guide](https://github.com/syy/ulak/blob/main/docs/synchronization.md)
+for conflict resolution, deletion rules and transfer limits.
 
-The synchronization runs in both directions. Local edits go to the server, and
-files created or changed by the stack come back. Ulak does not provide a merge
-engine: if both sides change the same file, the last write wins.
-
-Ulak follows `.gitignore` by default. Use `[sync] include` for a required
-gitignored path and `[sync] protect` for data that must stay on the server.
+Ulak follows `.gitignore`. Use `[sync] include` for required ignored paths and
+`[sync] protect` for server-owned data.
 
 ## Docker commands
 
-Docker's command tree stays below `ulak docker`:
-
-| Docker | Ulak |
-|---|---|
-| `docker compose up -d` | `ulak docker compose up -d` |
-| `docker build -t api .` | `ulak docker build -t api .` |
-| `docker run --rm image` | `ulak docker run --rm image` |
-| `docker exec -it app sh` | `ulak docker exec -it app sh` |
-| `docker logs -f app` | `ulak docker logs -f app` |
-| `docker cp app:/tmp/out.txt .` | `ulak docker cp app:/tmp/out.txt .` |
-| `docker compose cp ./seed.txt app:/tmp/seed.txt` | `ulak docker compose cp ./seed.txt app:/tmp/seed.txt` |
-
-Compose flags keep Docker's order:
+Put `ulak` before a supported Docker command:
 
 ```bash
+ulak docker build -t api .
+ulak docker run --rm image
+ulak docker cp app:/tmp/out.txt .
 ulak docker compose -f compose.yaml -f compose.dev.yaml -p my-app up -d
 ```
 
-Run `ulak docker --help` to inspect the supported tree. Ulak refuses a command
-that it cannot route safely instead of forwarding it on a guess. The generated
-[Docker command map](https://github.com/syy/ulak/blob/main/docs/docker-commands.md) lists every command and how Ulak
-handles it.
+Run `ulak docker --help` or see the
+[Docker command map](https://github.com/syy/ulak/blob/main/docs/docker-commands.md).
+Commands that Ulak cannot route safely are refused.
 
 ### Project scripts that call `docker`
 
-A project script usually calls `docker`, not `ulak docker`. Run it through the
-temporary shim without installing anything:
+Run an existing script through a temporary shim:
 
 ```bash
 ulak shim run -- ./scripts/start.sh
 ```
 
-For a persistent shim:
-
-```bash
-ulak shim install
-ulak shim status
-ulak shim uninstall
-```
-
-`shim install` asks before it changes a shell profile. `shim uninstall` removes
-only the block that Ulak added.
+For a persistent shim, use `ulak shim install`, `ulak shim status` and
+`ulak shim uninstall`. Installation asks before changing a shell profile;
+uninstall removes only Ulak's block.
 
 ## Main commands
 
@@ -217,10 +165,9 @@ only the block that Ulak added.
 | `ulak service ...` | Install, remove, or run the local background service. |
 | `ulak completions <shell>` | Generate Bash, Zsh, or Fish completions. |
 
-`ulak sync --dry-run` previews uploads and remote deletions without applying
-them. It does not preview downloads. Resolving the Compose model still requires
-a server connection and may upload temporary Compose and environment files.
-Use `ulak config --json` when a script needs the effective configuration.
+`ulak sync --dry-run` previews uploads and remote deletions, not downloads.
+It still contacts the server; its upload list can differ from the real sync.
+See [preview details](https://github.com/syy/ulak/blob/main/docs/synchronization.md#previewing-a-sync).
 
 When you change `host`, Ulak's management commands can keep addressing the
 server recorded for a running stack. See
@@ -229,25 +176,18 @@ retiring a server that no longer exists.
 
 ## Configuration
 
-Ulak reads three TOML layers. Later layers override earlier ones, field by
-field:
+Settings apply in this order; later layers override earlier ones:
 
-| Layer | Default path | Use |
-|---|---|---|
-| Global | `~/.config/ulak/config.toml` | Defaults for this computer. |
-| Project | `ulak.toml` | Settings shared by the project. |
-| Local | `ulak.local.toml` | Settings for one checkout. |
+1. Global: `~/.config/ulak/config.toml`
+2. Project: `ulak.toml`
+3. Checkout: `ulak.local.toml`
+4. Environment variables
+5. CLI flags
 
-Environment variables override the files, and CLI flags override everything.
-Lists replace earlier lists; they are not appended. Run `ulak config` to see the
-result. The project and local files sit in the project directory itself, next
-to the compose file; a `.config/ulak.toml` left over from an earlier version is
-not read, and `ulak config` lists it as ignored.
-
-On its first ordinary interactive run, Ulak creates a fully commented global
-configuration file. The file changes no setting until you edit it.
-
-A typical project configuration is small:
+Project and checkout files sit next to the Compose file. Lists replace earlier
+lists. Run `ulak config` to inspect the result, or `ulak config --json` for scripts.
+The first ordinary interactive run creates a fully commented global config.
+The old `.config/ulak.toml` project location is ignored.
 
 ```toml
 host = "my-server"
@@ -256,75 +196,47 @@ host = "my-server"
 exclude = ["node_modules", ".venv", "target"]
 protect = ["data/", "uploads/"]
 max_delete = 25
-
-[forward]
-auto = true
 ```
 
-`.env` is already included by default. You only need to set `include` when you
-want to replace that default or add other gitignored paths.
+`.env` is included by default. Setting `include` replaces that default.
 
 ### Protect server-owned data
 
-Use `[sync] protect` for writable data that belongs only to the server, such as
-database files or uploads:
+`[sync] protect` paths are never uploaded, downloaded or deleted. Use it for
+database files and uploads, not source code or generated files you want back.
+`ulak doctor` suggests writable mounts that may need protection.
 
-```toml
-[sync]
-protect = ["data/", "uploads/"]
-```
-
-A protected path is not pushed, pulled, or deleted. Do not protect source code
-or generated files that you want in the local checkout. `ulak doctor` reports
-writable mounts and suggests paths that may need protection.
-
-For all environment variables, SSH key settings, and CI examples, see
-[Environment variables](https://github.com/syy/ulak/blob/main/docs/env.md).
+See [Environment variables](https://github.com/syy/ulak/blob/main/docs/env.md)
+for all settings, SSH keys and CI examples.
 
 ## Background service
 
-The first Ulak command run in an interactive terminal installs one user-level
-background service on your computer. Ulak uses launchd on macOS and a systemd
-user unit on Linux. It prints a message when it does this.
+The first ordinary interactive command installs a local user service using
+launchd on macOS or systemd on Linux. For stacks left running, it synchronizes
+files, maintains localhost ports and reconnects after interruptions. Nothing
+is installed automatically in scripts or CI, or on the server.
 
-The service only maintains stacks that you left running. It:
-
-- watches local files and synchronizes changes;
-- brings container-generated files back;
-- keeps published ports on `localhost`; and
-- reconnects after sleep, a network change, or a server restart.
-
-Nothing is installed automatically in a non-interactive script, CI job, or
-test. Nothing is installed on the Docker server.
-
-To disable automatic background work, put this in the global configuration:
+To disable automatic installation, set this in the **global** configuration:
 
 ```toml
 [service]
 auto = false
 ```
 
-Every command still works. Run the service manually when you need continuous
-sync and tunnels:
+| Command | Purpose |
+|---|---|
+| `ulak service run --foreground` | Run continuous sync and tunnels manually. |
+| `ulak service install` | Install or refresh the service; run after upgrading. |
+| `ulak service uninstall` | Stop and remove the installed service. |
 
-```bash
-ulak service run --foreground
-```
-
-Install or refresh the service explicitly with `ulak service install`.
-To stop and remove the installed service, run:
-
-```bash
-ulak service uninstall
-```
-
-Keep `[service] auto = false` in the global configuration to prevent the next
-ordinary terminal command from installing it again. After an upgrade, run
-`ulak service install` to restart the service with the installed binary.
+Keep `auto = false` to prevent a later terminal command from reinstalling it.
+Small changes use a persistent SSH connection; larger transfers use rsync.
+See the [synchronization guide](https://github.com/syy/ulak/blob/main/docs/synchronization.md)
+for server-change detection and full comparisons.
 
 ## Ports and access
 
-Bind a published port to loopback in Compose:
+Publish ports on server loopback:
 
 ```yaml
 services:
@@ -333,74 +245,57 @@ services:
       - "127.0.0.1:8080:80"
 ```
 
-While the stack and Ulak's background service are running, the server's TCP
-port is available at `http://localhost:8080`. If a local port is busy, Ulak
-names it and still opens the other available ports.
+With the stack and background service running, this is available at
+`http://localhost:8080`. A busy local port is reported; other ports still open.
 
-Be careful with this shorter form:
+**`"8080:80"` publishes on all server interfaces.** A localhost tunnel does not
+make that server port private, and Docker's port rules can bypass UFW.
+`ulak doctor` warns about public bindings.
 
-```yaml
-ports:
-  - "8080:80"
-```
-
-It binds the port on all server interfaces. Forwarding it to `localhost` does
-not make the server-side port private, and Docker's published-port rules can
-bypass host firewall policies such as UFW. `ulak doctor` warns about public
-bindings.
-
-Ulak forwards server ports to your computer. It does not provide the reverse
-path from a container to a service on your computer. Use a private routed
-network when a container must reach a local service.
+Forwarding is TCP-only and runs from server to computer. UDP and automatic
+forwarding of `network_mode: host` ports are unsupported. Containers cannot
+use these tunnels to reach services on your computer.
 
 ## Data safety
 
-Ulak treats deletion as a separate operation from synchronization.
+- Ulak never uses `rsync --delete` and never deletes local files during a pull.
+- Remote deletion requires a tracked file that is absent locally. A server
+  edit since the last agreed content is kept and brought back instead.
+- With no agreed content, a recorded send can authorize deletion even if the
+  server changed the file. Sends known never to have arrived are excepted;
+  see [deletion rules](https://github.com/syy/ulak/blob/main/docs/synchronization.md#deletion-safety).
+- Protected paths and unclaimed server-created files are not deleted.
+- More than 25 remote deletions require confirmation by default; configure
+  `sync.max_delete` or `--max-delete` to change the limit.
 
-- It never runs `rsync --delete`.
-- It never deletes a local file during a pull.
-- A remote file is eligible for deletion only if Ulak recorded that it sent
-  the file and the file is now absent locally.
-- Ulak does not delete an unclaimed server-created file merely because no local
-  copy exists.
-- Protected paths never enter the deletion ledger.
-- More than 25 remote deletions require confirmation by default. Change the
-  limit with `sync.max_delete` or `--max-delete`.
-
-Each client and checkout gets its own remote workspace. Ulak locks the
-workspace during changes and refuses if two clients claim the same workspace.
-SSH host-key checking is never disabled.
+Workspaces are isolated per client and checkout, locked during changes, and
+checked for identity conflicts. SSH host-key checking stays enabled.
 
 ## Known limits
 
-- Ulak supports Unix systems only.
-- For Compose, only referenced local paths are synchronized. Add a mount or
-  another Compose reference when the stack needs another path.
-- `.gitignore` applies to synchronization. Use `[sync] include` for a required
-  ignored path.
-- Absolute paths and paths under `~` in a Compose file belong to the server.
-  `ulak doctor` checks whether they exist there.
-- SSH tunnels forward TCP ports only. UDP ports are reported and skipped.
-- Ports used through `network_mode: host` do not appear in the Compose port
-  model, so Ulak cannot forward them automatically.
-- Ulak has no three-way merge or conflict files. Avoid changing the same file
-  on both machines at the same time.
+- Absolute and `~` paths in Compose refer to the server; `ulak doctor` checks them.
+- Conflicts require manual resolution. Ulak does not merge or create conflict files.
+- Rsync compares files before writing them: a concurrent server edit can be
+  overwritten. Avoid editing locally a file that a container is rewriting.
+- Digest caching assumes consistent filesystem clocks. Network filesystems
+  with clock skew can hide a change.
+
+See [Synchronization](https://github.com/syy/ulak/blob/main/docs/synchronization.md)
+for resolving conflicts, finding warnings and clearing digest caches.
 
 ## CI and temporary runners
 
-You can configure Ulak without writing files. Set `ULAK_HOST` and, when
-needed, provide key and `known_hosts` contents through environment variables.
-Host-key checking stays enabled.
+Set `ULAK_HOST` and provide SSH credentials through environment variables.
+Keep a stable workspace namespace and UUID; persist the state directory for
+deletion tracking and common-content history. Without history, the default
+`sync.no_history = "send"` can replace a differing server copy.
 
-A fresh runner should also keep a stable workspace namespace and UUID. Persist
-the Ulak state directory if server-side deletions must reconcile between jobs.
-See [Environment variables](https://github.com/syy/ulak/blob/main/docs/env.md#ulak-in-ci-or-an-agent) before using
-Ulak from a temporary runner.
+Follow the [CI setup](https://github.com/syy/ulak/blob/main/docs/env.md#ulak-in-ci-or-an-agent)
+for identities, credentials and host-key verification.
 
 ## Demo
 
-The included demo checks bind mounts, `configs`, `env_file`, build contexts,
-and port forwarding:
+From a cloned repository:
 
 ```bash
 cd examples/demo

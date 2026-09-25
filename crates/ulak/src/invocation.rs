@@ -774,55 +774,6 @@ pub(crate) fn pending_deletions(key: &crate::config::WorkspaceStateKey) -> usize
         .unwrap_or(0)
 }
 
-/// When the last push started reading this workspace, and the last
-/// SECOND it was still reading in. The two ends are measured
-/// differently on purpose — `sync::hidden_by_the_quick_check` is the
-/// only caller and says why.
-///
-/// Three integers, so neither end needs a float:
-/// `<start secs> <start nanos> <end secs>`. On disk rather than in
-/// memory because `ulak sync` typed by hand is a different process from
-/// the service, and the hole is the same one for both.
-pub(crate) fn record_push_window(
-    key: &crate::config::WorkspaceStateKey,
-    from: std::time::SystemTime,
-    to: u64,
-) {
-    let Some(path) = writable_receipt_marker(key, "pushed") else {
-        return;
-    };
-    let Ok(d) = from.duration_since(std::time::UNIX_EPOCH) else {
-        return;
-    };
-    let _ = write_private(
-        &path,
-        format!("{} {} {to}", d.as_secs(), d.subsec_nanos()).as_bytes(),
-    );
-}
-
-pub(crate) fn last_push_window(
-    key: &crate::config::WorkspaceStateKey,
-) -> Option<(std::time::SystemTime, u64)> {
-    let text = std::fs::read_to_string(receipt_marker(key, "pushed")?).ok()?;
-    let mut fields = text.split_whitespace();
-    let secs: u64 = fields.next()?.parse().ok()?;
-    let nanos: u32 = fields.next()?.parse().ok()?;
-    let to: u64 = fields.next()?.parse().ok()?;
-    Some((
-        std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos),
-        to,
-    ))
-}
-
-/// Seconds since the epoch, which is the only clock the comparison can
-/// use: it is what a file's mtime is measured against too.
-pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 // ─── which machine owns this workspace ─────────────────────────────────
 //
 // The automatic client namespace keeps independent local state roots out
@@ -918,9 +869,9 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    /// `synced`, pending deletions and the push window all describe one
-    /// remote copy. Sharing any one of them lets activity on server A alter
-    /// the safety decision made for server B.
+    /// `synced` and pending deletions both describe one remote copy.
+    /// Sharing either lets activity on server A alter the safety decision
+    /// made for server B.
     #[test]
     fn sync_receipts_are_partitioned_by_destination() {
         let workspace = crate::config::WorkspaceKey::from_namespace(
@@ -934,15 +885,11 @@ mod tests {
 
         mark_synced(&a);
         record_pending_deletions(&a, 7);
-        let from = std::time::UNIX_EPOCH + std::time::Duration::new(42, 9);
-        record_push_window(&a, from, 43);
 
         assert!(ever_synced(&a));
         assert!(!ever_synced(&b));
         assert_eq!(pending_deletions(&a), 7);
         assert_eq!(pending_deletions(&b), 0);
-        assert_eq!(last_push_window(&a), Some((from, 43)));
-        assert_eq!(last_push_window(&b), None);
 
         mark_synced(&b);
         record_pending_deletions(&b, 3);

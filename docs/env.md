@@ -50,6 +50,7 @@ stops it outright.
 | `ULAK_SYNC_INCLUDE` | `sync.include` | force-included paths, one per line |
 | `ULAK_SYNC_PROTECT` | `sync.protect` | server-owned paths, one per line |
 | `ULAK_SYNC_MAX_DELETE` | `sync.max_delete` | a number, or `unlimited` |
+| `ULAK_SYNC_NO_HISTORY` | `sync.no_history` | `send` or `hold` |
 | `ULAK_FORWARD_AUTO` | `forward.auto` | `true` or `false` |
 | `ULAK_SERVICE_AUTO` | `service.auto` | `true` or `false`; machine-wide, like the file it mirrors |
 
@@ -152,6 +153,16 @@ a fresh one claims nothing and nothing is retired: files you delete from
 the checkout stay on the server, and the workspace grows. `doctor` says
 so. To reconcile, persist `$XDG_STATE_HOME` between runs, which also
 restores the deletion budget's usual meaning.
+
+**A wiped runner has no agreed content either.** The state directory
+also keeps, per server, a fingerprint of the content both ends last agreed
+on, not the content itself. A fresh runner has none, so a file whose
+server copy differs from the checkout — output an earlier
+job's containers left behind, say — follows `sync.no_history`. The
+default, `send`, puts the runner's copy over the server's and names each
+such file in a warning. `hold` keeps both copies and reports a conflict
+that stays until someone makes the copies match, which a job cannot do on
+its own. Persisting `$XDG_STATE_HOME` keeps this record as well.
 
 Nothing here detects CI and changes its own defaults. An agent's microVM
 may legitimately want the background service, and a rule that guessed

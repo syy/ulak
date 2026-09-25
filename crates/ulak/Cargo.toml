@@ -17,11 +17,13 @@ anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 ignore.workspace = true
+libc.workspace = true
 inquire.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 toml.workspace = true
 
 [dev-dependencies]

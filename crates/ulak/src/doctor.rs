@@ -208,6 +208,13 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
         "missing or older than 3.2",
         "install it: apt-get install -y rsync (or your distro's equivalent)",
     );
+    // A gate like the others, not only a row: the pre-flight push below
+    // surveys through baseline.py, so without python3 it would end the
+    // report at its `?` instead of reaching the summary.
+    tools_ok &= match python_check(&facts.python_path, &facts.python, &dest) {
+        Ok(detail) => server_check(true, "python3", detail, "", ""),
+        Err((bad, now)) => server_check(false, "python3", String::new(), &bad, &now),
+    };
 
     let mut resources = format!("arch {}", facts.arch);
     let mut disk_low = false;
@@ -547,6 +554,14 @@ fn run_workspace(workspace: Workspace) -> Result<ExitCode> {
         check_bad("rsync", "missing or older than 3.2");
         problems.push("remote rsync is missing or older than 3.2".into());
     }
+    // A build syncs its context through the same survey as a Compose stack.
+    match python_check(&facts.python_path, &facts.python, &dest) {
+        Ok(detail) => check_ok("python3", &detail),
+        Err((bad, now)) => {
+            check_bad("python3", &bad);
+            problems.push(format!("python3: {bad} — now: {now}"));
+        }
+    }
     if facts.compose.contains("version") {
         check_ok("compose v2", &facts.compose);
     } else {
@@ -663,6 +678,11 @@ struct Facts {
     user: String,
     arch: String,
     rsync: String,
+    /// Where `python3` resolves on the server's PATH; empty when it
+    /// resolves nowhere.
+    python_path: String,
+    /// What `python3` printed for its version; empty when there is none.
+    python: String,
     docker: String,
     daemon_ok: bool,
     compose: String,
@@ -676,15 +696,18 @@ struct Facts {
 /// had already been filled, which is backwards.
 fn fetch_facts(ssh: &Ssh) -> Result<Facts> {
     // The workspace lives under $HOME — measure the disk it actually uses.
-    let script = "echo '==ULAK:user=='; id -un\n\
+    let script = format!(
+        "echo '==ULAK:user=='; id -un\n\
          echo '==ULAK:arch=='; uname -m\n\
          echo '==ULAK:rsync=='; rsync --version 2>/dev/null | head -1\n\
+         {python}\
          echo '==ULAK:docker=='; docker --version 2>/dev/null\n\
          echo '==ULAK:daemon=='; docker info >/dev/null 2>&1 && echo OK || echo FAIL\n\
          echo '==ULAK:compose=='; docker compose version 2>/dev/null\n\
          echo '==ULAK:disk=='; df -Pk \"$HOME\" 2>/dev/null | tail -1\n\
-         echo '==ULAK:mem=='; grep MemTotal /proc/meminfo 2>/dev/null\n"
-        .to_string();
+         echo '==ULAK:mem=='; grep MemTotal /proc/meminfo 2>/dev/null\n",
+        python = python_probe()
+    );
     let out = ssh.run_script(&script)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -709,6 +732,8 @@ fn fetch_facts(ssh: &Ssh) -> Result<Facts> {
         user: get("user").trim().to_string(),
         arch: get("arch").trim().to_string(),
         rsync: get("rsync").trim().to_string(),
+        python_path: get("python3-path").trim().to_string(),
+        python: get("python3").trim().to_string(),
         docker: get("docker").trim().to_string(),
         daemon_ok: get("daemon").trim() == "OK",
         compose: get("compose").trim().to_string(),
@@ -750,6 +775,92 @@ fn parse_df_avail_gb(df_line: &str) -> Option<u64> {
 fn parse_meminfo_gb(line: &str) -> Option<f64> {
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / (1024.0 * 1024.0) * 10.0).round() / 10.0)
+}
+
+/// Every sync runs baseline.py on the server, and baseline.py refuses an
+/// older python3 before it reads anything. A test pins the two together;
+/// scripts/check-server.sh carries the same floor.
+const PYTHON_FLOOR: (u32, u32) = (3, 7);
+
+/// The remote change index (observer.rs) also needs this, on Linux. Below
+/// it the service compares in full instead, which is slower, not broken,
+/// so doctor notes it on a passing row rather than counting a problem.
+const PYTHON_INDEX: (u32, u32) = (3, 9);
+
+/// Run by the server's python3 in `fetch_facts`. `%`, not an f-string
+/// (3.6+), and not `--version`, which Pythons before 3.4 print to stderr:
+/// an interpreter too old to sync must still say which version it is, or
+/// the row would call it missing.
+const PYTHON_PROBE: &str = "import sys; print(\"%d.%d.%d\" % sys.version_info[:3])";
+
+/// The python3 lines of `fetch_facts`'s script. Where the name resolves
+/// is asked apart from what it prints: a pyenv or asdf shim with no
+/// version chosen, or a venv whose interpreter is gone, is on PATH and
+/// prints nothing, and reading that silence as "not installed" sent users
+/// to a package install that changes nothing.
+fn python_probe() -> String {
+    format!(
+        "echo '==ULAK:python3-path=='; command -v python3 2>/dev/null\n\
+         echo '==ULAK:python3=='; python3 -c {} 2>/dev/null\n",
+        sh_quote(PYTHON_PROBE)
+    )
+}
+
+/// `PYTHON_PROBE` prints `major.minor.micro`; anything else, including the
+/// silence of a missing or failing interpreter, is `None`.
+fn parse_python_version(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The python3 row apart from the printing: `Ok` is a passing row's
+/// detail, `Err` the failing row's detail and the step that fixes it.
+/// `on_path` is where the name resolved and `probe` what it printed.
+fn python_check(
+    on_path: &str,
+    probe: &str,
+    dest: &str,
+) -> std::result::Result<String, (String, String)> {
+    let found = probe.trim();
+    let on_path = on_path.trim();
+    let dotted = |(major, minor): (u32, u32)| format!("{major}.{minor}");
+    match parse_python_version(found) {
+        // An install would report python3 as already there.
+        None if !on_path.is_empty() => Err((
+            format!(
+                "on PATH at {on_path} but did not run — syncing needs Python {} or later",
+                dotted(PYTHON_FLOOR)
+            ),
+            format!(
+                "see its error: ssh {dest} python3 --version — then repair that interpreter, or put a working Python {} or later ahead of it on the PATH a non-interactive ssh gets",
+                dotted(PYTHON_FLOOR)
+            ),
+        )),
+        None => Err((
+            format!(
+                "not installed — syncing needs Python {} or later",
+                dotted(PYTHON_FLOOR)
+            ),
+            "install it: apt-get install -y python3 (or your distro's equivalent)".into(),
+        )),
+        Some(version) if version < PYTHON_FLOOR => Err((
+            format!("{found} — syncing needs {} or later", dotted(PYTHON_FLOOR)),
+            // Not "install python3": on the distros that ship an older one,
+            // that command reports it is already there. What has to change
+            // is which interpreter the name resolves to over ssh.
+            format!(
+                "install Python {} or later as the server's python3 — ulak runs the one a non-interactive ssh finds first on PATH",
+                dotted(PYTHON_FLOOR)
+            ),
+        )),
+        Some(version) if version < PYTHON_INDEX => Ok(format!(
+            "{found} (the change index needs {}; the service compares in full instead)",
+            dotted(PYTHON_INDEX)
+        )),
+        Some(_) => Ok(found.to_string()),
+    }
 }
 
 /// Key an external resource by kind so a network and a volume with the
@@ -1207,5 +1318,166 @@ mod tests {
             Some(70)
         );
         assert_eq!(parse_meminfo_gb("MemTotal:  8123456 kB"), Some(7.7));
+    }
+
+    /// The version is read as numbers: 3.10 is newer than 3.7, which a
+    /// comparison of strings gets backwards. A missing python3 prints
+    /// nothing, and that must read as no version rather than as 0.0.
+    #[test]
+    fn a_python_version_is_read_as_numbers_and_silence_is_no_version() {
+        assert_eq!(parse_python_version("3.12.3\n"), Some((3, 12)));
+        assert_eq!(parse_python_version("3.7.0"), Some((3, 7)));
+        assert!(parse_python_version("3.10.0") > parse_python_version("3.7.17"));
+        assert_eq!(parse_python_version(""), None, "no python3, no output");
+        assert_eq!(parse_python_version("3"), None);
+    }
+
+    /// baseline.py refuses anything older than 3.7, so the row passes from
+    /// 3.7 on and fails below it or with no python3 at all. Both halves are
+    /// pinned: a floor one minor too high sends users to upgrade a server
+    /// that syncs fine, and one too low calls ready a server whose first
+    /// sync stops. 3.7 and 3.8 pass with the index note and 3.9 without.
+    #[test]
+    fn python3_passes_from_3_7_and_fails_below_it_or_when_missing() {
+        for (probe, noted) in [
+            ("3.7.0", true),
+            ("3.8.10", true),
+            ("3.9.0", false),
+            ("3.10.12", false),
+            ("3.12.3", false),
+        ] {
+            let detail = python_check("/usr/bin/python3", probe, "box")
+                .unwrap_or_else(|(bad, _)| panic!("{probe} runs baseline.py, yet: {bad}"));
+            assert!(detail.starts_with(probe), "{detail}");
+            assert_eq!(
+                detail.contains("the change index needs 3.9"),
+                noted,
+                "{probe}: {detail}"
+            );
+        }
+
+        let (bad, now) =
+            python_check("/usr/bin/python3", "3.6.15", "box").expect_err("baseline.py refuses 3.6");
+        assert_eq!(bad, "3.6.15 — syncing needs 3.7 or later");
+        assert!(
+            now.contains("Python 3.7 or later") && now.contains("PATH"),
+            "the step must say what to install and which python3 counts: {now}"
+        );
+
+        let (bad, now) = python_check("", "", "box").expect_err("no python3 cannot sync");
+        assert_eq!(bad, "not installed — syncing needs Python 3.7 or later");
+        assert_eq!(
+            now,
+            "install it: apt-get install -y python3 (or your distro's equivalent)"
+        );
+
+        assert!(python_check("/usr/bin/python3", "2.7.18", "box").is_err());
+    }
+
+    /// A pyenv shim with no version chosen is on PATH and prints no
+    /// version. Doctor called it "not installed" and sent the user to
+    /// apt-get, which answers that python3 is already there. The row names
+    /// where the name resolved and how to see the interpreter's own error.
+    #[test]
+    fn a_python3_on_path_that_prints_no_version_did_not_run_and_is_not_missing() {
+        let shim = "/home/me/.pyenv/shims/python3";
+        let (bad, now) = python_check(shim, "", "box").expect_err("a failing python3 cannot sync");
+        assert_eq!(
+            bad,
+            "on PATH at /home/me/.pyenv/shims/python3 but did not run — syncing needs Python 3.7 or later"
+        );
+        assert!(
+            now.starts_with("see its error: ssh box python3 --version")
+                && now.contains("Python 3.7 or later")
+                && !now.contains("apt-get"),
+            "the step must show the error and not offer an install: {now}"
+        );
+
+        // A version wins over the path, whatever `command -v` said.
+        assert_eq!(python_check("", "3.12.3", "box").unwrap(), "3.12.3");
+    }
+
+    /// The probe runs through a shell on the server and the row reads its
+    /// sections, so the real lines are run here against three PATHs: one
+    /// with no python3, one whose python3 fails the way a pyenv shim does,
+    /// and this machine's. A probe the parser cannot read would call
+    /// python3 missing on every server.
+    #[test]
+    fn the_probe_tells_a_working_python3_from_a_failing_one_and_from_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = |path: &std::ffi::OsStr| {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(python_probe())
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            let sections = split_sections(&String::from_utf8_lossy(&out.stdout));
+            let get = |k: &str| sections.get(k).cloned().unwrap_or_default();
+            python_check(&get("python3-path"), &get("python3"), "box")
+        };
+
+        let none = tempfile::tempdir().unwrap();
+        let (bad, _) = probe(none.path().as_os_str()).expect_err("no python3 on PATH");
+        assert!(bad.starts_with("not installed"), "{bad}");
+
+        let shims = tempfile::tempdir().unwrap();
+        let shim = shims.path().join("python3");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho 'pyenv: python3: command not found' >&2\nexit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (bad, _) = probe(shims.path().as_os_str()).expect_err("a failing python3");
+        assert!(
+            bad.starts_with(&format!("on PATH at {} but did not run", shim.display())),
+            "{bad}"
+        );
+
+        // Asserts python3 is on this machine, naming the fix, instead of
+        // letting the shell's "not found" read as a parse failure.
+        let _python3 = crate::stream::python();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let detail = probe(&path).unwrap_or_else(|(bad, _)| panic!("this python3: {bad}"));
+        assert!(
+            parse_python_version(&detail).is_some(),
+            "doctor cannot read the probe's own output: {detail:?}"
+        );
+    }
+
+    /// Doctor's floors copy what the helpers enforce, so they are read
+    /// back together: baseline.py's refusal, the version observer.rs names
+    /// when the change index is unavailable, and scripts/check-server.sh.
+    /// A drift would have doctor call a server ready that the first sync
+    /// turns away, or fail one that syncs fine.
+    #[test]
+    fn doctors_python_floors_are_the_ones_the_helpers_and_the_script_use() {
+        let refusal = include_str!("baseline.py")
+            .lines()
+            .find_map(|line| line.strip_prefix("if sys.version_info < ("))
+            .and_then(|rest| rest.strip_suffix("):"))
+            .expect("baseline.py refuses an old python3 with `if sys.version_info < (M, N):`");
+        assert_eq!(refusal, format!("{}, {}", PYTHON_FLOOR.0, PYTHON_FLOOR.1));
+
+        let index = format!("Python {}.{} or later", PYTHON_INDEX.0, PYTHON_INDEX.1);
+        assert!(
+            include_str!("observer.rs").contains(&index),
+            "observer.rs no longer names {index}"
+        );
+
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-server.sh"),
+        )
+        .unwrap();
+        for line in [
+            format!("PYTHON_FLOOR={}.{}", PYTHON_FLOOR.0, PYTHON_FLOOR.1),
+            format!("PYTHON_INDEX={}.{}", PYTHON_INDEX.0, PYTHON_INDEX.1),
+        ] {
+            assert!(
+                script.lines().any(|l| l == line),
+                "scripts/check-server.sh must carry `{line}`"
+            );
+        }
     }
 }

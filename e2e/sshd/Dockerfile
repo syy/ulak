@@ -1,7 +1,7 @@
 # E2e fixture: a disposable "server" that looks exactly like a real ulak
-# target — sshd + rsync + docker + compose v2 — reachable over SSH as a
-# NON-ROOT user in the docker group (my-server is root, so this fixture
-# covers the non-root path the test plan requires).
+# target — sshd + rsync + python3 + docker + compose v2 — reachable over
+# SSH as a NON-ROOT user in the docker group (my-server is root, so this
+# fixture covers the non-root path the test plan requires).
 #
 # Docker-in-Docker on purpose: the daemon must share the sshd filesystem,
 # otherwise bind mounts under ~/.ulak/workspaces would resolve against the
@@ -9,7 +9,9 @@
 # Requires: docker run --privileged.
 FROM docker:29.6.2-dind
 
-RUN apk add --no-cache openssh-server openssh-client rsync bash \
+# python3: every sync runs ulak's Python helpers on the server, and the
+# dind base image ships none.
+RUN apk add --no-cache openssh-server openssh-client rsync bash python3 \
     docker-cli-compose
 
 RUN addgroup -S docker 2>/dev/null || true \

@@ -9,11 +9,19 @@
 //! the widest: `passthrough::redact_argv` knows which flags a given
 //! command treats as secret, but only commands that route through the
 //! catalog reach it, and everything ever written reaches this.
+//!
+//! One line per record, written in ONE `write` under a process-wide lock.
+//! A full survey records the server's hashing and its file inventory from
+//! two threads at once; `writeln!` of a JSON value is many small writes,
+//! and O_APPEND only orders whole writes, so two records once arrived
+//! interleaved and the trail stopped being JSONL. The lock covers this
+//! process; the single write is what covers a second one.
 
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static CONTEXT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+static WRITER: Mutex<()> = Mutex::new(());
 
 /// Bind the audit log to a workspace (by path-hash). Called once after
 /// project discovery; recording is a no-op before that.
@@ -58,12 +66,15 @@ pub fn record_command_in(
 }
 
 fn append(path: &std::path::Path, kind: &str, argv: &[String], exit: Option<i32>) {
-    let ts = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    // Whole seconds for readers that sort or filter; milliseconds beside
+    // them because a reconcile is several commands inside one second, and
+    // "which of them was slow" is a question the trail exists to answer.
     let entry = serde_json::json!({
-        "ts_unix": ts,
+        "ts_unix": now.as_secs(),
+        "ts_ms": now.as_millis() as u64,
         "kind": kind,
         "argv": argv.iter().map(|a| redact(a)).collect::<Vec<_>>(),
         "exit": exit,
@@ -71,12 +82,16 @@ fn append(path: &std::path::Path, kind: &str, argv: &[String], exit: Option<i32>
     // The trail names hosts and paths — keep it private.
     let dir = path.parent().unwrap();
     let _ = crate::invocation::private_dir(dir);
+    let line = format!("{entry}\n");
+    let _guard = WRITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{entry}");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -187,6 +202,37 @@ fn hide_value(word: &str, vouched: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two threads recording at once — the survey's server hashing and
+    /// its file inventory — must leave a trail where every line is one
+    /// record. Measured before the lock: a JSONL reader of the trail hit
+    /// `{"argv":["ssh","-o",{"argv":[...` on line 5.
+    #[test]
+    fn concurrent_records_never_interleave_on_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.jsonl");
+        let argv: Vec<String> = (0..40)
+            .map(|i| format!("--filter=+ /site/dir{i}/***"))
+            .collect();
+        std::thread::scope(|scope| {
+            for kind in ["ssh-common", "ssh"] {
+                let (path, argv) = (&path, &argv);
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        append(path, kind, argv, Some(0));
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 400);
+        for line in lines {
+            let row: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("a trail line is not one record: {e}: {line}"));
+            assert_eq!(row["argv"].as_array().map(Vec::len), Some(40));
+        }
+    }
 
     /// The exact text one `docker …` argv leaves on disk. A value only
     /// counts as safe if it survives NEITHER gate: `Remote::spell`

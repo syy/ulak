@@ -49,6 +49,11 @@ expression: json
       "variable": "ULAK_SYNC_MAX_DELETE"
     },
     {
+      "key": "sync.no_history",
+      "value": "send",
+      "from": "default"
+    },
+    {
       "key": "forward.auto",
       "value": "true",
       "from": "default"

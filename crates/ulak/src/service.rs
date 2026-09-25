@@ -17,8 +17,13 @@
 //! preserves the invariant `ssh -O exit` needs: no second job is in
 //! flight on the master we are about to retire.
 //!
-//! **One engine.** The service calls `sync::reconcile_once`, and so does
-//! `ulak sync`. There is no second code path that could drift.
+//! **One engine.** `sync.rs` owns both full reconciliation and its warm
+//! session selection. The service passes file paths rather than inventing
+//! another interpretation of ignores, ownership or deletion. Queued
+//! watcher notices are coalesced before choosing the next reconcile; each
+//! dirty bit stays set until the workspace lock is actually acquired.
+//! Watch pruning includes normalized protect roots as well as walk excludes:
+//! protected entries are intentionally absent from the walk's exclude list.
 //!
 //! **The clock is the only sensor.** Suspend, a wifi handover, a VPN
 //! drop and a server reboot are the same event — the connection is
@@ -71,7 +76,10 @@ const TICK: Duration = Duration::from_secs(1);
 /// files; a project is only rebuilt when its intent actually changed.
 const CATALOG_EVERY: Duration = Duration::from_secs(5);
 
-const DEBOUNCE: Duration = Duration::from_millis(200);
+// Coalesce an editor's temporary-file/rename notices. The worker also
+// merges queued notices during transfers; a 200 ms watcher delay dominated
+// small saves once each save stopped launching a new rsync process.
+const DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Above this, a wall-clock jump is a real suspend and everything is
 /// assumed dead: retire the master, kill the tunnels, rebuild.
@@ -99,8 +107,9 @@ const PROBE_EVERY: Duration = Duration::from_secs(15);
 /// and without multiplexing: silence that keeps a shared master warm is
 /// not silence.
 const SILENT_PROBE_EVERY: Duration = Duration::from_secs(120);
-/// A running stack reconciles at least this often even if nobody typed
-/// anything — a container may have written a file while you were away.
+/// Without a remote index this is a full reconcile. Indexed sessions audit
+/// local metadata in the background, while the read-only remote helper audits
+/// its own metadata. Saves never wait behind a periodic whole-tree rsync.
 const IDLE_RECONCILE: Duration = Duration::from_secs(60);
 /// How long to wait out a human who holds the per-workspace lock. Short
 /// enough that "the next tick is seconds away" stays honest, long enough
@@ -260,7 +269,7 @@ enum Nudge {
     /// runtime state of the stacks that survive and drops the rest
     /// (which closes their tunnels).
     Jobs(Vec<Job>),
-    Dirty(String),
+    Dirty(String, Option<BTreeSet<PathBuf>>),
     /// Somebody ran a compose command against a stack on this
     /// destination, so this worker's picture of it is stale: ask now
     /// instead of at the end of the cadence. `Dirty` cannot stand in for
@@ -498,35 +507,34 @@ impl Fleet {
     }
 
     fn on_files(&mut self, result: DebounceEventResult) {
-        let mut touched: BTreeSet<String> = BTreeSet::new();
+        let mut touched: BTreeMap<String, Option<BTreeSet<PathBuf>>> = BTreeMap::new();
         match result {
-            // The OS says "I dropped events, rescan" — a rescan event
-            // carries NO paths, so a path-based filter drops it in
-            // silence. Everything gets reconciled instead, which is the
-            // only honest answer to "you missed something".
             Ok(events) if events.iter().any(|e| e.need_rescan()) => {
-                touched.extend(self.watched.keys().cloned());
+                touched.extend(self.watched.keys().map(|id| (id.clone(), None)));
             }
             Ok(events) => {
                 for path in events.iter().flat_map(|e| e.paths.iter()) {
                     for (stack, watch) in &self.watched {
                         if watch.covers(path) {
-                            touched.insert(stack.clone());
+                            touched
+                                .entry(stack.clone())
+                                .or_insert_with(|| Some(BTreeSet::new()))
+                                .as_mut()
+                                .map(|paths| paths.insert(path.clone()));
                         }
                     }
                 }
             }
-            // Watcher errors mean unknown missed events: reconcile.
             Err(errors) => {
                 ui::warn(&format!(
                     "file watcher hiccup ({} error(s)) — reconciling everything",
                     errors.len()
                 ));
-                touched.extend(self.watched.keys().cloned());
+                touched.extend(self.watched.keys().map(|id| (id.clone(), None)));
             }
         }
-        for stack in touched {
-            self.nudge(&stack);
+        for (stack, paths) in touched {
+            self.nudge(&stack, paths);
         }
     }
 
@@ -573,7 +581,7 @@ impl Fleet {
         self.built.remove(stack);
     }
 
-    fn nudge(&self, stack: &str) {
+    fn nudge(&self, stack: &str, paths: Option<BTreeSet<PathBuf>>) {
         let Some(job) = self.jobs.get(stack) else {
             return;
         };
@@ -581,7 +589,7 @@ impl Fleet {
             return;
         };
         if let Some(w) = self.workers.get(&dest) {
-            let _ = w.tx.send(Nudge::Dirty(stack.to_string()));
+            let _ = w.tx.send(Nudge::Dirty(stack.to_string(), paths));
         }
     }
 
@@ -653,6 +661,8 @@ struct Live {
     /// only once the lock is actually in hand — a tick skipped for a
     /// human's `up` must not swallow the save that triggered it.
     dirty: bool,
+    pending: Option<BTreeSet<PathBuf>>,
+    session: sync::Session,
     due: Instant,
     stack_up: bool,
     /// The services the last probe saw a running, non-one-off container
@@ -686,6 +696,8 @@ impl Live {
             fp: None,
             tunnels: None,
             dirty: true, // a fresh service reconciles once, on purpose
+            pending: None,
+            session: sync::Session::default(),
             due: Instant::now(),
             stack_up: false,
             running_services: BTreeSet::new(),
@@ -740,38 +752,54 @@ impl Dest {
     fn run(mut self, rx: Receiver<Nudge>) {
         loop {
             match rx.recv_timeout(self.wait()) {
-                Ok(Nudge::Jobs(jobs)) => self.take(jobs),
-                Ok(Nudge::Dirty(id)) => {
-                    if let Some(m) = self.stacks.get_mut(&id) {
-                        m.dirty = true;
-                    }
-                }
-                // `step()` runs at the bottom of this loop, so the probe
-                // is the very next thing that happens.
-                //
-                // The ladder restarts too, deliberately matching
-                // `on_wake`'s soft path below: somebody typing a command
-                // is the same signal as a lid opening — the world may
-                // have moved. Without it every doorbell rung during an
-                // outage BURNS a rung (`link_failed` counts each failed
-                // probe), so five `ulak docker compose ps` while the wifi is out
-                // would declare the link Blocked — a sentence about ten
-                // minutes of failure, said about seventy seconds of it —
-                // and then hold the tunnels shut for the five-minute
-                // plateau after the wifi came back.
-                Ok(Nudge::Look) => {
-                    if let Link::Down { .. } | Link::Blocked = self.link {
-                        self.set_link(Link::Down { attempts: 0 });
-                    }
-                    self.next_probe = Instant::now();
-                }
-                Ok(Nudge::Wake { hard }) => self.on_wake(hard),
+                Ok(nudge) => self.accept(nudge),
                 Err(RecvTimeoutError::Timeout) => {}
-                // The main loop is gone; so is any reason to keep
-                // running. Dropping the stacks closes the tunnels.
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+            // A transfer can accumulate hundreds of watcher messages.
+            // Apply the already queued facts before deciding what work is
+            // owed. The cap leaves time for network work under continuous
+            // edits; it never discards the remaining queue.
+            for nudge in rx.try_iter().take(1024) {
+                self.accept(nudge);
+            }
             self.step();
+        }
+    }
+
+    fn accept(&mut self, nudge: Nudge) {
+        match nudge {
+            Nudge::Jobs(jobs) => self.take(jobs),
+            Nudge::Dirty(id, paths) => {
+                if let Some(m) = self.stacks.get_mut(&id) {
+                    m.dirty = true;
+                    match (&mut m.pending, paths) {
+                        (Some(pending), Some(paths)) => pending.extend(paths),
+                        (_, None) => m.pending = None,
+                        (None, Some(_)) => {}
+                    }
+                }
+            }
+            // `step()` runs at the bottom of this loop, so the probe
+            // is the very next thing that happens.
+            //
+            // The ladder restarts too, deliberately matching
+            // `on_wake`'s soft path below: somebody typing a command
+            // is the same signal as a lid opening — the world may
+            // have moved. Without it every doorbell rung during an
+            // outage BURNS a rung (`link_failed` counts each failed
+            // probe), so five `ulak docker compose ps` while the wifi is out
+            // would declare the link Blocked — a sentence about ten
+            // minutes of failure, said about seventy seconds of it —
+            // and then hold the tunnels shut for the five-minute
+            // plateau after the wifi came back.
+            Nudge::Look => {
+                if let Link::Down { .. } | Link::Blocked = self.link {
+                    self.set_link(Link::Down { attempts: 0 });
+                }
+                self.next_probe = Instant::now();
+            }
+            Nudge::Wake { hard } => self.on_wake(hard),
         }
     }
 
@@ -804,6 +832,9 @@ impl Dest {
                 .filter(|m| m.stack_up && m.blocked.is_none())
             {
                 next = next.min(m.due);
+                if m.session.indexed() || m.session.pending() {
+                    next = next.min(now + Duration::from_millis(100));
+                }
             }
         }
         next.saturating_duration_since(now)
@@ -838,10 +869,12 @@ impl Dest {
         if hard {
             for m in self.stacks.values_mut() {
                 m.tunnels = None;
+                m.session = sync::Session::default();
                 // The sensor died with the connection: what was running
                 // before the lid closed is a memory, not a report.
                 m.running_services.clear();
                 m.dirty = true;
+                m.pending = None;
             }
             self.ssh.close_master();
             self.set_link(Link::Down { attempts: 0 });
@@ -918,6 +951,7 @@ impl Dest {
                 // Everything on the far side may have moved while we
                 // were away: reconcile before believing the stack.
                 m.dirty = true;
+                m.pending = None;
                 m.said.clear();
             }
         }
@@ -944,6 +978,7 @@ impl Dest {
             if was_up && !m.stack_up {
                 // Not an error: `ulak docker compose down` looks exactly like this.
                 m.tunnels = None;
+                m.session = sync::Session::default();
                 m.said.clear();
             }
             if !was_up && m.stack_up {
@@ -965,6 +1000,7 @@ impl Dest {
             };
             if let Some(why) = m.blocked.clone() {
                 m.tunnels = None;
+                m.session = sync::Session::default();
                 m.say(&why);
             }
         }
@@ -1008,6 +1044,11 @@ impl Dest {
     }
 
     fn link_failed(&mut self, attempted: Instant, why: Option<String>) {
+        // Persistent observers and writers must retire before their SSH
+        // master. Reconnecting starts a fresh observation window.
+        for m in self.stacks.values_mut() {
+            m.session = sync::Session::default();
+        }
         // Said once per distinct sentence, and kept for `status` — a
         // service with no terminal has nowhere else to be heard, and a
         // locked key must not turn into a silent climb up the ladder.
@@ -1104,7 +1145,7 @@ impl Dest {
         let Some(m) = self.stacks.get(id) else {
             return tunnels_changed;
         };
-        if !m.dirty && Instant::now() < m.due {
+        if !m.dirty && !m.session.pending() && Instant::now() < m.due {
             return tunnels_changed;
         }
         self.reconcile(id);
@@ -1255,9 +1296,23 @@ impl Dest {
             }
         };
         m.dirty = false;
-        m.due = Instant::now() + IDLE_RECONCILE;
+        let paths = if Instant::now() >= m.due {
+            m.due = Instant::now() + IDLE_RECONCILE;
+            if m.session.indexed() {
+                m.session.audit();
+                m.pending.take()
+            } else {
+                None
+            }
+        } else {
+            m.pending.take()
+        };
+        m.pending = Some(BTreeSet::new());
+        if paths.is_none() {
+            m.due = Instant::now() + IDLE_RECONCILE;
+        }
 
-        let result = sync::reconcile_once(
+        let result = sync::reconcile_changes(
             &m.project,
             &fp,
             ssh,
@@ -1270,6 +1325,8 @@ impl Dest {
                 // stops being maintained.
                 over_budget: sync::OverBudget::Report,
             },
+            &mut m.session,
+            paths.as_ref(),
         );
         drop(lock);
 
@@ -1301,6 +1358,7 @@ impl Dest {
                 // A failed reconcile is still owed: keep it dirty rather
                 // than waiting out the idle cadence.
                 m.dirty = true;
+                m.pending = None;
             }
         }
     }
@@ -1370,6 +1428,7 @@ fn mark_service_running(tunnels: &mut [crate::intent::TunnelState], running: &BT
 /// internals, whatever the ignore rules exclude. Computed where the
 /// footprint is, so the main thread's event triage stays a prefix match.
 fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
     let build = fp.build_filter();
     fp.sync_dirs()
         .iter()
@@ -1378,11 +1437,20 @@ fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
                 .map(|plan| {
                     plan.excludes
                         .iter()
-                        .map(|rel| fp.anchor.join(String::from_utf8_lossy(rel).as_ref()))
+                        .map(|rel| fp.anchor.join(std::ffi::OsString::from_vec(rel.clone())))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
         })
+        .chain(protected_subtrees(&fp.anchor, &project.config.sync.protect))
+        .collect()
+}
+
+fn protected_subtrees(anchor: &Path, protect: &[String]) -> Vec<PathBuf> {
+    protect
+        .iter()
+        .filter_map(|p| crate::walk::protect_entry(p))
+        .map(|p| anchor.join(p))
         .collect()
 }
 
@@ -1811,5 +1879,19 @@ mod tests {
         assert!(!w.covers(Path::new("/p/app/.git/objects/ab")));
         // A sibling repo in the same monorepo must never wake a sync.
         assert!(!w.covers(Path::new("/p/other-repo/file")));
+    }
+
+    /// Protect entries never appear in walk.excludes. Omitting them from
+    /// watcher pruning made ignored build logs wake a full sync repeatedly.
+    #[test]
+    fn protected_churn_is_filtered_without_hiding_a_named_sibling() {
+        let watch = Watch {
+            dirs: vec!["/p".into()],
+            excluded: protected_subtrees(Path::new("/p"), &["./logs/".into()]),
+        };
+        assert!(!watch.covers(Path::new("/p/logs/output.txt")));
+        assert!(!watch.covers(Path::new("/p/logs")));
+        assert!(watch.covers(Path::new("/p/logs2/output.txt")));
+        assert!(watch.covers(Path::new("/p/src/main.rs")));
     }
 }

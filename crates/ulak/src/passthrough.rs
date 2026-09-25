@@ -252,20 +252,37 @@ pub fn run(globals: &[String], argv: Vec<OsString>) -> Result<ExitCode> {
     // your directory; here it has to travel back, and right now is
     // exactly when we know to look. Never fatal: the command's own exit
     // code is what the user asked for.
-    if !read_only
-        // No cutoff here: the push was before the command, and whatever
-        // the command wrote — a migration, a lockfile, generated code —
-        // is exactly what has to come home, however recently it landed.
-        && let Err(e) = sync::pull_back(
-            &project,
-            &footprint,
-            &ssh,
-            true,
-            &crate::proc::Budget::new(crate::proc::RECONCILE),
-            None,
-        )
-    {
-        ui::render_error(&e);
+    if !read_only {
+        // An interactive command gave the lock up above. Take it again
+        // before the pull, as `runspec::pull_home` does: the pull writes
+        // the ledger and the common-content record, whose writers are
+        // ordered by this lock. Unlocked, a service tick writing the same
+        // record could overwrite or compact away this pull's receipt, and
+        // a file whose record is lost is sent over the server's copy.
+        let held = match lock.take() {
+            Some(guard) => Ok(guard),
+            None => WorkspaceLock::acquire(project.workspace_id()),
+        };
+        match held {
+            Ok(guard) => {
+                lock = Some(guard);
+                // No cutoff here: the push was before the command, and
+                // whatever the command wrote — a migration, a lockfile,
+                // generated code — is exactly what has to come home,
+                // however recently it landed.
+                if let Err(e) = sync::pull_back(
+                    &project,
+                    &footprint,
+                    &ssh,
+                    true,
+                    &crate::proc::Budget::new(crate::proc::RECONCILE),
+                    None,
+                ) {
+                    ui::render_error(&e);
+                }
+            }
+            Err(e) => ui::render_error(&e),
+        }
     }
     drop(lock);
 
@@ -1322,6 +1339,28 @@ mod tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The pull after a compose command runs under the workspace lock
+    /// even when an interactive command gave it up: pinned on the source,
+    /// because the race it prevents — a service tick writing the same
+    /// common-content record — cannot be staged in a unit test.
+    #[test]
+    fn the_pull_after_a_command_takes_the_workspace_lock_back_first() {
+        let source = include_str!("passthrough.rs");
+        let released = source.find("        lock = None;").unwrap();
+        let retaken = source[released..]
+            .find("None => WorkspaceLock::acquire(project.workspace_id()),")
+            .map(|at| released + at)
+            .expect("the lock is taken back after an interactive command");
+        let pulled = source[released..]
+            .find("if let Err(e) = sync::pull_back(")
+            .map(|at| released + at)
+            .unwrap();
+        assert!(
+            retaken < pulled,
+            "the lock must be held before the pull starts"
+        );
     }
 
     #[test]
