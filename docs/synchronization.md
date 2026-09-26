@@ -31,8 +31,8 @@ To resolve a conflict:
 3. Make both copies contain the result you want, then run `ulak sync`.
 
 Without agreed content on record for that server, uploads follow
-`[sync] no_history`. This can happen after the state directory was wiped, on a
-fresh CI runner, or on a machine without that server's history:
+`[sync] no_history`. This can happen after the state directory was wiped or
+on a machine without that server's history:
 
 - `send` (default) replaces the server copy with the local copy and warns for
   each replaced file.

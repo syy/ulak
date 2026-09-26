@@ -104,7 +104,7 @@ fn write_project_layer(root: &Path, host: Option<&str>) -> Result<()> {
 #max_delete = 25
 
 # A file that differs on both ends with no shared history yet (a wiped
-# state directory, a CI runner, a second machine): send this copy, or hold both.
+# state directory or a second machine): send this copy, or hold both.
 #no_history = \"send\"       # or \"hold\"
 
 [forward]
@@ -223,7 +223,7 @@ fn write_global_layer(path: &Path) -> Result<bool> {
 #max_delete = 25
 
 # A file that differs on both ends with no shared history yet (a wiped
-# state directory, a CI runner, a second machine): send this copy, or hold both.
+# state directory or a second machine): send this copy, or hold both.
 #no_history = \"send\"       # or \"hold\"
 
 [forward]

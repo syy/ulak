@@ -207,14 +207,14 @@ database files and uploads, not source code or generated files you want back.
 `ulak doctor` suggests writable mounts that may need protection.
 
 See [Environment variables](https://github.com/syy/ulak/blob/main/docs/env.md)
-for all settings, SSH keys and CI examples.
+for all settings, SSH keys and agent setup.
 
 ## Background service
 
 The first ordinary interactive command installs a local user service using
 launchd on macOS or systemd on Linux. For stacks left running, it synchronizes
 files, maintains localhost ports and reconnects after interruptions. Nothing
-is installed automatically in scripts or CI, or on the server.
+is installed automatically in non-interactive runs or on the server.
 
 To disable automatic installation, set this in the **global** configuration:
 
@@ -283,14 +283,14 @@ checked for identity conflicts. SSH host-key checking stays enabled.
 See [Synchronization](https://github.com/syy/ulak/blob/main/docs/synchronization.md)
 for resolving conflicts, finding warnings and clearing digest caches.
 
-## CI and temporary runners
+## Using Ulak from an agent
 
 Set `ULAK_HOST` and provide SSH credentials through environment variables.
 Keep a stable workspace namespace and UUID; persist the state directory for
 deletion tracking and common-content history. Without history, the default
 `sync.no_history = "send"` can replace a differing server copy.
 
-Follow the [CI setup](https://github.com/syy/ulak/blob/main/docs/env.md#ulak-in-ci-or-an-agent)
+Follow the [agent setup](https://github.com/syy/ulak/blob/main/docs/env.md#using-ulak-from-an-agent)
 for identities, credentials and host-key verification.
 
 ## Demo

@@ -221,7 +221,7 @@ pub enum ServiceCommand {
     /// Every workspace you left `up` keeps syncing, keeps its ports on
     /// localhost, and comes back by itself after a suspend. This is the
     /// same thing the installed service does — the manual crank for when
-    /// it is off, for CI, and for watching what it actually does.
+    /// it is off, or for watching what it actually does.
     Run {
         /// Say what is happening, and run even when `[service] auto` is
         /// off — you are asking for it by hand
