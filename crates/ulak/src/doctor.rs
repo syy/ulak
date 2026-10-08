@@ -295,7 +295,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     );
     let outcome = classify(
         &footprint,
-        &project.config.sync.protect,
+        &project.sync_rules().protect,
         &swallowed,
         &existing,
     );
@@ -325,11 +325,14 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
         if !protectable.is_empty() {
             let mut merged: Vec<String> = project.config.sync.protect.to_vec();
             for p in &protectable {
+                // The table speaks from the anchor; the config file is read
+                // from the project directory.
+                let written = walk::as_written(&project.inv.project_dir, &footprint.anchor, p);
                 let entry =
                     if footprint.anchor.join(p).is_dir() || !footprint.anchor.join(p).exists() {
-                        format!("{p}/")
+                        format!("{written}/")
                     } else {
-                        (*p).clone()
+                        written
                     };
                 merged.push(entry);
             }
@@ -356,10 +359,16 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
 
     if !outcome.ignored.is_empty() {
         println!();
+        // Spelled the way the protect/include it suggests has to be.
+        let written: Vec<String> = outcome
+            .ignored
+            .iter()
+            .map(|p| walk::as_written(&project.inv.project_dir, &footprint.anchor, p))
+            .collect();
         let err = fail!(
             "{} referenced path(s) are excluded from the sync, so the server would only get an EMPTY directory: {}",
             outcome.ignored.len(),
-            outcome.ignored.join(", ")
+            written.join(", ")
         )
         .now("if the container OWNS that data (a database dir), say so: protect = [\"<path>/\"] in ulak.toml")
         .now("if the app needs the files, force them through: include = [\"<path>/**\"]")
@@ -928,13 +937,12 @@ fn check_server_side(
 /// problem now.
 fn ignored_entries(project: &Project, fp: &Footprint) -> Vec<String> {
     let build = fp.build_filter();
+    let rules = project.sync_rules();
     let mut out: Vec<String> = fp
         .entries
         .iter()
         .filter(|e| e.exists)
-        .filter(|e| {
-            walk::is_ignored(&fp.anchor, &e.local, &project.config.sync, &build).unwrap_or(false)
-        })
+        .filter(|e| walk::is_ignored(&fp.anchor, &e.local, &rules, &build).unwrap_or(false))
         .filter_map(|e| crate::invocation::anchor_rel(&fp.anchor, &e.local))
         .collect();
     out.sort();

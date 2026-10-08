@@ -86,6 +86,10 @@ fn write_project_layer(root: &Path, host: Option<&str>) -> Result<()> {
 #namespace = \"alice-laptop\"
 
 [sync]
+# Paths here are relative to this compose project's folder; ../ reaches
+# a sibling folder the stack mounts. A pattern with no slash (node_modules)
+# matches at any depth, in every folder that travels.
+
 # Extra ignore patterns on top of .gitignore (gitignore syntax).
 # Excluded paths are never pushed AND never deleted on the server — a
 # container may have created them there (e.g. node_modules built

@@ -412,7 +412,7 @@ pub fn reconcile_changes(
     }
     *session = Session::default();
     let plan = checked_plan(project, fp)?;
-    let (roots, pruned) = inventory_scope(&project.config.sync.protect, fp, &plan.excludes);
+    let (roots, pruned) = inventory_scope(&project.sync_rules().protect, fp, &plan.excludes);
     // Subscribe before reconciling: output written during the full transfer
     // must survive into the next turn. The helper's registration scan runs
     // while the survey does — both read-only — and is waited for before
@@ -523,7 +523,7 @@ fn reconcile_structure(
     {
         return Ok(None);
     }
-    let Some((plan, scopes)) = rescanned_plan(&project.config.sync, fp, &session.plan, paths)?
+    let Some((plan, scopes)) = rescanned_plan(&project.sync_rules(), fp, &session.plan, paths)?
     else {
         return Ok(None);
     };
@@ -1752,9 +1752,9 @@ fn doomed_files(
     anchor: &std::path::Path,
     kept: &[Vec<u8>],
 ) -> Vec<String> {
-    let protect = &project.config.sync.protect;
+    let protect = project.sync_rules().protect;
     let mut doomed = ledger::doomed(state, anchor, kept);
-    doomed.retain(|row| !walk::protected(protect, row));
+    doomed.retain(|row| !walk::protected(&protect, row));
     doomed
 }
 
@@ -1765,9 +1765,9 @@ fn doomed_directories(
     state: &crate::config::WorkspaceStateKey,
     anchor: &std::path::Path,
 ) -> Vec<String> {
-    let protect = &project.config.sync.protect;
+    let protect = project.sync_rules().protect;
     let mut doomed = ledger::doomed_dirs(state, anchor);
-    doomed.retain(|row| !walk::protected(protect, row));
+    doomed.retain(|row| !walk::protected(&protect, row));
     doomed
 }
 
@@ -2902,7 +2902,7 @@ fn pull(
             &unclaimed,
             &claimed,
             &excluded,
-            &inventory_scope(&project.config.sync.protect, fp, &survey.plan.excludes),
+            &inventory_scope(&project.sync_rules().protect, fp, &survey.plan.excludes),
             &fp.anchor,
         );
         survey.common.end_return(&lost)?;
@@ -3044,7 +3044,7 @@ pub fn pull_back(
 /// own entries and answers it in the report. This one puts it to what
 /// just came down the wire.
 fn say_what_slipped_past_the_ignores(project: &Project, fp: &Footprint, invented: &[Event]) {
-    let slipped = slipped_past_the_ignores(&project.config.sync, fp, invented);
+    let slipped = slipped_past_the_ignores(&project.sync_rules(), fp, invented);
     if slipped.is_empty() {
         return;
     }
@@ -3412,13 +3412,14 @@ pub fn push_no_delete(project: &Project, fp: &Footprint, ssh: &Ssh) -> Result<(S
 /// footprint model exists to avoid.
 fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
     let mut plan = walk::WalkReport::default();
+    let rules = project.sync_rules();
     // Narrows each build context by its own `.dockerignore`, and nothing
     // else — see dockerignore.rs. It lands in the SAME literal exclude
     // list as the gitignore chain, which sync.rs already ranks ahead of
     // the footprint's includes, so no filter rule has to change.
     let build = fp.build_filter();
     for dir in fp.sync_dirs() {
-        let part = walk::plan_in(&fp.anchor, &dir, &project.config.sync, &build)?;
+        let part = walk::plan_in(&fp.anchor, &dir, &rules, &build)?;
         plan.excludes.extend(part.excludes);
         plan.bad_names.extend(part.bad_names);
         plan.kept.extend(part.kept);
@@ -3450,7 +3451,7 @@ fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
             // and `rm -f -- 'data/config.json'` ran against the server's
             // only copy. One file is under the default `max_delete` of
             // 25, so there was no prompt either.
-            if crate::walk::protected(&project.config.sync.protect, &rel) {
+            if crate::walk::protected(&rules.protect, &rel) {
                 continue;
             }
             plan.kept.push(rel.into_bytes());
@@ -3641,7 +3642,7 @@ fn inventory_command(
 ) -> (Command, String) {
     let script = inventory_script(
         &project.remote_dir(),
-        &project.config.sync.protect,
+        &project.sync_rules().protect,
         fp,
         excludes,
     );
@@ -3920,7 +3921,7 @@ fn rsync_pass_dir(
         });
     }
     let mut filters = filter_args(
-        &project.config.sync.protect,
+        &project.sync_rules().protect,
         if selected.is_some() { &[] } else { held_back },
         fp.filter_rules(),
     );
@@ -4466,7 +4467,13 @@ fn relayout(
     // not touched" is true of those too, and useless — there is no local
     // copy to be touched. Naming them is the difference between a
     // question somebody can answer and one they can only agree to.
-    let protect = &project.config.sync.protect;
+    // Where the server holds them now: under the layout being replaced.
+    let protect = walk::rebase(
+        &project.config.sync,
+        &project.inv.project_dir,
+        std::path::Path::new(old_anchor),
+    )
+    .protect;
     if !protect.is_empty() {
         ui::warn(&format!(
             "server-owned data is emptied with it, and nothing here holds a copy: {}",

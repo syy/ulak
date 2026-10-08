@@ -86,8 +86,9 @@ impl WalkReport {
 /// The footprint model needs both: what travels is a handful of
 /// directories scattered under the anchor (so walking the anchor itself
 /// would defeat the entire point — that is the multi-gigabyte monorepo
-/// scan), while every pattern the user writes and every path ulak
-/// prints is anchor-relative, because the anchor IS the workspace root.
+/// scan), while every rule the walk applies and every path ulak prints
+/// is anchor-relative, because the anchor IS the workspace root. `cfg`
+/// therefore arrives through `rebase`, never as the user wrote it.
 ///
 /// The gitignore stack is seeded from the anchor down to `scope`, so a
 /// repo-root `.gitignore` still governs a directory deep inside it.
@@ -217,8 +218,8 @@ pub fn protected(protect: &[String], rel: &str) -> bool {
 /// agree about what it names. `None` for an entry that names nothing.
 ///
 /// A leading `/` is stripped rather than refused. These entries are
-/// anchor-relative and already anchored — `data` names the tree at the
-/// root and never `api/data` — so `/data` says what the entry meant
+/// anchor-relative (`rebase` made them so) and already anchored — `data`
+/// names the tree at the root and never `api/data` — so `/data` says what the entry meant
 /// anyway, and the keys either side of it in the same table (`exclude`,
 /// `include`) are gitignore patterns where that slash is both legal and
 /// exactly this meaning. The config file trains the habit; refusing it
@@ -245,6 +246,172 @@ pub fn protect_entry(raw: &str) -> Option<String> {
 pub fn protect_covers(entry: &str, rel: &str) -> bool {
     rel.strip_prefix(entry)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// `[sync]` as the walk, every guard and every rsync rule read it:
+/// anchor-relative.
+///
+/// The rules are written beside the compose file and mean that folder,
+/// but the anchor is whatever the active model reaches — a profile that
+/// mounts `../frontend-web` lifts it a level, and the workspace record
+/// keeps it there for every run after. Read from the anchor as written,
+/// `protect = ["data/"]` named a `data/` BESIDE the project and stopped
+/// protecting the database inside it, silently, and only under some
+/// profiles. So every rule is read from `base`, the project directory,
+/// and respelled from the anchor here, once:
+///
+///   * a protect entry is a path: `..` reaches a sibling the stack
+///     mounts, and an entry that ends up outside the anchor names
+///     nothing that travels, so it is dropped;
+///   * a pattern with a slash — gitignore's anchored kind — has its
+///     leading `./` and `../` resolved the same way and keeps its glob;
+///   * a pattern without one, or led by `**/`, already matches at any
+///     depth and passes through untouched: `node_modules` is meant in a
+///     mounted sibling too.
+///
+/// Nothing changes when the anchor IS the project directory — every
+/// project that names nothing outside itself.
+///
+/// A project directory outside the anchor (a `--project-directory` the
+/// model never reaches, or one folder spelled two ways) keeps the rules
+/// as written: respelled from there, every anchored rule would name
+/// nothing, and a protect entry that names nothing is protection lost.
+pub fn rebase(cfg: &SyncCfg, base: &Path, anchor: &Path) -> SyncCfg {
+    if !base.starts_with(anchor) {
+        return cfg.clone();
+    }
+    let patterns = |lines: &[String]| {
+        lines
+            .iter()
+            .filter_map(|line| rebase_pattern(line, base, anchor))
+            .collect()
+    };
+    SyncCfg {
+        exclude: patterns(&cfg.exclude),
+        include: patterns(&cfg.include),
+        protect: cfg
+            .protect
+            .iter()
+            .filter_map(|entry| rebase_protect(entry, base, anchor))
+            .collect(),
+        max_delete: cfg.max_delete,
+        no_history: cfg.no_history,
+    }
+}
+
+/// The spelling a `[sync]` entry needs to name this anchor-relative
+/// path: from the project directory, `../` and all. What doctor tells
+/// somebody to write, so `rebase` reads it back as `rel`.
+pub fn as_written(base: &Path, anchor: &Path, rel: &str) -> String {
+    let target = anchor.join(rel);
+    let mut from = base.to_path_buf();
+    let mut up = String::new();
+    while !target.starts_with(&from) {
+        if !from.pop() {
+            return rel.to_string();
+        }
+        up.push_str("../");
+    }
+    match target.strip_prefix(&from).ok().and_then(Path::to_str) {
+        Some(down) => format!("{up}{down}"),
+        None => rel.to_string(),
+    }
+}
+
+fn rebase_protect(entry: &str, base: &Path, anchor: &Path) -> Option<String> {
+    let mut at = base.to_path_buf();
+    for part in entry.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                at.pop();
+            }
+            name => at.push(name),
+        }
+    }
+    if base.starts_with(&at) {
+        return None; // the project directory itself, or a folder above it
+    }
+    match at.strip_prefix(anchor).ok()?.to_str() {
+        Some("") => None,
+        Some(rel) => Some(rel.to_string()),
+        // A folder name no rule string can spell keeps the literal reading.
+        None => protect_entry(entry),
+    }
+}
+
+fn rebase_pattern(line: &str, base: &Path, anchor: &Path) -> Option<String> {
+    if line.starts_with('#') || line.trim().is_empty() {
+        return Some(line.to_string());
+    }
+    let (bang, body) = match line.strip_prefix('!') {
+        Some(rest) => ("!", rest),
+        None => ("", line),
+    };
+    let (rooted, body) = match body.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let core = body.trim_end();
+    let core = core.strip_suffix('/').unwrap_or(core);
+    if (!rooted && !core.contains('/')) || core == "**" || core.starts_with("**/") {
+        return Some(line.to_string());
+    }
+
+    let mut at = base.to_path_buf();
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start_matches('/');
+        if let Some(r) = rest.strip_prefix("../") {
+            at.pop();
+            rest = r;
+        } else if rest == ".." {
+            at.pop();
+            rest = "";
+        } else if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if rest == "." {
+            rest = "";
+        } else {
+            break;
+        }
+    }
+
+    let prefix = if let Ok(below) = at.strip_prefix(anchor) {
+        let Some(below) = below.to_str() else {
+            // A folder name no pattern can spell keeps the literal reading.
+            return Some(line.to_string());
+        };
+        below.to_string()
+    } else {
+        // Climbed past the anchor: only a pattern that walks back into it
+        // by name reaches anything that travels.
+        let above = anchor.strip_prefix(&at).ok()?;
+        for name in above.components() {
+            let (head, tail) = rest.split_once('/')?;
+            if head.contains(['*', '?', '[', '{', '\\']) || Some(head) != name.as_os_str().to_str()
+            {
+                return None;
+            }
+            rest = tail;
+        }
+        String::new()
+    };
+    if rest.trim_end().trim_end_matches('/').is_empty() {
+        return None; // the project directory itself, or a folder above it
+    }
+    let mut out = format!("{bang}/");
+    for c in prefix.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    if !prefix.is_empty() {
+        out.push('/');
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// `.gitignore` files between the anchor and the scope, shallowest
@@ -511,10 +678,28 @@ fn include_reaches_into(include_lines: &[String], rel_dir: &str) -> bool {
         if !anchored {
             return false;
         }
-        let prefix = &body[..body.find(['*', '?', '[']).unwrap_or(body.len())];
+        let prefix = literal_head(body);
         let dir_slash = format!("{rel_dir}/");
-        prefix.starts_with(&dir_slash) || dir_slash.starts_with(prefix)
+        prefix.starts_with(&dir_slash) || dir_slash.starts_with(&prefix)
     })
+}
+
+/// A pattern's literal start, up to its first wildcard, with escapes
+/// undone — `rebase` escapes a folder name it puts in front.
+fn literal_head(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(next) => out.push(next),
+                None => break,
+            },
+            '*' | '?' | '[' | '{' => break,
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Escape a protect path for use inside an rsync filter RULE ("P /x",
@@ -610,6 +795,16 @@ mod tests {
     fn excludes_as_strings(r: &WalkReport) -> Vec<String> {
         let mut v: Vec<String> = r
             .excludes
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn kept_as_strings(r: &WalkReport) -> Vec<String> {
+        let mut v: Vec<String> = r
+            .kept
             .iter()
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .collect();
@@ -988,5 +1183,160 @@ mod tests {
             rsync_exclude_pattern(b"back\\slash"),
             b"/back\\slash".to_vec()
         );
+    }
+
+    /// `protect = ["data/"]` and `exclude = ["/secret.txt"]` beside the
+    /// compose file. Read from the anchor as written, a sibling mount that
+    /// widened it to the parent sent `repo/data/db` and `repo/secret.txt`.
+    /// Read through `rebase`, the project walks the same under either.
+    #[test]
+    fn a_rule_names_the_same_files_whatever_the_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path();
+        let repo = w.join("repo");
+        for rel in [
+            "repo/data/db",
+            "repo/secret.txt",
+            "repo/src/main.rs",
+            "web/uploads/a.png",
+            "web/index.html",
+        ] {
+            touch(w, rel);
+        }
+        let written = cfg(&["/secret.txt"], &[], &["data/", "../web/uploads/"]);
+        let none = BuildFilter::default();
+
+        let narrow = plan_in(&repo, &repo, &rebase(&written, &repo, &repo), &none).unwrap();
+        assert_eq!(kept_as_strings(&narrow), ["src/main.rs"]);
+        assert_eq!(excludes_as_strings(&narrow), ["secret.txt"]);
+
+        let wide = rebase(&written, &repo, w);
+        let (mut kept, mut excluded) = (Vec::new(), Vec::new());
+        for scope in [repo.clone(), w.join("web")] {
+            let part = plan_in(w, &scope, &wide, &none).unwrap();
+            kept.extend(kept_as_strings(&part));
+            excluded.extend(excludes_as_strings(&part));
+        }
+        kept.sort();
+        assert_eq!(kept, ["repo/src/main.rs", "web/index.html"]);
+        assert_eq!(excluded, ["repo/secret.txt"]);
+    }
+
+    #[test]
+    fn rules_are_written_from_the_project_and_read_from_the_anchor() {
+        let repo = Path::new("/w/repo");
+        let w = Path::new("/w");
+        let protect =
+            |anchor: &Path, entries: &[&str]| rebase(&cfg(&[], &[], entries), repo, anchor).protect;
+        let exclude =
+            |anchor: &Path, lines: &[&str]| rebase(&cfg(lines, &[], &[]), repo, anchor).exclude;
+
+        assert_eq!(
+            protect(
+                w,
+                &["data/", "./data", "/data", "../web/uploads", "data/../logs"]
+            ),
+            [
+                "repo/data",
+                "repo/data",
+                "repo/data",
+                "web/uploads",
+                "repo/logs"
+            ]
+        );
+        assert!(
+            protect(w, &[".", "..", "../..", "../../elsewhere"]).is_empty(),
+            "the project itself, a folder above it and one outside the anchor name nothing that travels"
+        );
+        assert_eq!(
+            protect(repo, &["data/", "../repo/data", "../web/uploads"]),
+            ["data", "data"]
+        );
+
+        assert_eq!(
+            exclude(
+                w,
+                &[
+                    "node_modules",
+                    "*.log",
+                    "**/upload/",
+                    "/**/tmp",
+                    "# note",
+                    "/secret.txt",
+                    "web/dist/",
+                    "!/keep.txt",
+                    "./a/b",
+                    "../web/dist/",
+                ]
+            ),
+            [
+                "node_modules",
+                "*.log",
+                "**/upload/",
+                "/**/tmp",
+                "# note",
+                "/repo/secret.txt",
+                "/repo/web/dist/",
+                "!/repo/keep.txt",
+                "/repo/a/b",
+                "/web/dist/",
+            ]
+        );
+        // From the project's own root: a `../` that walks back in by name
+        // still counts, one that leaves the anchor names nothing.
+        assert_eq!(
+            exclude(repo, &["/secret.txt", "../repo/x", "../web/dist", "../*/x"]),
+            ["/secret.txt", "/x"]
+        );
+        // A project directory outside the anchor has nothing to respell from.
+        let written = cfg(&["/secret.txt"], &["a/b"], &["data/"]);
+        assert_eq!(rebase(&written, Path::new("/elsewhere/repo"), w), written);
+    }
+
+    /// The project folder's own name goes in front of every anchored rule,
+    /// so a `[` in it must stay a character — and an include must still
+    /// see that it reaches into the excluded directory beneath it.
+    #[test]
+    fn a_folder_named_like_a_glob_is_respelled_literally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path();
+        let repo = w.join("app[1]");
+        for rel in [
+            "app[1]/main.rs",
+            "app[1]/secret.txt",
+            "app[1]/secrets/prod.env",
+            "app[1]/secrets/junk.tmp",
+        ] {
+            touch(w, rel);
+        }
+        let written = cfg(&["/secret.txt", "/secrets/"], &["/secrets/prod.env"], &[]);
+        let report = plan_in(
+            w,
+            &repo,
+            &rebase(&written, &repo, w),
+            &BuildFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept_as_strings(&report),
+            ["app[1]/main.rs", "app[1]/secrets/prod.env"]
+        );
+        assert_eq!(
+            excludes_as_strings(&report),
+            ["app[1]/secret.txt", "app[1]/secrets/junk.tmp"]
+        );
+    }
+
+    #[test]
+    fn what_doctor_suggests_reads_back_as_the_path_it_meant() {
+        let repo = Path::new("/w/repo");
+        let w = Path::new("/w");
+        assert_eq!(as_written(repo, w, "repo/data"), "data");
+        assert_eq!(as_written(repo, w, "web/uploads"), "../web/uploads");
+        assert_eq!(as_written(Path::new("/w/a/b"), w, "c/d"), "../../c/d");
+        for rel in ["repo/data", "web/uploads", "repo/a/b"] {
+            let written = as_written(repo, w, rel);
+            assert_eq!(rebase(&cfg(&[], &[], &[&written]), repo, w).protect, [rel]);
+        }
     }
 }

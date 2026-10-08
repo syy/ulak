@@ -248,7 +248,7 @@ pub struct WorkspaceCfg {
     pub namespace: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyncCfg {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
@@ -978,6 +978,14 @@ impl Project {
     pub fn adopt_existing_stack(&mut self, fp: &mut crate::footprint::Footprint) {
         fp.settle_anchor(self.workspace_id());
         self.anchor = fp.anchor.clone();
+    }
+
+    /// `[sync]` read from the anchor this project is laid out under.
+    /// `config.sync` stays as written — relative to the project
+    /// directory — for anything that shows it or tells somebody what to
+    /// write; everything that decides what travels asks here.
+    pub fn sync_rules(&self) -> SyncCfg {
+        crate::walk::rebase(&self.config.sync, &self.inv.project_dir, &self.anchor)
     }
 
     /// Remote path of this workspace's manifest — SIBLING of the project
@@ -2576,6 +2584,63 @@ mod tests {
         assert_eq!(p.inv.project_dir, repo.join("stack"));
         assert_eq!(p.name, "stack");
         assert_eq!(p.config.sync.max_delete, DeleteBudget::Limit(7));
+    }
+
+    /// A model that reaches less than the workspace already holds — a
+    /// profile that stays inside the project, after one that mounted a
+    /// sibling — is laid out under the recorded, wider anchor through
+    /// both doors, or `ensure_workspace` refuses it on every rerun. And
+    /// `[sync]` keeps meaning the project directory under that anchor.
+    #[test]
+    fn a_narrower_model_keeps_the_wider_layout_and_its_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        write(&repo.join("compose.yaml"), "services: {}\n");
+        write(
+            &repo.join(PROJECT_CONFIG),
+            "[sync]\nprotect = [\"data/\", \"../web/uploads/\"]\nexclude = [\"/secret.txt\"]\n",
+        );
+        let narrow = || crate::footprint::Footprint {
+            anchor: repo.clone(),
+            entries: Vec::new(),
+            server_refs: Vec::new(),
+            whole_anchor: false,
+            contexts: Vec::new(),
+            pinned: Vec::new(),
+            model_json: String::new(),
+        };
+        type Adopt = fn(&mut Project, &mut crate::footprint::Footprint);
+        let doors: [(&str, Adopt); 2] = [
+            ("adopt", Project::adopt),
+            ("adopt_existing_stack", Project::adopt_existing_stack),
+        ];
+
+        let workspace = load_at(&repo, None).unwrap().workspace_id().to_string();
+        crate::invocation::forget_workspace(&workspace);
+        for (door, adopt) in doors {
+            let mut project = load_at(&repo, None).unwrap();
+            adopt(&mut project, &mut narrow());
+            assert_eq!(project.anchor, repo, "{door}: nothing recorded yet");
+            assert_eq!(project.sync_rules().protect, ["data"], "{door}");
+        }
+
+        crate::invocation::record_anchor(&workspace, &root);
+        for (door, adopt) in doors {
+            let mut project = load_at(&repo, None).unwrap();
+            let mut fp = narrow();
+            adopt(&mut project, &mut fp);
+            assert_eq!(project.anchor, root, "{door}");
+            assert_eq!(
+                fp.anchor, root,
+                "{door}: the footprint lays out the same way"
+            );
+            let rules = project.sync_rules();
+            assert_eq!(rules.protect, ["repo/data", "web/uploads"], "{door}");
+            assert_eq!(rules.exclude, ["/repo/secret.txt"], "{door}");
+            assert_eq!(project.config.sync.protect, ["data/", "../web/uploads/"]);
+        }
+        crate::invocation::forget_workspace(&workspace);
     }
 
     #[test]

@@ -1430,10 +1430,11 @@ fn mark_service_running(tunnels: &mut [crate::intent::TunnelState], running: &BT
 fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let build = fp.build_filter();
+    let rules = project.sync_rules();
     fp.sync_dirs()
         .iter()
         .flat_map(|dir| {
-            crate::walk::plan_in(&fp.anchor, dir, &project.config.sync, &build)
+            crate::walk::plan_in(&fp.anchor, dir, &rules, &build)
                 .map(|plan| {
                     plan.excludes
                         .iter()
@@ -1442,7 +1443,7 @@ fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
                 })
                 .unwrap_or_default()
         })
-        .chain(protected_subtrees(&fp.anchor, &project.config.sync.protect))
+        .chain(protected_subtrees(&fp.anchor, &rules.protect))
         .collect()
 }
 

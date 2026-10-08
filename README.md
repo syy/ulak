@@ -198,6 +198,11 @@ protect = ["data/", "uploads/"]
 max_delete = 25
 ```
 
+Paths in `[sync]` are relative to the Compose project directory, even when
+the stack mounts something outside it; use `../web/uploads/` for a sibling
+folder. A pattern without a slash, such as `node_modules`, matches at any
+depth in every folder that travels.
+
 `.env` is included by default. Setting `include` replaces that default.
 
 ### Protect server-owned data
