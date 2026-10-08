@@ -189,7 +189,8 @@ pub fn run(foreground: bool) -> Result<ExitCode> {
     // heartbeat that stops while the process lives is the one signal
     // launchd structurally cannot give ("running" is all it knows).
     let started = intent::now_unix();
-    crate::agent::beat(started);
+    let build = crate::agent::own_build();
+    crate::agent::beat(started, &build);
     let mut next_beat = Instant::now() + crate::agent::BEAT_EVERY;
     ui::info("Ulak service — looking after every stack you left up   (Ctrl-C stops it)");
 
@@ -225,7 +226,7 @@ pub fn run(foreground: bool) -> Result<ExitCode> {
         }
         if Instant::now() >= next_beat {
             next_beat = Instant::now() + crate::agent::BEAT_EVERY;
-            crate::agent::beat(started);
+            crate::agent::beat(started, &build);
         }
         fleet.keep_workers_alive();
     }
