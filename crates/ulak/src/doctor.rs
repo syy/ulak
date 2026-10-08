@@ -242,7 +242,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     // ─── COMPOSE FOOTPRINT ──────────────────────────────────────────
     // Resolving comes BEFORE the pre-flight push: the footprint is what
     // decides which paths the push may even touch.
-    let footprint = match footprint::resolve(&project, &ssh) {
+    let mut footprint = match footprint::resolve(&project, &ssh) {
         Ok((fp, _)) => fp,
         Err(e) => {
             println!("\n{}COMPOSE MODEL{}", s.bold, s.off);
@@ -253,7 +253,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     };
     // Before the pre-flight push, because the push writes the
     // manifest and the manifest carries the identity.
-    project.adopt(&footprint);
+    project.adopt(&mut footprint);
     let (_, deletions_pending) = sync::push_no_delete(&project, &footprint, &ssh)?;
     let recorded = crate::invocation::pending_deletions(&project.state_key(&dest));
     if recorded > 0 {

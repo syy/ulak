@@ -1170,7 +1170,7 @@ impl Dest {
         let Some(m) = stacks.get_mut(id) else {
             return false;
         };
-        let fp = match footprint::resolve_cached(&m.project, ssh, dest) {
+        let mut fp = match footprint::resolve_cached(&m.project, ssh, dest) {
             Ok(fp) => fp,
             Err(e) => {
                 let msg = ui::flatten(&e);
@@ -1179,7 +1179,7 @@ impl Dest {
                 return false;
             }
         };
-        m.project.adopt_existing_stack(&fp);
+        m.project.adopt_existing_stack(&mut fp);
         let dirs = fp.watch_dirs();
         if dirs != m.watched {
             let excluded = excluded_subtrees(&m.project, &fp);

@@ -160,7 +160,8 @@ pub fn run(resolved: &Resolved) -> Result<ExitCode> {
 
     let dest = project.ssh_dest()?;
     let ssh = Ssh::new(&dest)?;
-    let footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
+    let mut footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
+    footprint.settle_anchor(project.workspace_id());
     project.anchor = footprint.anchor.clone();
     spec.rewrite(&project, &mut args)?;
 

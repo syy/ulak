@@ -958,7 +958,11 @@ impl Project {
     /// DIFFERENT project". Measured on a real server by
     /// `e2e_doctor::a_file_doctor_pushed_can_still_be_retired`, on a
     /// fixture whose compose file names itself.
-    pub fn adopt(&mut self, fp: &crate::footprint::Footprint) {
+    ///
+    /// The footprint is widened to the workspace's recorded anchor first,
+    /// so the two agree on the widened one.
+    pub fn adopt(&mut self, fp: &mut crate::footprint::Footprint) {
+        fp.settle_anchor(self.workspace_id());
         self.anchor = fp.anchor.clone();
         self.identity = crate::compose::project_name(&self.inv, &fp.model_json);
     }
@@ -971,7 +975,8 @@ impl Project {
     /// identity would make it abandon the stack that is still running
     /// and start reporting on a different one. `Desired` pins that
     /// identity; only the anchor is allowed to follow the current model.
-    pub fn adopt_existing_stack(&mut self, fp: &crate::footprint::Footprint) {
+    pub fn adopt_existing_stack(&mut self, fp: &mut crate::footprint::Footprint) {
+        fp.settle_anchor(self.workspace_id());
         self.anchor = fp.anchor.clone();
     }
 
@@ -1014,10 +1019,10 @@ pub(crate) fn is_projectless(err: &anyhow::Error) -> bool {
 pub(crate) fn bind_located(mut project: Project) -> Result<Bound> {
     let dest = project.ssh_dest()?;
     let ssh = crate::ssh::Ssh::new(&dest)?;
-    let footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
+    let mut footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
     // The server's compose has now read the env files and the YAML, so
     // it can answer the three rungs argv never could.
-    project.adopt(&footprint);
+    project.adopt(&mut footprint);
     Ok(Bound {
         project,
         ssh,
