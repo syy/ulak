@@ -186,6 +186,18 @@ impl Dir {
         // SAFETY: valid descriptor and NUL-terminated name.
         ok(unsafe { libc::unlinkat(self.0.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) })
     }
+
+    /// Another descriptor for this same directory.
+    pub fn try_clone(&self) -> io::Result<Dir> {
+        Ok(Dir(self.0.try_clone()?))
+    }
+
+    /// The directory's own mode, set through the descriptor held, never
+    /// through its name.
+    pub fn set_mode(&self, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        File::from(self.0.try_clone()?).set_permissions(std::fs::Permissions::from_mode(mode))
+    }
 }
 
 #[cfg(test)]

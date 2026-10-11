@@ -267,6 +267,26 @@ pub struct Pulled {
     pub modified: (i64, i64),
     pub content: String,
     pub bytes: Vec<u8>,
+    /// The modes of the server's directories above it, from the anchor
+    /// down: `land` gives a directory it creates its server's mode.
+    pub parents: Vec<u32>,
+}
+
+/// The directories one `land` created, set to the server's modes when it
+/// returns, however it returns. Not as each is made: a mode without the
+/// owner's write would block the staging directory and the file below it.
+/// With this machine's umask instead, a directory a container made 0777
+/// differed from the server's, and the next push tried to change root's
+/// directory as a non-root SSH user: every sync failed. A mode that can't
+/// be set keeps the umask's.
+struct ServerModes(Vec<(crate::dirfd::Dir, u32)>);
+
+impl Drop for ServerModes {
+    fn drop(&mut self) {
+        for (dir, mode) in &self.0 {
+            let _ = dir.set_mode(*mode);
+        }
+    }
 }
 
 /// Write a pulled file into the workspace under the guard the caller
@@ -304,9 +324,15 @@ pub fn land(anchor: &Path, pulled: &Pulled, expected: Option<&Stamp>) -> Result<
         }
         Err(e) => return Err(e.into()),
     };
-    for component in parent_rel.components() {
+    let mut made = ServerModes(Vec::new());
+    for (depth, component) in parent_rel.components().enumerate() {
         match parent.child(component.as_os_str())? {
-            Some((dir, _)) => parent = dir,
+            Some((dir, created)) => {
+                if created && let Some(&mode) = pulled.parents.get(depth) {
+                    made.0.push((dir.try_clone()?, mode));
+                }
+                parent = dir;
+            }
             None => return refuse("a parent here is a symlink or not a directory"),
         }
     }
@@ -412,6 +438,7 @@ struct ReadHead {
     mode: u32,
     modified: (i64, i64),
     content: String,
+    parents: Vec<u32>,
 }
 
 impl Default for Receipt {
@@ -572,6 +599,7 @@ impl Client {
                 modified: head.modified,
                 content: head.content,
                 bytes: std::mem::replace(&mut bytes, rest),
+                parents: head.parents,
             });
         }
         Ok(Applied {
@@ -1219,6 +1247,61 @@ mod tests {
         assert_eq!(applied.pulled.len(), 8);
     }
 
+    /// A directory a pull creates takes the server's mode, as rsync gave
+    /// it, and one already here keeps its own. A mode without the owner's
+    /// write still lets the file land below it.
+    #[test]
+    fn a_directory_a_pull_creates_takes_the_servers_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let sealed = server.path().join("kept/work/sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("001.sql"), b"CREATE TABLE").unwrap();
+        for (dir, m) in [
+            ("kept", 0o750),
+            ("kept/work", 0o777),
+            ("kept/work/sealed", 0o555),
+        ] {
+            set(&server.path().join(dir), m);
+        }
+        std::fs::create_dir(local.path().join("kept")).unwrap();
+        set(&local.path().join("kept"), 0o700);
+
+        let mut batch = Batch::new();
+        batch.read("kept/work/sealed/001.sql".into()).unwrap();
+        let applied = helper(server.path())
+            .send(batch, &Budget::new(Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(applied.pulled[0].parents, [0o750, 0o777, 0o555]);
+        assert!(
+            land(local.path(), &applied.pulled[0], None)
+                .unwrap()
+                .is_some()
+        );
+
+        let here = local.path().join("kept/work/sealed");
+        assert_eq!(
+            std::fs::read(here.join("001.sql")).unwrap(),
+            b"CREATE TABLE"
+        );
+        assert_eq!(
+            mode(&local.path().join("kept")),
+            0o700,
+            "already here: its own"
+        );
+        assert_eq!(mode(&local.path().join("kept/work")), 0o777);
+        assert_eq!(mode(&here), 0o555);
+        assert!(!here.join(".ulak-partial").exists());
+        set(&here, 0o755);
+        set(&sealed, 0o755);
+    }
+
     /// Landing goes through real directories only. A directory the server
     /// made is created here; a symlinked parent — the walk never follows
     /// one — is refused and nothing is written outside the workspace; a
@@ -1235,6 +1318,7 @@ mod tests {
             modified: (1_700_000_000, 0),
             content: crate::baseline::regular(b"server generated code", 0o644),
             bytes: b"server generated code".to_vec(),
+            parents: Vec::new(),
         };
         // The server made `generated/`; this machine lacks it.
         assert!(
@@ -1354,6 +1438,7 @@ mod tests {
                 modified: (1_700_000_000, 0),
                 content: content.clone(),
                 bytes: bytes.clone(),
+                parents: Vec::new(),
             };
             if matches!(land(local.path(), &pulled, None), Ok(Some(_))) {
                 landed += 1;

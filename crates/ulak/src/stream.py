@@ -9,7 +9,8 @@ to send; a create needs an absent name under an existing parent. A batch is
 verified in full before anything is applied, so a refusal applies nothing, and the receipt names what changed, what the server
 lost and what was refused; sync.rs claims and retires on the receipt alone. A
 read returns a small file's bytes after the receipt line, with the mode, mtime
-and fingerprint they were read under; sync.rs lands them under its own guard.
+and fingerprint they were read under and the modes of the directories above
+it; sync.rs lands them under its own guard.
 This helper cannot create or remove project directories. Directory descriptors
 and O_NOFOLLOW keep a parent symlink from redirecting a selected write outside
 the workspace.
@@ -67,6 +68,7 @@ class Item:
         self.name = None
         self.before = None
         self.previous = None
+        self.parents = []
 
     def close(self):
         if self.parent is not None:
@@ -80,12 +82,14 @@ def resolve(root, item):
     if any(p in ("", ".", "..") or "\x00" in p for p in parts):
         raise ValueError("invalid relative path")
     parent = os.dup(root)
+    modes = []
     try:
         for part in parts[:-1]:
             next_parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                   dir_fd=parent)
             os.close(parent)
             parent = next_parent
+            modes.append(stat.S_IMODE(os.fstat(parent).st_mode))
     except FileNotFoundError:
         # A parent that is now a file or a symlink is not a refusal but a
         # protocol failure: the channel ends and the full survey looks.
@@ -93,6 +97,7 @@ def resolve(root, item):
         return
     item.parent = parent
     item.name = parts[-1]
+    item.parents = modes
 
 
 def verify(root, item):
@@ -263,7 +268,8 @@ def serve(root, control, lock, lease, request):
                                   "mode": stat.S_IMODE(item.before.st_mode),
                                   "modified": [item.before.st_mtime_ns // 1000000000,
                                                item.before.st_mtime_ns % 1000000000],
-                                  "content": item.spec["content"]})
+                                  "content": item.spec["content"],
+                                  "parents": item.parents})
                     payload.append(item.previous)
                 elif item.op == "unlink":
                     apply(control, lock, lease, item)
