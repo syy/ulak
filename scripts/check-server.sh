@@ -93,6 +93,39 @@ else
   bad "rsync" "not installed -> install rsync >= 3.2 with your package manager"
 fi
 
+# Every sync runs a Python helper on the server that refuses an older
+# python3; the change index also needs 3.9 on Linux, and without it the
+# service compares in full instead. A test in doctor.rs reads these two
+# lines back against doctor's PYTHON_FLOOR and PYTHON_INDEX.
+PYTHON_FLOOR=3.7
+PYTHON_INDEX=3.9
+
+# Compares number by number, so 3.10 counts as newer than 3.7.
+version_at_least() {
+  local pattern='^([0-9]+)\.([0-9]+)'
+  [[ "$1" =~ $pattern ]] || return 1
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}"
+  [[ "$2" =~ $pattern ]] || return 1
+  local want_major="${BASH_REMATCH[1]}" want_minor="${BASH_REMATCH[2]}"
+  (( 10#$major > 10#$want_major || (10#$major == 10#$want_major && 10#$minor >= 10#$want_minor) ))
+}
+
+if command -v python3 >/dev/null 2>&1; then
+  # `%`, not --version: Pythons before 3.4 print that to stderr.
+  python_version=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)
+  if [ -z "$python_version" ]; then
+    bad "python3" "on PATH at $(command -v python3) but did not run -> see its error: python3 --version; repair it, or put a working python3 >= $PYTHON_FLOOR ahead of it on the PATH a non-interactive ssh gets"
+  elif ! version_at_least "$python_version" "$PYTHON_FLOOR"; then
+    bad "python3" "need python3 >= $PYTHON_FLOOR; found: ${python_version:-no version} -> install a newer Python as the python3 a non-interactive ssh finds first on PATH"
+  elif ! version_at_least "$python_version" "$PYTHON_INDEX"; then
+    ok "python3" "$python_version (the change index needs $PYTHON_INDEX; the service compares in full instead)"
+  else
+    ok "python3" "$python_version"
+  fi
+else
+  bad "python3" "not installed -> install python3 >= $PYTHON_FLOOR with your package manager"
+fi
+
 # ─── resources ───────────────────────────────────────────────────────────
 head_ "RESOURCES"
 
@@ -184,7 +217,7 @@ fi
 printf '\n%s──────────────────────────────────────────────────────%s\n' "$B" "$N"
 if [ "$FAIL" -gt 0 ]; then
   printf '%s%s hard requirement(s) missing — ulak will not run.%s  (%s warning(s))\n' "$R" "$FAIL" "$N" "$WARN"
-  printf '%sInstall: docker-ce + docker-compose-plugin from docker'"'"'s official apt repo, plus rsync%s\n' "$D" "$N"
+  printf '%sInstall: docker-ce + docker-compose-plugin from docker'"'"'s official apt repo, plus rsync and python3%s\n' "$D" "$N"
   exit 1
 fi
 

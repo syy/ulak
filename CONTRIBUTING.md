@@ -12,8 +12,9 @@ module's `//!` header before changing what it decides.
 ## Development setup
 
 Install [Ulak's local prerequisites](README.md#on-your-computer), plus the Docker
-CLI and Buildx. The Rust toolchain in `rust-toolchain.toml` includes rustfmt and
-Clippy. A local Docker daemon is needed only for the dockerized e2e fixture.
+CLI, Buildx and Python 3 (`python3`) to run the server helpers in unit tests.
+The Rust toolchain in `rust-toolchain.toml` includes rustfmt and Clippy.
+A local Docker daemon is needed only for the dockerized e2e fixture.
 
 On macOS, the Docker CLI and Buildx can be installed without Docker Desktop:
 

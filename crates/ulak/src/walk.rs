@@ -591,6 +591,7 @@ mod tests {
             include: include.iter().map(|s| s.to_string()).collect(),
             protect: protect.iter().map(|s| s.to_string()).collect(),
             max_delete: crate::config::DeleteBudget::Limit(25),
+            no_history: crate::config::NoHistory::Send,
         }
     }
 

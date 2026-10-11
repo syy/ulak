@@ -372,6 +372,7 @@ fn settings_of(c: &Config) -> Vec<(&'static str, String)> {
         ("sync.include", list(&c.sync.include)),
         ("sync.protect", list(&c.sync.protect)),
         ("sync.max_delete", c.sync.max_delete.to_string()),
+        ("sync.no_history", c.sync.no_history.to_string()),
         ("forward.auto", c.forward.auto.to_string()),
         ("service.auto", c.service.auto.to_string()),
     ]

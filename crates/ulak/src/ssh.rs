@@ -36,11 +36,22 @@ const CONTROL_PERSIST: &str = "600";
 /// with lsof: fd3 a dead unix socket, fd4 a brand new ESTABLISHED TCP).
 /// `ConnectTimeout` is what stops that second connection from hanging
 /// forever; `proc::run_bounded` is what stops everything else.
+///
+/// Compression is the master's setting too: it belongs to the transport
+/// the master negotiated, and a mux client's own flag is ignored
+/// (measured: the same transfer took the same time with or without it).
+/// So it rides here, where every session and rsync's transport share it.
+/// A full survey carries every selected name up and, for each directory
+/// that differs, its fingerprints down; zlib shrinks the names about
+/// tenfold, and even the hex digests, which compress poorly, more than
+/// halve. rsync's payload is already `--compress`ed; re-compressing it
+/// costs CPU, the same trade already accepted for rsync on a fast LAN.
 const LINK_OPTS: &[&str] = &[
     "ConnectTimeout=10",
     "ServerAliveInterval=15",
     "ServerAliveCountMax=4",
     "TCPKeepAlive=yes",
+    "Compression=yes",
 ];
 
 #[derive(Debug, Clone)]
@@ -559,6 +570,15 @@ fn rsync_quote(raw: &str) -> String {
     }
 }
 
+/// A handle whose every connection fails at once, for tests that reach
+/// code which may contact the server but must not touch the network.
+#[cfg(test)]
+impl Ssh {
+    pub(crate) fn offline(&mut self) {
+        self.identity.push("-oProxyCommand=false".into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +968,7 @@ mod tests {
             "ConnectTimeout=10",
             "ServerAliveInterval=15",
             "ServerAliveCountMax=4",
+            "Compression=yes",
         ] {
             assert!(args.contains(opt), "ssh args lost {opt}: {args}");
             assert!(

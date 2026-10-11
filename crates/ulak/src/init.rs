@@ -103,6 +103,10 @@ fn write_project_layer(root: &Path, host: Option<&str>) -> Result<()> {
 # Server-side deletions one sync may perform without asking.
 #max_delete = 25
 
+# A file that differs on both ends with no shared history yet (a wiped
+# state directory or a second machine): send this copy, or hold both.
+#no_history = \"send\"       # or \"hold\"
+
 [forward]
 # Bring every compose-published port home to localhost while the stack
 # is up. The service opens the tunnels; set this to false and nothing on
@@ -217,6 +221,10 @@ fn write_global_layer(path: &Path) -> Result<bool> {
 
 # Server-side deletions one sync may perform without asking.
 #max_delete = 25
+
+# A file that differs on both ends with no shared history yet (a wiped
+# state directory or a second machine): send this copy, or hold both.
+#no_history = \"send\"       # or \"hold\"
 
 [forward]
 # Bring every compose-published port home to localhost while a stack is

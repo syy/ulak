@@ -20,8 +20,9 @@
 //! The workspace lock remains checkout-wide because both destinations can
 //! still pull into the same local tree.
 //!
-//! Deliberately NOT a conflict engine: no hashes, no three-way merge, no
-//! `.conflict` files. Local docker has none of that either.
+//! Deliberately NOT a conflict engine: baseline.rs owns common content;
+//! sync.rs protects differing versions. Content equality grants no deletion
+//! authority: only this ledger can claim or retire a server path.
 //!
 //! Directories are recorded too, with a TRAILING SLASH — walk.rs
 //! guarantees file rows never end in one, so the two never blur. They

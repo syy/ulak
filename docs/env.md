@@ -1,7 +1,7 @@
 # Environment variables
 
-Every setting has one. A CI job or a coding agent gets a fresh machine and
-a read-only checkout, so "edit `ulak.toml`" is advice it cannot take.
+Use environment variables to configure Ulak without editing project files.
+This also works for agents running in temporary or read-only checkouts.
 
 `ulak config` prints what is actually in effect and which layer won it —
 reach for that before reading this table.
@@ -35,10 +35,9 @@ The global file is **written for you** the first time ulak runs in a
 terminal: a fully commented `~/.config/ulak/config.toml` that changes no
 setting by existing. It is where `[service]` has to live, since that is
 the one setting no project may decide for a machine. An existing file is
-never touched, nothing is written where stderr is not a terminal (so no
-CI job or container grows one), `ULAK_CONFIG` suppresses it because the
-global layer has been relocated, and `ULAK_GLOBAL_CONFIG_AUTO=false`
-stops it outright.
+never touched. Non-interactive runs do not create it. `ULAK_CONFIG` suppresses
+it because the global layer has been relocated, and
+`ULAK_GLOBAL_CONFIG_AUTO=false` stops it outright.
 
 ## Settings
 
@@ -50,6 +49,7 @@ stops it outright.
 | `ULAK_SYNC_INCLUDE` | `sync.include` | force-included paths, one per line |
 | `ULAK_SYNC_PROTECT` | `sync.protect` | server-owned paths, one per line |
 | `ULAK_SYNC_MAX_DELETE` | `sync.max_delete` | a number, or `unlimited` |
+| `ULAK_SYNC_NO_HISTORY` | `sync.no_history` | `send` or `hold` |
 | `ULAK_FORWARD_AUTO` | `forward.auto` | `true` or `false` |
 | `ULAK_SERVICE_AUTO` | `service.auto` | `true` or `false`; machine-wide, like the file it mirrors |
 
@@ -84,11 +84,11 @@ A single pattern needs neither: `ULAK_SYNC_EXCLUDE='*.log'`.
 | `ULAK_WORKSPACE_UUID` | this run's workspace identity (see below) |
 
 With none of these set, nothing changes: connections are exactly the ones
-your own `ssh` would make, agent and `~/.ssh/config` included.
+your own `ssh` would make, `ssh-agent` and `~/.ssh/config` included.
 
 Setting both `ULAK_SSH_KEY` and `ULAK_SSH_KEY_FILE` is refused — picking
 one would authenticate as an identity you did not choose. A key with a
-passphrase is refused too: load it into an agent instead. Host key
+passphrase is refused too: load it into `ssh-agent` instead. Host key
 checking is **never** relaxed, in any mode; pin the key with
 `ULAK_KNOWN_HOSTS` rather than accepting whatever answers.
 
@@ -96,19 +96,23 @@ checking is **never** relaxed, in any mode; pin the key with
 ordinary multi-line value, or a single line with literal `\n`. A missing
 final newline is restored.
 
-## Ulak in CI or an agent
+## Using Ulak from an agent
 
-```yaml
-- run: ulak docker compose up -d
-  env:
-    ULAK_HOST:           deploy@server
-    ULAK_SSH_KEY:        ${{ secrets.SSH_KEY }}
-    ULAK_KNOWN_HOSTS:    ${{ secrets.KNOWN_HOSTS }}
-    ULAK_WORKSPACE_NAMESPACE: ${{ vars.ULAK_WORKSPACE_NAMESPACE }}
-    ULAK_WORKSPACE_UUID:      ${{ vars.ULAK_WORKSPACE_UUID }}
+Give the agent a stable workspace namespace and UUID, and keep both values
+for the life of its workspace:
+
+```bash
+export ULAK_HOST="user@server"
+export ULAK_WORKSPACE_NAMESPACE="my-agent"
+export ULAK_WORKSPACE_UUID="my-project"
+ulak docker compose up -d
 ```
 
-Collect the server's host key before configuring the job:
+Normal SSH configuration still applies. If the environment has none, supply
+`ULAK_SSH_KEY_FILE` or `ULAK_SSH_KEY`, and verified host-key contents through
+`ULAK_KNOWN_HOSTS`.
+
+Collect the server's host key before configuring access:
 
 ```bash
 ssh-keyscan -t ed25519 server > known_hosts.candidate
@@ -122,40 +126,36 @@ console or another previously verified channel. For example, on that console:
 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
-Only after the fingerprints match, store the contents of `known_hosts.candidate`
-in `KNOWN_HOSTS`. Use the key type your server offers if it does not use
+Only after the fingerprints match, put the contents of `known_hosts.candidate`
+in `ULAK_KNOWN_HOSTS`. Use the key type your server offers if it does not use
 Ed25519. [`ssh-keyscan` collects keys but does not authenticate them](https://man.openbsd.org/ssh-keyscan);
 running it on a trusted computer alone does not verify the server's identity.
 
-The last two are the ones that are not obvious, and a wiped runner needs
-**both** — they fix different halves of the same problem.
+The two workspace settings serve different purposes:
 
-`ULAK_WORKSPACE_NAMESPACE` fixes **where**. It is half the remote
-locator, and Ulak mints one into the state directory when you do not
-supply it — so a fresh runner lands in a brand-new workspace every job.
-Nothing fails; the server just grows another copy and orphans the last
-one.
+- `ULAK_WORKSPACE_NAMESPACE` selects the client's remote location. Without a
+  stable value or persisted local state, each fresh environment gets another
+  workspace and leaves the previous one behind.
+- `ULAK_WORKSPACE_UUID` declares ownership. If local state was lost, Ulak
+  otherwise asks before reusing an existing workspace and refuses without a
+  terminal. A namespace alone does not establish ownership.
 
-`ULAK_WORKSPACE_UUID` fixes **whose**. The workspace on the server
-carries a random uuid, and a machine that has lost its own copy cannot
-tell "mine, before the runner was wiped" from "another machine using the
-same checkout path". Ulak asks a human, and with no terminal it refuses —
-so with the namespace pinned but not this, the second job is refused
-outright. Declaring the identity is that answer, given in advance.
+Any stable one-word value works for either. Use distinct identities for
+independent clients; sharing a checkout path does not mean sharing ownership.
 
-Any stable one-word value works for either; keep both for the life of the
-workspace.
+**Persist Ulak's state directory between runs.** Under `$XDG_STATE_HOME/ulak`
+(default `~/.local/state/ulak`), it holds the deletion ledger and fingerprints
+of the content both ends last agreed on. Namespace and UUID do not replace it:
 
-**Deletions do not reconcile on a wiped runner.** The ledger — the record
-of what this machine put on the server — lives in the state directory, so
-a fresh one claims nothing and nothing is retired: files you delete from
-the checkout stay on the server, and the workspace grows. `doctor` says
-so. To reconcile, persist `$XDG_STATE_HOME` between runs, which also
-restores the deletion budget's usual meaning.
+- Without the ledger, files removed from the checkout remain on the server.
+  `ulak doctor` reports this when it sees a declared identity with no local record.
+- Without common-content history, a differing server copy follows
+  `sync.no_history`: `send` replaces it with the local copy and warns; `hold`
+  keeps both copies until the conflict is resolved.
 
-Nothing here detects CI and changes its own defaults. An agent's microVM
-may legitimately want the background service, and a rule that guessed
-would be wrong for exactly that case.
+Non-interactive runs do not install the background service automatically.
+Run `ulak service run --foreground` when the agent needs continuous sync and
+port forwarding.
 
 ## Test hooks
 

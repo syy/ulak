@@ -18,6 +18,101 @@ use std::time::{Duration, Instant};
 
 use common::{Chain, Service, TestServer, Workspace, desired, extract_remote_dir, service_status};
 
+// The example's published ports and project name are for people. A test
+// on a shared host must borrow neither somebody else's ports nor stack.
+static PORTS: std::sync::OnceLock<[u16; 2]> = std::sync::OnceLock::new();
+
+fn ports() -> [u16; 2] {
+    *PORTS
+        .get()
+        .expect("the fixture chose both ports before any scenario")
+}
+
+struct Fixture<'a> {
+    server: &'a TestServer,
+    workspace: &'a Workspace,
+    name: String,
+}
+
+impl Drop for Fixture<'_> {
+    fn drop(&mut self) {
+        // Exact generated label: even a failed up may have made just one
+        // container. Base images are shared prerequisites and stay put.
+        let name = &self.name;
+        let _ = self.server.ssh_quiet(&format!(
+            "ids=$(docker ps -aq --filter label=com.docker.compose.project={name}); if [ -n \"$ids\" ]; then docker rm -f $ids; fi; docker network rm {name}_default >/dev/null 2>&1; docker image rm {name}-prober >/dev/null 2>&1; true"
+        ));
+        self.workspace.forget_on_server(self.server);
+    }
+}
+
+fn isolated_fixture<'a>(server: &'a TestServer, ws: &'a Workspace) -> Fixture<'a> {
+    // busybox is already seeded, and --pull=never makes the prerequisite
+    // explicit. Host networking asks about the Docker host's own ports,
+    // including listeners outside Docker, on both fixture backends.
+    let out = server.ssh("docker run --rm --pull=never --network host busybox netstat -lnt");
+    assert!(
+        out.status.success(),
+        "cannot enumerate the fixture host's ports: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let used: std::collections::BTreeSet<u16> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(3))
+        .filter_map(|address| address.rsplit(':').next()?.parse().ok())
+        .collect();
+    let mut held = Vec::new();
+    for _ in 0..100 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if !used.contains(&port) {
+            held.push(listener);
+        }
+        if held.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(held.len(), 2, "could not reserve two fixture ports");
+    let selected = [
+        held[0].local_addr().unwrap().port(),
+        held[1].local_addr().unwrap().port(),
+    ];
+    PORTS
+        .set(selected)
+        .expect("only one service fixture in this process");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("ulak-service-{}-{stamp}", std::process::id());
+    let file = ws.project.join("compose.yaml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    for expected in [
+        "name: workspace-demo",
+        "127.0.0.1:8080:80",
+        "127.0.0.1:18080:80",
+    ] {
+        assert!(text.contains(expected), "the example changed: {expected}");
+    }
+    let text = text
+        .replace("name: workspace-demo", &format!("name: {name}"))
+        .replace(
+            "127.0.0.1:8080:80",
+            &format!("127.0.0.1:{}:80", selected[0]),
+        )
+        .replace(
+            "127.0.0.1:18080:80",
+            &format!("127.0.0.1:{}:80", selected[1]),
+        );
+    std::fs::write(file, text).unwrap();
+    Fixture {
+        server,
+        workspace: ws,
+        name,
+    }
+}
+
 /// The scenarios, in the order they run and by name.
 ///
 /// They cannot be split: they hand each other one stack, one service and
@@ -89,6 +184,7 @@ fn phase5_the_service_keeps_the_stack_alive() {
     let ws = Workspace::new();
     std::fs::remove_file(ws.project.join("compose.yaml")).unwrap();
     ws.use_demo_fixture();
+    let _fixture = isolated_fixture(&server, &ws);
     ws.set_host(&server.alias);
     ws.write("ulak.toml", "[sync]\nprotect = [\"data/\"]\n");
 
@@ -131,10 +227,6 @@ fn phase5_the_service_keeps_the_stack_alive() {
     chain.link(|| scenario_half_sent_files_never_come_home(&server, &ws, &remote_dir));
     chain.link(|| scenario_clean_resists_then_cleans(&server, &ws, &remote_dir));
     chain.finish();
-
-    if server.is_real_host() {
-        server.ssh("docker rmi nginx:alpine alpine:3.20 >/dev/null 2>&1; true");
-    }
 }
 
 /// Docker's rule, written to disk: `up` means live until `down`. The
@@ -284,33 +376,22 @@ fn scenario_a_failed_up_does_not_claim_to_be_live(server: &TestServer) {
 /// the two things a service has: it says so, and `status` shows it. What
 /// it must NEVER do is stay quiet.
 fn scenario_a_busy_port_is_named_not_skipped(server: &TestServer, ws: &Workspace) {
-    // The scenario has to BE the thing holding 8080, and when it cannot
-    // it says so out loud. It used to print a line and return, which is
-    // wrong twice over: libtest captures stderr for a test that PASSES,
-    // so the line went nowhere and a scenario named
-    // "is_named_not_skipped" skipped itself in silence — and 8080 is the
-    // very port the service is asked to bring home three scenarios
-    // further down, so a machine that cannot lend it fails this suite
-    // anyway, later and wearing a ulak-shaped mask.
-    let holder = std::net::TcpListener::bind("127.0.0.1:8080").unwrap_or_else(|e| {
-        panic!(
-            "this scenario needs to hold local port 8080 itself, and could not: {e}\n\
-             Find what has it and stop that, then rerun:  \
-             lsof -nP -iTCP:8080 -sTCP:LISTEN"
-        )
+    let port = ports()[0];
+    let holder = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+        panic!("this scenario must hold its fixture port {port}: {e}; check: lsof -nP -iTCP:{port} -sTCP:LISTEN")
     });
 
     let service = Service::start(ws, server);
     let st = service.wait_status(ws, 90, "a tunnel it could not open", |st| {
         st["tunnels"]
             .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["port"] == 8080))
+            .is_some_and(|t| t.iter().any(|t| t["port"] == ports()[0]))
     });
     let tunnel = st["tunnels"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["port"] == 8080)
+        .find(|t| t["port"] == ports()[0])
         .unwrap()
         .clone();
     assert_eq!(
@@ -318,12 +399,14 @@ fn scenario_a_busy_port_is_named_not_skipped(server: &TestServer, ws: &Workspace
         "a port we could not take must be reported as not open, not omitted: {st}"
     );
     assert!(
-        st["note"].as_str().is_some_and(|n| n.contains("8080")),
+        st["note"]
+            .as_str()
+            .is_some_and(|n| n.contains(&ports()[0].to_string())),
         "status must name the port that did not come home: {st}"
     );
     let said = service.said();
     assert!(
-        said.contains("8080") && said.contains("NOT tunneled"),
+        said.contains(&ports()[0].to_string()) && said.contains("NOT tunneled"),
         "the busy port must be named out loud, not skipped in silence:\n{said}"
     );
     assert!(
@@ -332,7 +415,7 @@ fn scenario_a_busy_port_is_named_not_skipped(server: &TestServer, ws: &Workspace
     );
 
     // And when the holder goes away, the tunnel has to follow on its
-    // own. This is the MIXED set — 18080 open, 8080 taken — and it is
+    // own. This is the MIXED set — second port open, first taken — and it is
     // the only one where the bug lived: `covers` counts a blocked port
     // as covered, so the plan looked satisfied and the service returned
     // before probing anything, while the child stayed alive and the
@@ -344,21 +427,22 @@ fn scenario_a_busy_port_is_named_not_skipped(server: &TestServer, ws: &Workspace
     // is no child, `died()` answers true, and the set is already
     // reopened every tick. That is why the demo publishes two.
     assert!(
-        st["tunnels"]
-            .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["port"] == 18080 && t["open"] == true)),
+        st["tunnels"].as_array().is_some_and(|t| t
+            .iter()
+            .any(|t| t["port"] == ports()[1] && t["open"] == true)),
         "this needs the other port OPEN, or it is not the set that was stuck: {st}"
     );
     drop(holder);
     let st = service.wait_status(ws, 90, "the freed port tunneled", |st| {
-        st["tunnels"]
-            .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["port"] == 8080 && t["open"] == true))
+        st["tunnels"].as_array().is_some_and(|t| {
+            t.iter()
+                .any(|t| t["port"] == ports()[0] && t["open"] == true)
+        })
     });
     assert!(
-        st["tunnels"]
-            .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["port"] == 8080 && t["open"] == true)),
+        st["tunnels"].as_array().is_some_and(|t| t
+            .iter()
+            .any(|t| t["port"] == ports()[0] && t["open"] == true)),
         "the port was given back and the tunnel never followed: {st}"
     );
 
@@ -373,10 +457,11 @@ fn scenario_the_ports_come_home_on_their_own(
     ws: &Workspace,
     service: &Service,
 ) {
-    service.wait_status(ws, 120, "an open tunnel on 8080", |st| {
-        st["tunnels"]
-            .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["port"] == 8080 && t["open"] == true))
+    service.wait_status(ws, 120, "an open tunnel on the fixture port", |st| {
+        st["tunnels"].as_array().is_some_and(|t| {
+            t.iter()
+                .any(|t| t["port"] == ports()[0] && t["open"] == true)
+        })
     });
     assert_eq!(
         fetch(DEMO_PAGE, Duration::from_secs(30)),
@@ -603,14 +688,15 @@ fn scenario_a_tunnel_with_nobody_behind_it_says_so(
         .success();
     let st = service.wait_status(ws, 90, "an open tunnel with no container behind it", |st| {
         st["tunnels"].as_array().is_some_and(|t| {
-            t.iter()
-                .any(|t| t["port"] == 8080 && t["open"] == true && t["service_running"] == false)
+            t.iter().any(|t| {
+                t["port"] == ports()[0] && t["open"] == true && t["service_running"] == false
+            })
         })
     });
     // The engine's own truth must survive the report: both ports stay
     // HELD (open), only the backing is gone. Dropping them instead
     // would hand 8080 to whatever local process asks next.
-    for port in [8080, 18080] {
+    for port in ports() {
         let t = st["tunnels"]
             .as_array()
             .unwrap()
@@ -645,7 +731,7 @@ fn scenario_a_tunnel_with_nobody_behind_it_says_so(
     service.wait_status(ws, 90, "the tunnel answered again", |st| {
         st["tunnels"].as_array().is_some_and(|t| {
             t.iter()
-                .any(|t| t["port"] == 8080 && t["service_running"] == true)
+                .any(|t| t["port"] == ports()[0] && t["service_running"] == true)
         })
     });
     assert_eq!(
@@ -679,7 +765,7 @@ fn scenario_the_link_heals_without_anyone_typing(
     assert_eq!(
         fetch(LAST_EDIT, Duration::from_secs(20)),
         Some(true),
-        "localhost:8080 is not serving the last edit, so there is no working \
+        "the local fixture port is not serving the last edit, so there is no working \
          tunnel here for the link to die under:\n{}",
         service.said()
     );
@@ -865,7 +951,7 @@ fn scenario_clean_resists_then_cleans(server: &TestServer, ws: &Workspace, remot
 fn fetch(needle: &str, within: Duration) -> Option<bool> {
     let deadline = Instant::now() + within;
     loop {
-        if let Ok(mut stream) = std::net::TcpStream::connect("127.0.0.1:8080") {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", ports()[0])) {
             // Short on purpose: a tunnel whose far end is gone accepts
             // the connection and then says nothing, and waiting that out
             // would push the service further up its backoff ladder
