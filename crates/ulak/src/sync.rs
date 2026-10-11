@@ -2190,13 +2190,16 @@ fn push_and_claim(
         let mut streamed = None;
         if dirs.is_empty() && !selected.is_empty() {
             let mut batch = crate::stream::Batch::new();
+            // Under the stamp the file carries now, not the survey's: the
+            // batch records exactly the bytes it sends, so a save since the
+            // survey goes as it is. Left to rsync, that save reached the
+            // server as a version no record named, and every later sync
+            // held the file as the server's edit.
             let fits = selected.iter().all(|p| {
                 let create = !survey.remote.get(p).is_some_and(Option::is_some);
-                survey.cache.stamp_of(p).is_some_and(|stamp| {
-                    batch
-                        .add(&fp.anchor, &fp.anchor.join(p), stamp, create)
-                        .is_some()
-                })
+                let path = fp.anchor.join(p);
+                crate::selection::Stamp::read(&path)
+                    .is_some_and(|stamp| batch.add(&fp.anchor, &path, &stamp, create).is_some())
             });
             if fits {
                 // Guarded on the server's copy AS SURVEYED, not on the
@@ -6579,6 +6582,53 @@ mod tests {
         assert!(
             ledger::doomed(&state, local.path(), &[]).is_empty(),
             "no claim was made without its record"
+        );
+    }
+
+    /// A save between the survey and the send goes over the channel as it
+    /// is now, and is recorded as what was sent. Sent by rsync instead, it
+    /// put a version on the server that no record named, and every later
+    /// sync took it for the server's own edit. Measured in CI: five saves
+    /// 50 ms apart left the server on the third for good.
+    #[test]
+    fn a_save_after_the_survey_is_sent_as_it_is_now_and_recorded() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, mut ssh) = helper_project(local.path());
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        let rp = remote.path().join("new.rs");
+        std::fs::write(&rp, b"agreed").unwrap();
+        let agreed = crate::baseline::fingerprint(&rp).unwrap();
+        std::fs::write(&lp, b"save 1").unwrap();
+        let mut survey = one_file_survey(&project, &ssh, agreed.clone());
+        survey
+            .common
+            .record(crate::baseline::Contents::from([("new.rs".into(), agreed)]))
+            .unwrap();
+        std::fs::write(&lp, b"save number two").unwrap();
+        push_and_claim(
+            &PathBuf::from("rsync-not-invoked"),
+            &project,
+            &inventory_footprint(local.path()),
+            &ssh,
+            &mut survey,
+            &state,
+            &crate::proc::Budget::new(crate::proc::RECONCILE),
+            &mut Some(crate::stream::local_helper(remote.path())),
+        )
+        .expect("the channel carries the save, no rsync");
+        assert_eq!(std::fs::read(&rp).unwrap(), b"save number two");
+        let sent = crate::baseline::fingerprint(&lp).unwrap();
+        assert_eq!(survey.common.get("new.rs"), sent.as_ref());
+        assert_eq!(
+            crate::baseline::State::load(&state, local.path())
+                .unwrap()
+                .get("new.rs"),
+            sent.as_ref(),
+            "the record names what the server holds"
         );
     }
 
