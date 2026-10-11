@@ -100,7 +100,8 @@ impl Why {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub local: PathBuf,
-    /// Directories travel whole (minus gitignore/exclude); files alone.
+    /// Directories travel whole (minus `[sync] exclude`, and what a
+    /// build-only path's `.dockerignore` drops); files alone.
     pub is_dir: bool,
     /// False when compose named a path that is not there locally.
     pub exists: bool,
@@ -127,7 +128,8 @@ pub struct ServerRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Footprint {
-    /// Deepest directory containing every entry. Determines LAYOUT only:
+    /// Deepest directory containing every entry, or the wider one the
+    /// workspace already records (`settle_anchor`). Determines LAYOUT only:
     /// the workspace reproduces `entry - anchor`, never the anchor's tree.
     pub anchor: PathBuf,
     pub entries: Vec<Entry>,

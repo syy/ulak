@@ -25,6 +25,13 @@
 //! Watch pruning includes normalized protect roots as well as walk excludes:
 //! protected entries are intentionally absent from the walk's exclude list.
 //!
+//! **An edited `[sync]` reaches a running stack.** The fleet stamps each
+//! job's configuration layers on every catalog read and rebuilds a job
+//! whose layers changed — only once the change has stood still for a
+//! whole read, so a half-written file is never acted on — then asks the
+//! worker for a full reconcile under the new rules. A layer that no
+//! longer loads leaves the running job, and the rules it had, in place.
+//!
 //! **The clock is the only sensor.** Suspend, a wifi handover, a VPN
 //! drop and a server reboot are the same event — the connection is
 //! gone — and `SystemTime` is the only thing that sees all four.
@@ -298,6 +305,13 @@ struct Fleet {
     /// What each stack's intent looked like when its job was built, so
     /// an unchanged file costs a read and not a rebuild.
     built: BTreeMap<String, intent::Desired>,
+    /// The configuration files each job's project was merged from, as
+    /// they stood then. `[sync]` decides what travels, so an edit to it
+    /// has to reach a running stack without a restart.
+    configured: BTreeMap<String, Vec<Option<crate::selection::Stamp>>>,
+    /// An edit seen on the last reload and not acted on yet: it is acted
+    /// on only once a whole reload finds the files unchanged since.
+    settling: BTreeMap<String, Vec<Option<crate::selection::Stamp>>>,
     watched: BTreeMap<String, Watch>,
     /// The last complaint made about a stack, so a compose file that
     /// has been deleted is reported once and not every five seconds.
@@ -323,6 +337,8 @@ impl Fleet {
             workers: BTreeMap::new(),
             jobs: BTreeMap::new(),
             built: BTreeMap::new(),
+            configured: BTreeMap::new(),
+            settling: BTreeMap::new(),
             watched: BTreeMap::new(),
             complained: BTreeMap::new(),
         }
@@ -341,13 +357,32 @@ impl Fleet {
             .map(|(id, _)| id.clone())
             .collect();
 
+        let mut reconfigured = Vec::new();
         for (id, desired) in &catalog {
             if !desired.live {
                 self.retire(debouncer, id);
                 continue;
             }
-            if self.built.get(id) == Some(desired) {
-                continue;
+            let same_intent = self.built.get(id) == Some(desired);
+            // An unchanged intent is rebuilt only for an edited layer, and
+            // only once the edit has stood still for a whole reload. An
+            // editor that truncates before it writes, or two saves of one
+            // change, would otherwise hand a running stack the file in
+            // between — and an empty file is valid TOML whose defaults
+            // protect nothing.
+            let seen = match self.jobs.get(id) {
+                Some(job) if same_intent => Some(config_stamps(&job.project)),
+                _ => None,
+            };
+            if let Some(now) = &seen {
+                if self.configured.get(id) == Some(now) {
+                    self.settling.remove(id);
+                    continue;
+                }
+                if self.settling.get(id) != Some(now) {
+                    self.settling.insert(id.clone(), now.clone());
+                    continue;
+                }
             }
             // `desired.json` is untrusted input by contract: it is plain
             // JSON on disk that a process holding the user's ssh keys
@@ -358,10 +393,24 @@ impl Fleet {
             // Docker project on one daemon. Neither may be rewritten to
             // make the service act on an arbitrary checkout or host.
             let rebuilt = desired.project_for_stack(id);
+            // A layer that moved while it was read is read again next time.
+            if let (Some(before), Some(job)) = (&seen, self.jobs.get(id))
+                && config_stamps(&job.project) != *before
+            {
+                continue;
+            }
             match rebuilt {
                 Ok(project) => {
+                    self.settling.remove(id);
                     self.complained.remove(id);
                     self.built.insert(id.clone(), desired.clone());
+                    // What was read, not what is there now: an edit that
+                    // lands after the check above is still owed a reload.
+                    let stamps = seen.clone().unwrap_or_else(|| config_stamps(&project));
+                    self.configured.insert(id.clone(), stamps);
+                    if same_intent {
+                        reconfigured.push(id.clone());
+                    }
                     self.jobs.insert(
                         id.clone(),
                         Job {
@@ -372,7 +421,13 @@ impl Fleet {
                 }
                 Err(e) => {
                     self.complain(id, &ui::flatten(&e));
-                    self.retire(debouncer, id);
+                    // A configuration mid-edit is often half-written: a
+                    // running stack keeps the rules it has, tunnels and
+                    // all, and the next reload tries again. Only an intent
+                    // that cannot be rebuilt retires it.
+                    if !(same_intent && self.jobs.contains_key(id)) {
+                        self.retire(debouncer, id);
+                    }
                 }
             }
         }
@@ -388,6 +443,12 @@ impl Fleet {
             self.retire(debouncer, &id);
         }
         self.dispatch(&nudged);
+        // After the job list, which carries the new rules to the worker:
+        // the warm plan was walked under the old ones, so only a full
+        // reconcile may follow.
+        for id in reconfigured {
+            self.nudge(&id, None);
+        }
     }
 
     /// Group the jobs by destination and give every worker its share.
@@ -580,6 +641,8 @@ impl Fleet {
         self.unwatch(debouncer, stack);
         self.jobs.remove(stack);
         self.built.remove(stack);
+        self.configured.remove(stack);
+        self.settling.remove(stack);
     }
 
     fn nudge(&self, stack: &str, paths: Option<BTreeSet<PathBuf>>) {
@@ -850,8 +913,20 @@ impl Dest {
         for job in jobs {
             match self.stacks.get_mut(&job.id) {
                 // The intent changed under us (a new -f, a new profile):
-                // take the new project, keep the counters.
-                Some(live) => live.project = job.project,
+                // take the new project, keep the counters. New `[sync]`
+                // rules move what the watcher skips, not what it watches,
+                // so the next resolve has to say so again — and the paths
+                // gathered so far were judged under the old rules, so the
+                // next pass is a full one. The fleet's nudge asks for that
+                // too, but it can arrive after a step has already run.
+                Some(live) => {
+                    if live.project.config.sync != job.project.config.sync {
+                        live.watched.clear();
+                        live.dirty = true;
+                        live.pending = None;
+                    }
+                    live.project = job.project;
+                }
                 None => {
                     let live = Live::new(job.project, &job.id);
                     self.stacks.insert(job.id, live);
@@ -1425,9 +1500,10 @@ fn mark_service_running(tunnels: &mut [crate::intent::TunnelState], running: &BT
     }
 }
 
-/// Subtrees whose churn must not wake a sync — `node_modules`, `.git`
-/// internals, whatever the ignore rules exclude. Computed where the
-/// footprint is, so the main thread's event triage stays a prefix match.
+/// Subtrees whose churn must not wake a sync — `.git` internals, and
+/// whatever `[sync] exclude` or a build's `.dockerignore` keeps off the
+/// server. Computed where the footprint is, so the main thread's event
+/// triage stays a prefix match.
 fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let build = fp.build_filter();
@@ -1446,6 +1522,27 @@ fn excluded_subtrees(project: &Project, fp: &Footprint) -> Vec<PathBuf> {
         })
         .chain(protected_subtrees(&fp.anchor, &rules.protect))
         .collect()
+}
+
+/// The files a stack's configuration would be merged from now: the
+/// project and checkout layers of the nearest config home and the global
+/// one. Any write, a new file or a removed one changes the answer — a
+/// layer created nearer the project too, which moves the home itself, and
+/// an edit through a symlink, since a dotfiles checkout edits the file a
+/// link points at.
+fn config_stamps(project: &Project) -> Vec<Option<crate::selection::Stamp>> {
+    let home = crate::config::find_config_home(&project.inv.project_dir);
+    [
+        Some(home.join(crate::config::PROJECT_CONFIG)),
+        Some(home.join(crate::config::LOCAL_CONFIG)),
+        crate::config::global_layer_path(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let meta = std::fs::metadata(path?).ok()?;
+        Some(crate::selection::Stamp::from_metadata(&meta))
+    })
+    .collect()
 }
 
 fn protected_subtrees(anchor: &Path, protect: &[String]) -> Vec<PathBuf> {
@@ -1631,6 +1728,109 @@ fn ssh_trouble(dest: &str, stderr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[sync]` decides what travels, so a running service has to see it
+    /// change: a layer appearing beside the stack, an edit to one and an
+    /// edit through a link each give a new answer. The fleet acts on one
+    /// only after it has stood still for a whole reload, keeps a running
+    /// job when the new file does not load, and asks for a full reconcile
+    /// only after the job list has carried the new rules to the worker.
+    /// The fleet half is pinned on the source, for the reason the test
+    /// below gives.
+    #[test]
+    fn an_edit_to_a_configuration_layer_reaches_the_running_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let project_layer = dir.join(crate::config::PROJECT_CONFIG);
+        std::fs::write(&project_layer, "[sync]\nexclude = [\"a\"]\n").unwrap();
+        let inv = crate::invocation::Invocation::capture_in(dir, &[], BTreeMap::new()).unwrap();
+        let project = Project::locate_from(inv).unwrap();
+
+        let before = config_stamps(&project);
+        assert_eq!(config_stamps(&project), before, "nothing moved");
+        std::fs::write(
+            dir.join(crate::config::LOCAL_CONFIG),
+            "[sync]\nexclude = [\"b\"]\n",
+        )
+        .unwrap();
+        let local = config_stamps(&project);
+        assert_ne!(local, before, "a checkout layer appeared");
+        std::fs::write(&project_layer, "[sync]\nexclude = [\"a\", \"c\"]\n").unwrap();
+        let edited = config_stamps(&project);
+        assert_ne!(edited, local, "the project layer changed");
+        // A layer that is a link: the edit lands on the file it points at.
+        let target = tmp.path().join("dotfiles-ulak.toml");
+        std::fs::write(&target, "[sync]\nexclude = [\"d\"]\n").unwrap();
+        std::fs::remove_file(dir.join(crate::config::LOCAL_CONFIG)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(crate::config::LOCAL_CONFIG)).unwrap();
+        let linked = config_stamps(&project);
+        std::fs::write(&target, "[sync]\nexclude = [\"d\", \"e\"]\n").unwrap();
+        assert_ne!(config_stamps(&project), linked, "an edit through a link");
+
+        // Rules read from a parent: a layer that appears beside the
+        // project becomes the config home and must be noticed as well.
+        let app = dir.join("app");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::write(app.join("compose.yaml"), "services: {}\n").unwrap();
+        let inv = crate::invocation::Invocation::capture_in(&app, &[], BTreeMap::new()).unwrap();
+        let nested = Project::locate_from(inv).unwrap();
+        assert_eq!(
+            nested.config_home.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
+        let inherited = config_stamps(&nested);
+        std::fs::write(
+            app.join(crate::config::LOCAL_CONFIG),
+            "[sync]\nexclude = [\"f\"]\n",
+        )
+        .unwrap();
+        assert_ne!(
+            config_stamps(&nested),
+            inherited,
+            "a nearer layer takes over"
+        );
+
+        let mine = include_str!("service.rs");
+        let body = |name: &str| {
+            let at = mine.find(name).expect("the function exists");
+            &mine[at..][..mine[at..].find("\n    }\n").expect("the function ends")]
+        };
+        let reload = body("fn reload(&mut self");
+        assert!(reload.contains("config_stamps(&job.project)"));
+        let dispatch = reload.find("self.dispatch(&nudged)").expect("dispatch");
+        let full = reload
+            .find("self.nudge(&id, None)")
+            .expect("a full reconcile is asked for");
+        assert!(
+            dispatch < full,
+            "the reconcile would run under the rules the worker still holds"
+        );
+        assert!(
+            reload.contains("if !(same_intent && self.jobs.contains_key(id))"),
+            "a half-written layer must not take a running stack down"
+        );
+        let waits = reload
+            .find("self.settling.get(id) != Some(now)")
+            .expect("an edit is acted on only once it has stood still");
+        let rebuilds = reload
+            .find("desired.project_for_stack(id)")
+            .expect("the rebuild");
+        assert!(waits < rebuilds, "the wait has to come before the rebuild");
+        assert!(
+            reload.contains("seen.clone().unwrap_or_else(|| config_stamps(&project))"),
+            "an edit made after the read would be recorded as already applied"
+        );
+        let take = body("fn take(&mut self");
+        assert!(
+            take.contains("live.watched.clear()"),
+            "the watcher would keep skipping what the old rules excluded"
+        );
+        assert!(
+            take.contains("live.dirty = true") && take.contains("live.pending = None"),
+            "a warm pass would run on paths judged under the old rules"
+        );
+    }
 
     /// A workspace nothing can advance must not set the sleep floor.
     ///

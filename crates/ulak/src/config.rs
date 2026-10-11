@@ -288,8 +288,12 @@ impl Default for Config {
             workspace: WorkspaceCfg::default(),
             sync: SyncCfg {
                 exclude: vec![],
-                // .env is usually gitignored but compose needs it on the
-                // server — force-included unless the user overrides.
+                // The project's own `.env` and every env file compose
+                // insists on are footprint entries, but an optional one —
+                // an `include:`d file's own `.env`, an `env_file` with
+                // `required: false` — is not, and a build context's
+                // `.dockerignore` usually lists `.env`. Kept unless the
+                // user overrides; it outranks an exclude like any include.
                 include: vec![".env".into()],
                 protect: vec![],
                 max_delete: DeleteBudget::Limit(25),
@@ -727,7 +731,9 @@ pub struct Project {
     /// Directory whose `ulak*.toml` were merged. Usually the
     /// project directory; for a monorepo it may be an ancestor.
     pub config_home: PathBuf,
-    /// Deepest common ancestor of everything that must reach the server.
+    /// Deepest common ancestor of everything that must reach the server,
+    /// or the wider anchor the workspace already records
+    /// (`Footprint::settle_anchor`, through `adopt`).
     /// The remote workspace reproduces layout relative to this, never its contents —
     /// what actually travels is the footprint (F2).
     pub anchor: PathBuf,
@@ -1187,10 +1193,7 @@ pub(crate) fn resolve_layers_in(
     // pointing at /etc/ulak.toml would then move the anchor and re-lay
     // out the workspace on the server.
     let pointed = env_value(env, "ULAK_CONFIG");
-    let global_path = match pointed {
-        Some(raw) => Some(PathBuf::from(raw)),
-        None => global.map(Path::to_path_buf),
-    };
+    let global_path = global_layer_path_in(global.map(Path::to_path_buf), env);
 
     let planned = [
         (global_path, "global", true),
@@ -1396,6 +1399,24 @@ fn declared_workspace_uuid_in(env: &BTreeMap<String, String>) -> Result<Option<S
 /// the way out of a read-only checkout.
 pub(crate) fn env_var_for(key: &str) -> Option<&'static str> {
     ENV_VARS.iter().find(|v| v.key == Some(key)).map(|v| v.name)
+}
+
+/// The file the global layer is read from: `ULAK_CONFIG` when it names
+/// one, otherwise the default slot. `resolve_layers_in` makes the same
+/// choice through here, and so does a reader that only watches the
+/// layers for an edit (`service::config_stamps`).
+pub(crate) fn global_layer_path() -> Option<PathBuf> {
+    global_layer_path_in(global_config_path(), &std::env::vars().collect())
+}
+
+fn global_layer_path_in(
+    default: Option<PathBuf>,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    match env_value(env, "ULAK_CONFIG") {
+        Some(raw) => Some(PathBuf::from(raw)),
+        None => default,
+    }
 }
 
 /// An empty variable is an UNSET one, not an empty value. CI writes
@@ -2637,10 +2658,27 @@ mod tests {
             );
             let rules = project.sync_rules();
             assert_eq!(rules.protect, ["repo/data", "web/uploads"], "{door}");
-            assert_eq!(rules.exclude, ["/repo/secret.txt"], "{door}");
+            assert_eq!(rules.exclude, ["/repo/secret.txt", "!/repo/"], "{door}");
             assert_eq!(project.config.sync.protect, ["data/", "../web/uploads/"]);
         }
         crate::invocation::forget_workspace(&workspace);
+    }
+
+    /// `ULAK_CONFIG` relocates the global layer for every reader, the one
+    /// that only watches the files included; an empty one relocates
+    /// nothing.
+    #[test]
+    fn the_global_layer_is_wherever_ulak_config_points() {
+        let default = Some(PathBuf::from("/home/me/.config/ulak/config.toml"));
+        assert_eq!(
+            global_layer_path_in(default.clone(), &env(&[("ULAK_CONFIG", "/etc/ulak.toml")])),
+            Some(PathBuf::from("/etc/ulak.toml"))
+        );
+        assert_eq!(
+            global_layer_path_in(default.clone(), &env(&[("ULAK_CONFIG", "")])),
+            default
+        );
+        assert_eq!(global_layer_path_in(default.clone(), &env(&[])), default);
     }
 
     #[test]

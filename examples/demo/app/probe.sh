@@ -34,7 +34,7 @@ show "3. bind mount (./bind)"     /mnt/bind/marker.txt
 show "4. configs file (./configs)" /mnt/config/app.conf
 
 # 5. Writable mount: appends one line per run. Ulak brings this file
-#    back to the checkout unless the mount is protected or ignored.
+#    back to the checkout unless the mount is protected or excluded.
 echo "--------------------------------------------------------------------"
 if [ -d /data ]; then
   echo "run $(date -u +%H:%M:%S)" >> /data/runs.log 2>/dev/null || true

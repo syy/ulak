@@ -9,13 +9,13 @@
 //!   0. partials  — rsync's own half-written blobs, ours to exclude
 //!   1. held back — paths the pull must not carry home (see pull_back)
 //!   2. protect   — server-owned data: never sent, never deleted
-//!   3. ignores   — .gitignore/[sync] exclude, expanded to literal paths
+//!   3. ignores   — [sync] exclude/.dockerignore, expanded to literal paths
 //!   4. footprint — the only paths allowed to travel, plus their parents
 //!   5. `- *`     — everything else, which rsync then never descends into
 //!
 //! Rule 5 is what makes a small stack inside a multi-gigabyte monorepo
-//! cost a 3 MB scan. Rule 3 beating rule 4 is deliberate: pushing a
-//! gitignored `./data` over a live database is the worse of the two
+//! cost a 3 MB scan. Rule 3 beating rule 4 is deliberate: pushing an
+//! excluded `./data` over a live database is the worse of the two
 //! failures, and doctor reports any footprint path the ignores swallowed.
 //!
 //! The workspace runs BOTH ways, because a local bind mount does: your
@@ -516,9 +516,9 @@ fn reconcile_structure(
 ) -> Result<Option<SyncReport>> {
     if session.common.is_none()
         || paths.iter().any(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n == ".gitignore" || n.ends_with(".dockerignore") || n == "ulak.toml"
-            })
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".dockerignore") || n == "ulak.toml")
         })
     {
         return Ok(None);
@@ -681,7 +681,14 @@ fn reconcile_structure(
             session.common = Some(common);
             return Ok(None);
         }
-        doomed = set_aside(&state, &fp.anchor, &mut common, &copies, doomed)?;
+        doomed = set_aside(
+            &state,
+            &fp.anchor,
+            &project.inv.project_dir,
+            &mut common,
+            &copies,
+            doomed,
+        )?;
         doomed = retire_never_landed(&state, &fp.anchor, &mut common, &copies.remote, doomed)?;
         if !doomed.is_empty() {
             let removal = delete_remote(ssh, project, &doomed, &[])?;
@@ -1191,8 +1198,7 @@ fn changed_leaves(
             continue;
         }
         let name = path.file_name()?.to_str()?;
-        if name == ".gitignore"
-            || name.ends_with(".dockerignore")
+        if name.ends_with(".dockerignore")
             || name == "ulak.toml"
             || !path.starts_with(anchor)
             || !std::fs::symlink_metadata(path).ok()?.is_file()
@@ -1831,7 +1837,14 @@ fn push(
     // deletions then wait over budget, and a row the sync keeps must not
     // be counted, prompted for or recorded as pending.
     let copies = read_doomed(ssh, project, &doomed, deadline)?;
-    let mut doomed = judge_doomed(&state, &fp.anchor, &mut survey.common, &copies, doomed)?;
+    let mut doomed = judge_doomed(
+        &state,
+        &fp.anchor,
+        &project.inv.project_dir,
+        &mut survey.common,
+        &copies,
+        doomed,
+    )?;
     doomed_dirs = spare_dirs_above(doomed_dirs, &copies);
     if doomed.is_empty() && doomed_dirs.is_empty() {
         crate::invocation::record_pending_deletions(&state, 0);
@@ -1870,7 +1883,14 @@ fn push(
         // `rm -f` compares nothing. A server edit made while the list was
         // open is spared like any other: read and judge again, now.
         let copies = read_doomed(ssh, project, &doomed, deadline)?;
-        doomed = judge_doomed(&state, &fp.anchor, &mut survey.common, &copies, doomed)?;
+        doomed = judge_doomed(
+            &state,
+            &fp.anchor,
+            &project.inv.project_dir,
+            &mut survey.common,
+            &copies,
+            doomed,
+        )?;
         doomed_dirs = spare_dirs_above(doomed_dirs, &copies);
     }
 
@@ -1926,11 +1946,12 @@ fn read_doomed(
 fn judge_doomed(
     state: &crate::config::WorkspaceStateKey,
     anchor: &std::path::Path,
+    project_dir: &std::path::Path,
     common: &mut crate::baseline::State,
     copies: &crate::baseline::Copies,
     doomed: Vec<String>,
 ) -> Result<Vec<String>> {
-    let doomed = set_aside(state, anchor, common, copies, doomed)?;
+    let doomed = set_aside(state, anchor, project_dir, common, copies, doomed)?;
     let doomed = retire_never_landed(state, anchor, common, &copies.remote, doomed)?;
     retire_moved(state, anchor, common, &copies.remote, doomed)
 }
@@ -1962,13 +1983,16 @@ fn split_verdicts(
 fn set_aside(
     state: &crate::config::WorkspaceStateKey,
     anchor: &std::path::Path,
+    project_dir: &std::path::Path,
     common: &mut crate::baseline::State,
     copies: &crate::baseline::Copies,
     doomed: Vec<String>,
 ) -> Result<Vec<String>> {
     let (doomed, restructured, held) = split_verdicts(doomed, copies);
     retire_restructured(state, anchor, common, copies, &restructured)?;
-    hold_unreadable(copies, &held);
+    hold_unreadable(copies, &held, |rel| {
+        walk::as_written(project_dir, anchor, rel)
+    });
     Ok(doomed)
 }
 
@@ -2023,8 +2047,12 @@ fn restructured_warning(copies: &crate::baseline::Copies, restructured: &[String
 /// restructured instead turned a file caught mid-write into one ulak no
 /// longer tracked, and a file the SSH user may not read into a
 /// creating-pass candidate that failed every later pull.
-fn hold_unreadable(copies: &crate::baseline::Copies, held: &[String]) {
-    if let Some(warning) = held_warning(copies, held) {
+fn hold_unreadable(
+    copies: &crate::baseline::Copies,
+    held: &[String],
+    as_written: impl Fn(&str) -> String,
+) {
+    if let Some(warning) = held_warning(copies, held, as_written) {
         ui::warn(&warning);
     }
 }
@@ -2032,8 +2060,15 @@ fn hold_unreadable(copies: &crate::baseline::Copies, held: &[String]) {
 /// The warning `hold_unreadable` gives, split from the printing for the
 /// reason `slipped_past_the_ignores` is. A file the SSH user may not read
 /// is the server's own, and `[sync] protect` is how to say so; protected
-/// rows are never doomed (`doomed_files`), so that ends the warning.
-fn held_warning(copies: &crate::baseline::Copies, held: &[String]) -> Option<String> {
+/// rows are never doomed (`doomed_files`), so that ends the warning. The
+/// entry is offered `as_written` — from the project directory, as
+/// `ulak.toml` reads it — or a wider anchor's spelling would protect
+/// nothing.
+fn held_warning(
+    copies: &crate::baseline::Copies,
+    held: &[String],
+    as_written: impl Fn(&str) -> String,
+) -> Option<String> {
     if held.is_empty() {
         return None;
     }
@@ -2046,10 +2081,10 @@ fn held_warning(copies: &crate::baseline::Copies, held: &[String]) -> Option<Str
         "ulak could not read the server's copy of {} and left {them} there; your deletion waits, and the next sync tries again",
         rows.join(", ")
     );
-    let denied: Vec<&str> = held
+    let denied: Vec<String> = held
         .iter()
         .filter(|p| copies.held[*p].denied)
-        .map(String::as_str)
+        .map(|p| as_written(p))
         .collect();
     if !denied.is_empty() {
         warning.push_str(&format!(
@@ -2712,7 +2747,8 @@ fn claim(kept: &[Vec<u8>], kept_dirs: &[Vec<u8>], events: &[Event]) -> Vec<Vec<u
 /// circumstance does ulak remove a file from the user's machine.
 ///
 /// The same filter chain as the push, so protected data stays put and
-/// gitignored noise (a container's node_modules) never comes down. What
+/// excluded noise (a container's node_modules) comes down at most once,
+/// before the walk can name it (`say_what_slipped_past_the_ignores`). What
 /// the push does not need is the SPLIT: down here every remote file is
 /// one of two things, and the two have opposite rights.
 ///
@@ -3028,8 +3064,8 @@ pub fn pull_back(
 /// rank 3 of `filter_args` outranks the footprint's `+` rules at rank
 /// 4: it never travels again, in either direction.
 ///
-/// The ranking is not the bug and does not move — it is what stops a
-/// gitignored `./data` from being pushed over a live database, which is
+/// The ranking is not the bug and does not move — it is what stops an
+/// excluded `./data` from being pushed over a live database, which is
 /// the worse failure by a distance. The bug is that the one trip it
 /// does make is silent, and it is the trip that matters: a container's
 /// data directory lands on the developer's disk without being asked
@@ -3048,9 +3084,15 @@ fn say_what_slipped_past_the_ignores(project: &Project, fp: &Footprint, invented
     if slipped.is_empty() {
         return;
     }
+    // Named the way ulak.toml would name them, since that is where the
+    // advice below sends them.
+    let written: Vec<String> = slipped
+        .iter()
+        .map(|p| walk::as_written(&project.inv.project_dir, &fp.anchor, p))
+        .collect();
     ui::warn(&format!(
         "the stack made {} on the server and it came home, though this project's ignore rules cover it — nothing here could exclude a path that did not exist yet",
-        slipped.join(", ")
+        written.join(", ")
     ));
     ui::dim("    to keep it on the server from now on: add it to [sync] protect in ulak.toml");
 }
@@ -3415,8 +3457,8 @@ fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
     let rules = project.sync_rules();
     // Narrows each build context by its own `.dockerignore`, and nothing
     // else — see dockerignore.rs. It lands in the SAME literal exclude
-    // list as the gitignore chain, which sync.rs already ranks ahead of
-    // the footprint's includes, so no filter rule has to change.
+    // list as `[sync] exclude`, which sync.rs already ranks ahead of the
+    // footprint's includes, so no filter rule has to change.
     let build = fp.build_filter();
     for dir in fp.sync_dirs() {
         let part = walk::plan_in(&fp.anchor, &dir, &rules, &build)?;
@@ -3430,6 +3472,7 @@ fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
     // so without this they would never enter the ledger, and deleting one
     // locally would leave it on the server FOREVER. Measured: a removed
     // compose.override.yaml kept overriding the stack.
+    let excluded = crate::selection::Excludes::new(plan.excludes.iter().cloned());
     for e in &fp.entries {
         if e.is_dir || !e.exists {
             continue;
@@ -3452,6 +3495,14 @@ fn checked_plan(project: &Project, fp: &Footprint) -> Result<walk::WalkReport> {
             // only copy. One file is under the default `max_delete` of
             // 25, so there was no prompt either.
             if crate::walk::protected(&rules.protect, &rel) {
+                continue;
+            }
+            // Nor one an exclude keeps local, such as an `env_file:` in a
+            // mounted folder the user excluded: rsync's literal exclude
+            // refuses it and the pull's inventory never lists it, so a
+            // claim only the channel honoured sent it by one transport and
+            // not the other. Doctor names it (`ignored_entries`).
+            if excluded.contains(rel.as_bytes()) {
                 continue;
             }
             plan.kept.push(rel.into_bytes());
@@ -3481,9 +3532,9 @@ fn refuse_bad_names(plan: &walk::WalkReport) -> Result<()> {
 
 /// The walker's answer for the directories the notices name, spliced into
 /// the last full plan. The walker stays the only selection policy: each
-/// scope is walked with the same matchers, seeded with the same ignore
-/// files from the anchor down, and every previous entry under it is
-/// replaced by that walk. A notice names a leaf, whose parent is the
+/// scope is walked with the same matchers, entered as the walk from the
+/// anchor entered it (`walk::plan_in`), and every previous entry under it
+/// is replaced by that walk. A notice names a leaf, whose parent is the
 /// scope, or a directory the previous plan already kept — some watcher
 /// backends report the directory rather than its changed child — which is
 /// rescanned itself. A directory the plan does not know is reported
@@ -3542,7 +3593,8 @@ fn rescanned_plan(
         }
         // A directory the previous walk never saw is judged by the rules
         // it would have applied; a kept one was judged then, include
-        // rescues and all.
+        // rescues and all. One an include reaches into is not ignored, and
+        // `plan_in` enters it as the walk from the anchor did.
         if !known(scope) && walk::is_ignored(&fp.anchor, scope, cfg, &build)? {
             continue;
         }
@@ -4841,33 +4893,43 @@ mod tests {
     #[test]
     fn warm_selection_reconciles_new_paths_and_changed_ignore_rules() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".gitignore");
-        std::fs::write(&path, b"old").unwrap();
-        let observed = std::collections::BTreeMap::from([(
-            path.clone(),
-            crate::selection::Stamp::read(&path).unwrap(),
-        )]);
-        std::fs::write(&path, b"new-rule").unwrap();
-        assert!(
+        let edit = |name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"old").unwrap();
+            let observed = std::collections::BTreeMap::from([(
+                path.clone(),
+                crate::selection::Stamp::read(&path).unwrap(),
+            )]);
+            std::fs::write(&path, b"new-rule").unwrap();
             changed_leaves(
                 tmp.path(),
                 &Session {
-                    observed: observed.clone(),
+                    observed,
                     ..Session::default()
                 },
-                &std::collections::BTreeSet::from([path])
+                &std::collections::BTreeSet::from([path]),
             )
-            .is_none()
+        };
+        for rules in [".dockerignore", "Dockerfile.dockerignore", "ulak.toml"] {
+            assert!(
+                edit(rules).is_none(),
+                "{rules} must send the save to a walk"
+            );
+        }
+        // The walker never reads a `.gitignore`, so an edit to one moves
+        // no rule: it is an ordinary save, sent like any other.
+        let saved = edit(".gitignore").expect("a .gitignore edit is an ordinary save");
+        assert_eq!(
+            saved.keys().collect::<Vec<_>>(),
+            [&tmp.path().join(".gitignore")]
         );
+
         let new = tmp.path().join("new");
         std::fs::write(&new, b"new").unwrap();
         assert!(
             changed_leaves(
                 tmp.path(),
-                &Session {
-                    observed: observed.clone(),
-                    ..Session::default()
-                },
+                &Session::default(),
                 &std::collections::BTreeSet::from([new])
             )
             .is_none()
@@ -5432,10 +5494,11 @@ mod tests {
             pinned: Vec::new(),
             model_json: String::new(),
         };
-        // No `[sync]` rules at all: the `.gitignore` above is the only
-        // thing speaking, which is the shape of an ordinary project.
-        let cfg = crate::config::SyncCfg {
-            exclude: Vec::new(),
+        // `[sync] exclude` is the only rule speaking. The `.gitignore`
+        // above says the same thing and is never read — the last
+        // assertion holds it to that.
+        let mut cfg = crate::config::SyncCfg {
+            exclude: vec!["pgdata/".into()],
             include: Vec::new(),
             protect: Vec::new(),
             max_delete: crate::config::DeleteBudget::Limit(0),
@@ -5465,6 +5528,11 @@ mod tests {
             slipped_past_the_ignores(&cfg, &fp, &[Event::Push("app.log".into())]).is_empty(),
             "a file no rule covers is not a leak"
         );
+
+        // Without the exclude nothing covers `pgdata`: it comes home like
+        // any other output, whatever the `.gitignore` says.
+        cfg.exclude.clear();
+        assert!(slipped_past_the_ignores(&cfg, &fp, &invented).is_empty());
     }
 
     #[test]
@@ -6046,10 +6114,60 @@ mod tests {
         assert_eq!(spared, ["edited.rs"]);
     }
 
+    /// A notice under a directory the rules drop but an include reaches
+    /// into is rescanned as the full walk would walk it: the file the
+    /// include rescues is in the plan, its excluded neighbour is not. A
+    /// notice under one nothing reaches into still changes nothing.
+    #[test]
+    fn a_notice_an_include_rescues_is_rescanned_as_the_full_walk_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = tmp.path();
+        let write = |rel: &str| {
+            let p = anchor.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+            p
+        };
+        for rel in ["app/a.rs", "secrets/keep/prod.env", "secrets/junk.tmp"] {
+            write(rel);
+        }
+        let cfg = crate::config::SyncCfg {
+            exclude: vec!["secrets/".into(), "node_modules/".into()],
+            include: vec!["secrets/keep/*.env".into()],
+            protect: vec![],
+            max_delete: crate::config::DeleteBudget::Limit(25),
+            no_history: crate::config::NoHistory::Send,
+        };
+        let fp = inventory_footprint(anchor);
+        let previous = walk::plan_in(anchor, anchor, &cfg, &fp.build_filter()).unwrap();
+        assert!(previous.kept.contains(&b"secrets/keep/prod.env".to_vec()));
+
+        let rescued = write("secrets/keep/stage.env");
+        write("secrets/keep/junk.tmp");
+        let (plan, scopes) = rescanned_plan(&cfg, &fp, &previous, &[rescued].into_iter().collect())
+            .unwrap()
+            .expect("a rescan answers it");
+        assert_eq!(scopes, [anchor.join("secrets/keep")]);
+        let full = walk::plan_in(anchor, anchor, &cfg, &fp.build_filter()).unwrap();
+        assert!(
+            plan.kept.contains(&b"secrets/keep/stage.env".to_vec()),
+            "a file the include rescues must not wait for the next full walk"
+        );
+        assert_eq!(plan.kept, full.kept);
+        assert_eq!(plan.kept_dirs, full.kept_dirs);
+        assert_eq!(plan.excludes, full.excludes);
+        let noise = write("node_modules/pkg/x.js");
+        let (same, scopes) = rescanned_plan(&cfg, &fp, &previous, &[noise].into_iter().collect())
+            .unwrap()
+            .expect("nothing reaches into node_modules");
+        assert!(scopes.is_empty());
+        assert_eq!(same.kept, previous.kept);
+    }
+
     /// Rescanning the directories the notices name and splicing the walk's
     /// answer into the previous plan must give exactly the full walk's
     /// answer: the same kept leaves, kept directories and literal excludes,
-    /// under the same ignore files. A notice naming a directory, or a leaf
+    /// under the same ignore rules. A notice naming a directory, or a leaf
     /// whose parent is gone, is not rescanned but sent to the full path; a
     /// leaf under an excluded directory changes nothing.
     #[test]
@@ -6062,7 +6180,6 @@ mod tests {
             std::fs::write(&p, rel).unwrap();
             p
         };
-        std::fs::write(anchor.join(".gitignore"), "*.log\nbuild/\n").unwrap();
         for rel in [
             "app/src/a.rs",
             "app/src/b.rs",
@@ -6074,7 +6191,7 @@ mod tests {
             write(rel);
         }
         let cfg = crate::config::SyncCfg {
-            exclude: vec![],
+            exclude: vec!["*.log".into(), "build/".into()],
             include: vec![],
             protect: vec![],
             max_delete: crate::config::DeleteBudget::Limit(25),
@@ -6230,6 +6347,49 @@ mod tests {
                 "{name} must claim before the exchange and retire the fresh claims after a refusal"
             );
         }
+    }
+
+    /// A file the footprint names one by one is claimed like any other —
+    /// unless an exclude keeps the folder it sits in local, where rsync's
+    /// literal exclude and the pull's inventory would never carry it and
+    /// only the channel would have.
+    #[test]
+    fn a_named_file_under_an_excluded_folder_is_not_claimed() {
+        let local = tempfile::tempdir().unwrap();
+        let (mut project, _ssh) = helper_project(local.path());
+        let anchor = local.path().to_path_buf();
+        std::fs::create_dir_all(anchor.join("config")).unwrap();
+        std::fs::write(anchor.join("config/app.env"), "A=1\n").unwrap();
+        std::fs::write(anchor.join("config/other.conf"), "x\n").unwrap();
+        let entry = |rel: &str, is_dir: bool, why: crate::footprint::Why| crate::footprint::Entry {
+            local: anchor.join(rel),
+            is_dir,
+            exists: true,
+            empty: false,
+            why,
+            service: "app".into(),
+            writable: false,
+        };
+        let fp = Footprint {
+            anchor: anchor.clone(),
+            entries: vec![
+                entry("config", true, crate::footprint::Why::Volume),
+                entry("config/app.env", false, crate::footprint::Why::EnvFile),
+            ],
+            server_refs: Vec::new(),
+            whole_anchor: false,
+            contexts: Vec::new(),
+            pinned: Vec::new(),
+            model_json: String::new(),
+        };
+
+        let kept = checked_plan(&project, &fp).unwrap().kept;
+        assert!(kept.contains(&b"config/app.env".to_vec()), "{kept:?}");
+
+        project.config.sync.exclude = vec!["config/".into()];
+        let plan = checked_plan(&project, &fp).unwrap();
+        assert!(plan.kept.is_empty(), "{:?}", plan.kept);
+        assert_eq!(plan.excludes, [b"config".to_vec()]);
     }
 
     /// A project whose anchor is `local`, bound to a destination that is
@@ -7345,7 +7505,7 @@ mod tests {
         common.record(agreed).unwrap();
         let judged = |common: &mut crate::baseline::State, doomed: Vec<String>| {
             let copies = crate::baseline::local_verdicts(server.path(), &doomed).unwrap();
-            judge_doomed(&state, local.path(), common, &copies, doomed).unwrap()
+            judge_doomed(&state, local.path(), local.path(), common, &copies, doomed).unwrap()
         };
 
         // Before the prompt, nothing has moved.
@@ -7515,7 +7675,8 @@ mod tests {
         }
         // One names the held rows with theirs, and offers `[sync] protect`
         // for the one the SSH user may not read, and only for it.
-        let warning = held_warning(&copies, &held).expect("the held rows are named");
+        let warning =
+            held_warning(&copies, &held, str::to_string).expect("the held rows are named");
         for needed in [
             "busy.bin (it changed while it was read)",
             "locked.key (the SSH user may not read it)",
@@ -7524,12 +7685,29 @@ mod tests {
         ] {
             assert!(warning.contains(needed), "lost {needed:?}: {warning}");
         }
-        let warning = held_warning(&copies, &held[..1]).expect("the held row is named");
+        let warning =
+            held_warning(&copies, &held[..1], str::to_string).expect("the held row is named");
         assert!(!warning.contains("protect"), "{warning}");
-        assert!(held_warning(&copies, &[]).is_none());
+        assert!(held_warning(&copies, &[], str::to_string).is_none());
+        // The entry it offers is spelled the way ulak.toml reads it, from
+        // the project directory, whatever the anchor is.
+        let warning = held_warning(&copies, &held, |rel| format!("../web/{rel}"))
+            .expect("the held rows are named");
+        assert!(
+            warning.contains("if the server owns ../web/locked.key, add it to [sync] protect"),
+            "{warning}"
+        );
 
         // The judgement: only the unrelated row's deletion stands.
-        let doomed = judge_doomed(&state, local.path(), &mut common, &copies, doomed).unwrap();
+        let doomed = judge_doomed(
+            &state,
+            local.path(),
+            local.path(),
+            &mut common,
+            &copies,
+            doomed,
+        )
+        .unwrap();
         assert_eq!(doomed, ["gone.txt"], "the unrelated row is still deleted");
         assert_eq!(
             ledger::doomed(&state, local.path(), &[]),
@@ -7664,7 +7842,15 @@ mod tests {
 
         let copies = crate::baseline::local_verdicts(server.path(), &doomed).unwrap();
         assert_eq!(copies.structural.len(), 100);
-        let doomed = judge_doomed(&state, local.path(), &mut common, &copies, doomed).unwrap();
+        let doomed = judge_doomed(
+            &state,
+            local.path(),
+            local.path(),
+            &mut common,
+            &copies,
+            doomed,
+        )
+        .unwrap();
         assert_eq!(doomed, ["gone.txt"]);
         assert_eq!(ledger::doomed(&state, local.path(), &[]), ["gone.txt"]);
         let out = run_removal(server.path(), home.path(), &["gone.txt"], &[]);

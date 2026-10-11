@@ -291,15 +291,27 @@ fn init_is_offline_even_for_an_unreachable_host() {
 }
 
 fn scenario_first_sync(server: &TestServer, ws: &Workspace) -> String {
-    // .gitignore hides node_modules and .env — but .env must sync anyway.
+    // .gitignore has no say in what travels: docker never reads it, and
+    // the fixture mounts the whole project, so the container would see
+    // every one of these files. Only `[sync] exclude` keeps a path local,
+    // and `[sync] include` takes one back out of it — both set in the
+    // checkout layer, which a later scenario's rewrite of ulak.toml
+    // leaves in place.
     let gi = ws.project.join(".gitignore");
     let mut text = std::fs::read_to_string(&gi).unwrap();
-    text.push_str("node_modules/\n.env\n");
+    text.push_str("node_modules/\n.env\ndist/\n");
     std::fs::write(&gi, text).unwrap();
+    std::fs::write(
+        ws.project.join("ulak.local.toml"),
+        "[sync]\nexclude = [\"node_modules/\"]\ninclude = [\"node_modules/patched/\"]\n",
+    )
+    .unwrap();
 
     ws.write("site/index.html", "hello-v1");
     ws.write(".env", "GREETING=from-dotenv");
+    ws.write("dist/bundle.js", "built-locally");
     ws.write("node_modules/pkg/big.js", "never-synced");
+    ws.write("node_modules/patched/fix.js", "patched-locally");
     ws.write("app/main.py", "print(1)");
 
     let out = ws.ulak(server).arg("sync").assert().success();
@@ -309,19 +321,29 @@ fn scenario_first_sync(server: &TestServer, ws: &Workspace) -> String {
 
     let cat = server.ssh(&format!("cat {remote_dir}/site/index.html"));
     assert_eq!(String::from_utf8_lossy(&cat.stdout).trim(), "hello-v1");
+    for (path, bytes) in [
+        (".env", "GREETING=from-dotenv"),
+        ("dist/bundle.js", "built-locally"),
+    ] {
+        let cat = server.ssh(&format!("cat {remote_dir}/{path}"));
+        assert_eq!(
+            String::from_utf8_lossy(&cat.stdout),
+            bytes,
+            "gitignored {path} must reach the server: a bind mount shows it to the container"
+        );
+    }
     assert!(
         server
-            .ssh(&format!("grep -q from-dotenv {remote_dir}/.env"))
+            .ssh(&format!("test ! -e {remote_dir}/node_modules/pkg"))
             .status
             .success(),
-        ".env must be force-included despite .gitignore"
+        "[sync] exclude must keep node_modules off the server"
     );
-    assert!(
-        server
-            .ssh(&format!("test ! -e {remote_dir}/node_modules"))
-            .status
-            .success(),
-        "gitignored node_modules must not reach the server"
+    let cat = server.ssh(&format!("cat {remote_dir}/node_modules/patched/fix.js"));
+    assert_eq!(
+        String::from_utf8_lossy(&cat.stdout),
+        "patched-locally",
+        "[sync] include must take node_modules/patched back out of the exclude"
     );
     // Secrets hygiene: the workspace tree is sealed at the top. (The project
     // dir itself follows local perms — rsync --perms — but nobody can

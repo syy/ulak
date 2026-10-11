@@ -18,8 +18,8 @@ defaults
 ```
 
 Later wins, field by field. **Lists replace, they do not merge** — on
-every layer, the environment included. Setting `ULAK_SYNC_INCLUDE` means
-you carry `.env` yourself if you still want it.
+every layer, the environment included. Setting `ULAK_SYNC_INCLUDE` replaces
+the default `.env` entry too.
 
 An **empty variable is an unset one**: `ULAK_HOST=""` leaves whatever the
 files decided, so `ULAK_HOST=${MAYBE_UNSET}` in a pipeline degrades
