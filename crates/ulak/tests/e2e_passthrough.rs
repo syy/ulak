@@ -56,7 +56,8 @@ fn phase3_passthrough_identity_audit() {
     let ws2 = chain.link(|| same_name_projects_do_not_collide(&server, &identity));
     chain.finish();
 
-    // Teardown: both stacks down, images gone, workspaces gone.
+    // Teardown: both stacks and their built images down, workspaces gone.
+    // Base images are shared prerequisites and stay put.
     ws.ulak(&server)
         .args(["docker", "compose", "down", "-v", "--rmi", "local"])
         .assert()
@@ -72,10 +73,6 @@ fn phase3_passthrough_identity_audit() {
         {
             server.ssh(&format!("rm -rf {hash_dir}"));
         }
-    }
-    if server.is_real_host() {
-        // Leave the expendable server as we found it.
-        server.ssh("docker rmi nginx:alpine alpine:3.20 >/dev/null 2>&1; true");
     }
 }
 

@@ -61,10 +61,23 @@ fn an_image_reaches_the_server_from_this_machine_and_not_from_a_registry() {
 
     // And a real, layered image survives the same trip and can still run
     // a container, which a broken save/load would fail at and nowhere
-    // earlier.
-    server.ssh(&format!("docker image rm -f {SEEDABLE} >/dev/null 2>&1"));
-    server.needs_image(SEEDABLE);
-    let ran = server.ssh(&format!("docker run --rm {SEEDABLE} true"));
+    // earlier. Under a tag of its own: removing the base image from the
+    // server to force the trip would take it from every other binary
+    // building on it, and replace it with this machine's copy.
+    let layered = format!("ulak-e2e-layered-{}:test", std::process::id());
+    assert!(
+        Command::new("docker")
+            .args(["tag", SEEDABLE, &layered])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "could not tag this machine's {SEEDABLE}; if it has none:  docker pull {SEEDABLE}"
+    );
+    let _layered = Cleanup {
+        server: &server,
+        image: layered.clone(),
+    };
+    server.needs_image(&layered);
+    let ran = server.ssh(&format!("docker run --rm {layered} true"));
     assert!(
         ran.status.success(),
         "the seeded image cannot run a container:\n{}",
@@ -166,7 +179,9 @@ fn build_here(tag: &str) {
     );
 }
 
-/// The probe image is this test's litter on both daemons.
+/// A probe tag is this test's litter on both daemons. Removing it by
+/// tag never takes the base image along: where the two share an image,
+/// only the tag goes.
 struct Cleanup<'a> {
     server: &'a TestServer,
     image: String,

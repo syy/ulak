@@ -230,6 +230,8 @@ fn exec(server: &TestServer, ws: &Workspace, script: &str) -> String {
     )
 }
 
+/// The stack, its built images and the workspace go; base images are
+/// shared prerequisites and stay put.
 fn teardown(server: &TestServer, ws: &Workspace, workspace: &str) {
     ws.ulak(server)
         .args([
@@ -249,7 +251,4 @@ fn teardown(server: &TestServer, ws: &Workspace, workspace: &str) {
         .unwrap_or_else(|| workspace.to_string());
     server.ssh(&format!("rm -rf {hash_dir}"));
     ws.forget_on_server(server);
-    if server.is_real_host() {
-        server.ssh("docker rmi alpine:3.20 >/dev/null 2>&1; true");
-    }
 }

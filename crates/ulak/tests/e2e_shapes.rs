@@ -196,8 +196,7 @@ fn remote_find(server: &TestServer, ws: &Workspace, name: &str, action: &str) ->
 }
 
 /// Removes this test's workspaces on the failure path too; see
-/// `Teardown`, which also stops a stack and drops an image this scenario
-/// never touches.
+/// `Teardown`, which also stops a stack this scenario never starts.
 struct Forget<'a> {
     server: &'a TestServer,
     ws: &'a Workspace,
@@ -624,11 +623,8 @@ impl Drop for Teardown<'_> {
         // Reads the ids locally and removes each workspace by id, so it
         // needs no sync and cannot panic — the old teardown located the
         // remote directory by SYNCING first, which is the one thing that
-        // must not happen while a test is already unwinding.
+        // must not happen while a test is already unwinding. Base images
+        // are shared prerequisites and stay put.
         self.ws.forget_on_server(self.server);
-        if self.server.is_real_host() {
-            self.server
-                .ssh_quiet("docker rmi nginx:alpine >/dev/null 2>&1; true");
-        }
     }
 }
