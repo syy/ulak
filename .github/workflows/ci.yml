@@ -9,8 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Lint + full test run including e2e against the dockerized sshd fixture.
-  # ubuntu runners allow --privileged, which the DinD fixture needs.
+  # Lint and the unit tests. The e2e suite runs in the `e2e` jobs below.
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +29,37 @@ jobs:
           cargo package -p ulak --locked --no-verify
           tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-MIT$'
           tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-APACHE$'
+      # The agent is for `bake::tests::with_a_real_buildx`, not for ssh:
+      # Buildx resolves `ssh = ["default"]` for an ssh-style git context
+      # even when only asked to --print, so a runner without one gets a
+      # diagnostic where the recorded fixture has a plan. No keys are
+      # loaded, and none are needed.
+      - name: Tests (e2e skipped)
+        run: |
+          eval "$(ssh-agent -s)"
+          cargo test --workspace
+        env:
+          ULAK_TEST_E2E: skip
+
+  # The e2e suite against the dockerized sshd fixture, in three jobs that
+  # run side by side once `linux` has passed: in one job it took about 14
+  # minutes. Groups 1 and 2 name the slowest targets, about 5 minutes
+  # each; group 3 runs every other e2e target, so a new one is never left
+  # out. ubuntu runners allow --privileged, which the DinD fixture needs.
+  e2e:
+    needs: linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3]
+    env:
+      E2E_GROUP_1: e2e_service e2e_bake e2e_composepaths e2e_seed e2e_agent e2e_smoke
+      E2E_GROUP_2: e2e_flags e2e_passthrough e2e_sync e2e_deadline e2e_docker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # The e2e harness never pulls (see `needs_image`): it hands the
       # server a copy from THIS machine's daemon, so the suite cannot go
       # red on Docker Hub's per-IP anonymous limit halfway through a run.
@@ -43,15 +73,28 @@ jobs:
           for image in alpine:3.20 nginx:alpine busybox redis:7.2 registry:2 docker/buildkit-syft-scanner:stable-1; do
             docker pull "$image"
           done
-      # The agent is for `bake::tests::with_a_real_buildx`, not for ssh:
-      # Buildx resolves `ssh = ["default"]` for an ssh-style git context
-      # even when only asked to --print, so a runner without one gets a
-      # diagnostic where the recorded fixture has a plan. No keys are
-      # loaded, and none are needed.
-      - name: Tests (unit + e2e via dockerized sshd)
+      # --no-fail-fast: a red target must not hide the ones after it. A run
+      # that stopped at the first failure once never reached five targets,
+      # and nothing said so.
+      - name: Tests (e2e group ${{ matrix.group }} via dockerized sshd)
         run: |
+          all=$(ls crates/ulak/tests/e2e_*.rs | xargs -n1 basename | sed 's/\.rs$//' | sort)
+          named=$(printf '%s\n' $E2E_GROUP_1 $E2E_GROUP_2 | sort)
+          for t in $named; do
+            [ -f "crates/ulak/tests/$t.rs" ] || { echo "::error::$t is named in ci.yml but crates/ulak/tests/$t.rs does not exist"; exit 1; }
+          done
+          twice=$(printf '%s\n' "$named" | uniq -d)
+          [ -z "$twice" ] || { echo "::error::named in two e2e groups: $twice"; exit 1; }
+          case "${{ matrix.group }}" in
+            1) mine=$E2E_GROUP_1 ;;
+            2) mine=$E2E_GROUP_2 ;;
+            3) mine=$(comm -23 <(echo "$all") <(echo "$named")) ;;
+          esac
+          [ -n "$mine" ] || { echo "::error::e2e group ${{ matrix.group }} has no targets"; exit 1; }
+          echo "targets: $(echo $mine)"
+          # The agent the e2e targets ran under when they shared one job.
           eval "$(ssh-agent -s)"
-          ULAK_TEST_E2E_HUB=block cargo test --workspace
+          ULAK_TEST_E2E_HUB=block cargo test --no-fail-fast $(printf -- '--test %s ' $mine)
 
   # macOS runners have no docker daemon, so the e2e fixture is skipped.
   # The unit tests still run in full, Buildx included: `bake --print`
