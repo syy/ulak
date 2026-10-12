@@ -119,9 +119,6 @@ the local copy replaces a differing server copy, with a warning.** Set it to
 [synchronization guide](https://github.com/syy/ulak/blob/main/docs/synchronization.md)
 for conflict resolution, deletion rules and transfer limits.
 
-Ulak follows `.gitignore`. Use `[sync] include` for required ignored paths and
-`[sync] protect` for server-owned data.
-
 ## Docker commands
 
 Put `ulak` before a supported Docker command:
@@ -198,7 +195,14 @@ protect = ["data/", "uploads/"]
 max_delete = 25
 ```
 
-`.env` is included by default. Setting `include` replaces that default.
+Paths in `[sync]` are relative to the Compose project directory, even when
+the stack mounts something outside it; use `../web/uploads/` for a sibling
+folder. A pattern without a slash, such as `node_modules`, matches at any
+depth in every folder that travels.
+
+`[sync] include` sends paths an exclude or a `.dockerignore` would drop. It
+defaults to `.env`; setting it replaces that default. To keep `.env` local,
+exclude it and leave it out of `include`.
 
 ### Protect server-owned data
 

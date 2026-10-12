@@ -627,20 +627,41 @@ pub struct Beat {
     pub updated_unix: u64,
 }
 
+/// The build this process was started from: read ONCE, when the service
+/// starts, and handed to every `beat`.
+///
+/// Read on every beat instead, both halves followed the file on disk
+/// after a `cargo install` replaced it. On macOS the path stayed and the
+/// mtime became the NEW build's, so `drift` compared the new build with
+/// itself. On Linux `current_exe` reads `/proc/self/exe`, which names a
+/// replaced binary `<path> (deleted)` — a path no client's own ever
+/// equals. Either way a service still running the old code never said so.
+pub struct Build {
+    exe: String,
+    mtime_unix: u64,
+}
+
+pub fn own_build() -> Build {
+    let exe = std::env::current_exe().unwrap_or_default();
+    Build {
+        exe: exe.to_string_lossy().into_owned(),
+        mtime_unix: mtime_of(&exe),
+    }
+}
+
 /// Written by the service and by nobody else — the same one-writer rule
 /// the intent files use, so there is no lock here either.
-pub fn beat(started_unix: u64) {
+pub fn beat(started_unix: u64, build: &Build) {
     let Some(path) = beat_path() else { return };
     if let Some(parent) = path.parent() {
         let _ = invocation::private_dir(parent);
     }
-    let exe = std::env::current_exe().unwrap_or_default();
     let value = Beat {
         schema: SCHEMA,
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        exe: exe.to_string_lossy().into_owned(),
-        exe_mtime_unix: mtime_of(&exe),
+        exe: build.exe.clone(),
+        exe_mtime_unix: build.mtime_unix,
         started_unix,
         updated_unix: crate::intent::now_unix(),
     };
@@ -1251,6 +1272,24 @@ mod tests {
         assert_eq!(liveness(&beat, 1000 + STALE + 1, true), Alive::Wedged);
         // The pid belongs to somebody else now: not our process at all.
         assert_eq!(liveness(&beat, 1005, false), Alive::No);
+    }
+
+    /// The beat carries the build the service STARTED from. Re-reading the
+    /// file on disk every beat would hide a `cargo install` from `drift`
+    /// after the very next beat.
+    #[test]
+    fn the_beat_keeps_the_build_the_service_started_from() {
+        let mut started_from = own_build();
+        started_from.mtime_unix = 100;
+        beat(1000, &started_from);
+        let written = read_beat().expect("the beat was just written");
+        assert_eq!(written.exe_mtime_unix, 100);
+        assert_eq!(written.started_unix, 1000);
+        assert_eq!(written.exe, started_from.exe);
+        assert!(
+            drift(&written).is_some(),
+            "a service started from an older build of this exe must be named"
+        );
     }
 
     #[test]

@@ -6,10 +6,11 @@ This guide covers conflicts, deletion decisions and transfer limitations.
 ## Selection and transfer
 
 For Compose projects, Ulak synchronizes the paths referenced by the server's
-resolved Compose model, including sibling directories. `.gitignore` applies;
-`[sync] include` adds required ignored paths, and `[sync] protect` excludes
-server-owned data from uploads, downloads and deletion. Absolute paths and
-paths under `~` in Compose belong to the server.
+resolved Compose model, including sibling directories. A build context is
+narrowed by its `.dockerignore`. `[sync] exclude` keeps paths local,
+`[sync] include` sends paths an exclude or a `.dockerignore` would drop, and
+`[sync] protect` excludes server-owned data from uploads, downloads and
+deletion. Absolute paths and paths under `~` in Compose belong to the server.
 
 Small changes travel over a persistent SSH connection. Larger files and new
 directories use rsync. On Linux servers with Python 3.9 or later, server changes

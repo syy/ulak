@@ -18,6 +18,7 @@
 //! bare retry cannot be assumed to rediscover nonstandard files.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -242,7 +243,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     // ─── COMPOSE FOOTPRINT ──────────────────────────────────────────
     // Resolving comes BEFORE the pre-flight push: the footprint is what
     // decides which paths the push may even touch.
-    let footprint = match footprint::resolve(&project, &ssh) {
+    let mut footprint = match footprint::resolve(&project, &ssh) {
         Ok((fp, _)) => fp,
         Err(e) => {
             println!("\n{}COMPOSE MODEL{}", s.bold, s.off);
@@ -253,7 +254,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     };
     // Before the pre-flight push, because the push writes the
     // manifest and the manifest carries the identity.
-    project.adopt(&footprint);
+    project.adopt(&mut footprint);
     let (_, deletions_pending) = sync::push_no_delete(&project, &footprint, &ssh)?;
     let recorded = crate::invocation::pending_deletions(&project.state_key(&dest));
     if recorded > 0 {
@@ -295,22 +296,34 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     );
     let outcome = classify(
         &footprint,
-        &project.config.sync.protect,
+        &project.inv.project_dir,
+        &project.sync_rules().protect,
         &swallowed,
         &existing,
     );
     for line in &outcome.rows {
         println!("{line}");
     }
+    // The table speaks from the anchor; every sentence that sends somebody
+    // to ulak.toml names paths the way it reads them, from the project.
+    let as_written = |p: &str| walk::as_written(&project.inv.project_dir, &footprint.anchor, p);
 
     if !outcome.writable_shared.is_empty() {
         println!();
         ui::warn(&format!(
             "the container can write into path(s) that also hold YOUR files: {} — anything it creates there is removed by the next sync with deletions",
-            outcome.writable_shared.join(", ")
+            outcome
+                .writable_shared
+                .iter()
+                .map(|p| as_written(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
+        // Only an empty, absent or excluded directory reads as the
+        // container's own; one whose files came home from the server
+        // looks like this, so both answers are given.
         ui::dim(
-            "protect only the sub-path the container owns (e.g. a data/ inside it) — protecting the whole mount would stop your edits reaching the server",
+            "if the container owns all of it (a database's data directory), protect it whole; otherwise protect only the sub-path the container owns (e.g. a data/ inside it) — protecting your own files would stop your edits reaching the server",
         );
     }
     if !outcome.unprotected_writable.is_empty() {
@@ -325,11 +338,12 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
         if !protectable.is_empty() {
             let mut merged: Vec<String> = project.config.sync.protect.to_vec();
             for p in &protectable {
+                let written = as_written(p);
                 let entry =
                     if footprint.anchor.join(p).is_dir() || !footprint.anchor.join(p).exists() {
-                        format!("{p}/")
+                        format!("{written}/")
                     } else {
-                        (*p).clone()
+                        written
                     };
                 merged.push(entry);
             }
@@ -337,7 +351,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
                 "writable bind mount(s) without protect: {} — the next sync with deletions could remove what containers wrote there",
                 protectable
                     .iter()
-                    .map(|s| s.as_str())
+                    .map(|p| as_written(p))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -356,13 +370,15 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
 
     if !outcome.ignored.is_empty() {
         println!();
+        // Spelled the way the protect/include it suggests has to be.
+        let written: Vec<String> = outcome.ignored.iter().map(|p| as_written(p)).collect();
         let err = fail!(
             "{} referenced path(s) are excluded from the sync, so the server would only get an EMPTY directory: {}",
             outcome.ignored.len(),
-            outcome.ignored.join(", ")
+            written.join(", ")
         )
         .now("if the container OWNS that data (a database dir), say so: protect = [\"<path>/\"] in ulak.toml")
-        .now("if the app needs the files, force them through: include = [\"<path>/**\"]")
+        .now("if the app needs the files, drop the [sync] exclude that matches them, or force them through: include = [\"<path>/**\"]")
         .into_err();
         ui::render_error(&err);
         problems.push(format!(
@@ -928,13 +944,12 @@ fn check_server_side(
 /// problem now.
 fn ignored_entries(project: &Project, fp: &Footprint) -> Vec<String> {
     let build = fp.build_filter();
+    let rules = project.sync_rules();
     let mut out: Vec<String> = fp
         .entries
         .iter()
         .filter(|e| e.exists)
-        .filter(|e| {
-            walk::is_ignored(&fp.anchor, &e.local, &project.config.sync, &build).unwrap_or(false)
-        })
+        .filter(|e| walk::is_ignored(&fp.anchor, &e.local, &rules, &build).unwrap_or(false))
         .filter_map(|e| crate::invocation::anchor_rel(&fp.anchor, &e.local))
         .collect();
     out.sort();
@@ -962,6 +977,7 @@ struct Classified {
 
 fn classify(
     fp: &Footprint,
+    project_dir: &Path,
     protect: &[String],
     swallowed: &[String],
     existing: &BTreeMap<String, bool>,
@@ -978,10 +994,7 @@ fn classify(
         let Some(rel) = crate::invocation::anchor_rel(&fp.anchor, &e.local) else {
             continue;
         };
-        let protected = protect.iter().any(|p| {
-            let p = p.trim_start_matches("./").trim_end_matches('/');
-            !p.is_empty() && (rel == p || rel.starts_with(&format!("{p}/")))
-        });
+        let protected = walk::protected(protect, &rel);
         let swallowed_here = swallowed.contains(&rel);
         if swallowed_here && !protected {
             ignored.push(rel.clone());
@@ -991,10 +1004,17 @@ fn classify(
         // tracks (supabase's roles.sql — seen for real) would stop it
         // being pushed and break the stack. Only a DIRECTORY that holds
         // nothing of ours is a real candidate: empty, absent, or
-        // already ignored by git.
+        // already excluded from the sync.
+        //
+        // The project directory itself — `.` from where ulak.toml is read,
+        // whatever the anchor — can never be protected whole, and is
+        // named that way however wide a sibling's profile made the anchor.
         if e.writable && !protected {
             let container_owned = e.is_dir && (!e.exists || e.empty || swallowed_here);
-            if container_owned || rel == "." {
+            let whole_project = project_dir.starts_with(&e.local);
+            if whole_project {
+                unprotected_writable.push(".".to_string());
+            } else if container_owned {
                 unprotected_writable.push(rel.clone());
             } else {
                 writable_shared.push(rel.clone());
@@ -1198,7 +1218,7 @@ mod tests {
             ("/etc/localtime".to_string(), true),
             ("/opt/certs".to_string(), false),
         ]);
-        let out = classify(&f, &[], &[], &existing);
+        let out = classify(&f, Path::new("/m"), &[], &[], &existing);
         insta::assert_snapshot!(out.rows.join("\n"));
         assert_eq!(out.missing_server, 1);
         assert_eq!(
@@ -1233,10 +1253,27 @@ mod tests {
             pinned: vec![],
             model_json: String::new(),
         };
-        let out = classify(&f, &[], &[], &BTreeMap::new());
+        let out = classify(&f, Path::new("/m"), &[], &[], &BTreeMap::new());
         assert_eq!(out.missing_server, 0);
         assert!(out.rows.iter().all(|row| row.contains("SYNC")));
         assert_eq!(out.unprotected_writable, vec!["."]);
+    }
+
+    /// A profile that mounts a sibling widens the anchor above the
+    /// project; a writable mount of the project itself is still the whole
+    /// project, named `.`, and never a protect candidate spelled `/`.
+    #[test]
+    fn the_whole_project_stays_the_whole_project_under_a_wider_anchor() {
+        let f = fp(
+            vec![
+                entry("app", Why::Volume, "repo", true, true),
+                entry("web", Why::Volume, "web", false, true),
+            ],
+            vec![],
+        );
+        let out = classify(&f, Path::new("/m/repo"), &[], &[], &BTreeMap::new());
+        assert_eq!(out.unprotected_writable, vec!["."]);
+        assert!(out.writable_shared.is_empty());
     }
 
     #[test]
@@ -1245,7 +1282,13 @@ mod tests {
             vec![entry("db", Why::Volume, "data/pg", true, true)],
             vec![],
         );
-        let out = classify(&f, &["data/".to_string()], &[], &BTreeMap::new());
+        let out = classify(
+            &f,
+            Path::new("/m"),
+            &["data/".to_string()],
+            &[],
+            &BTreeMap::new(),
+        );
         assert!(out.unprotected_writable.is_empty());
         assert!(out.writable_shared.is_empty());
         assert!(out.rows[0].contains("protected"));
@@ -1260,7 +1303,7 @@ mod tests {
             vec![entry("db", Why::Volume, "volumes/db/roles.sql", true, true)],
             vec![],
         );
-        let out = classify(&f, &[], &[], &BTreeMap::new());
+        let out = classify(&f, Path::new("/m"), &[], &[], &BTreeMap::new());
         assert!(
             out.unprotected_writable.is_empty(),
             "a tracked FILE must never be suggested for protect"
@@ -1273,21 +1316,33 @@ mod tests {
         // sync normalizes "./data/" — doctor must agree (was a
         // confirmed divergence).
         let f = fp(vec![entry("db", Why::Volume, "data", true, true)], vec![]);
-        let out = classify(&f, &["./data/".to_string()], &[], &BTreeMap::new());
+        let out = classify(
+            &f,
+            Path::new("/m"),
+            &["./data/".to_string()],
+            &[],
+            &BTreeMap::new(),
+        );
         assert!(out.unprotected_writable.is_empty());
         assert!(out.rows[0].contains("protected"));
     }
 
     #[test]
     fn a_reference_the_ignores_swallow_is_reported_not_hidden() {
-        // The prototype's silence: compose mounts ./cache, .gitignore
+        // The prototype's silence: compose mounts ./cache, an exclude
         // hides it, the server grows an empty directory and nobody says
         // a word.
         let f = fp(
             vec![entry("app", Why::Volume, "cache", false, true)],
             vec![],
         );
-        let out = classify(&f, &[], &["cache".to_string()], &BTreeMap::new());
+        let out = classify(
+            &f,
+            Path::new("/m"),
+            &[],
+            &["cache".to_string()],
+            &BTreeMap::new(),
+        );
         assert_eq!(out.ignored, vec!["cache"]);
         assert!(out.rows[0].contains("IGNORED"), "{:?}", out.rows);
 
@@ -1295,6 +1350,7 @@ mod tests {
         // exactly what protect MEANS.
         let out = classify(
             &f,
+            Path::new("/m"),
             &["cache/".to_string()],
             &["cache".to_string()],
             &BTreeMap::new(),

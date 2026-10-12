@@ -100,7 +100,8 @@ impl Why {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub local: PathBuf,
-    /// Directories travel whole (minus gitignore/exclude); files alone.
+    /// Directories travel whole (minus `[sync] exclude`, and what a
+    /// build-only path's `.dockerignore` drops); files alone.
     pub is_dir: bool,
     /// False when compose named a path that is not there locally.
     pub exists: bool,
@@ -127,7 +128,8 @@ pub struct ServerRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Footprint {
-    /// Deepest directory containing every entry. Determines LAYOUT only:
+    /// Deepest directory containing every entry, or the wider one the
+    /// workspace already records (`settle_anchor`). Determines LAYOUT only:
     /// the workspace reproduces `entry - anchor`, never the anchor's tree.
     pub anchor: PathBuf,
     pub entries: Vec<Entry>,
@@ -200,6 +202,26 @@ impl Footprint {
             .filter(|d| !dirs.iter().any(|o| *o != **d && d.starts_with(o)))
             .cloned()
             .collect()
+    }
+
+    /// Lay this footprint out under the anchor the workspace already
+    /// uses, when that one is wider than the anchor the model gave.
+    ///
+    /// The model only names what the ACTIVE profiles reach, so one
+    /// compose file computes different anchors per invocation: a profile
+    /// that mounts a sibling (`../other`) anchors one level up, another
+    /// that stays inside the project does not. Same workspace id, so the
+    /// narrower run met the wider server layout and was told to run
+    /// again — and the rerun computed the same narrow anchor, because
+    /// nothing on this path read the anchor `ensure_workspace` had just
+    /// written down. `docker build`/`run` widen through the same record
+    /// before they build their footprint; this is the compose half.
+    pub fn settle_anchor(&mut self, workspace_id: &str) {
+        let anchor = crate::invocation::workspace_anchor(workspace_id, self.anchor.clone());
+        if anchor != self.anchor {
+            self.whole_anchor = self.entries.iter().any(|e| e.is_dir && e.local == anchor);
+            self.anchor = anchor;
+        }
     }
 
     /// What each build context's `.dockerignore` narrows away, and what
@@ -1200,6 +1222,40 @@ mod tests {
             pinned: vec![],
             model_json: String::new(),
         }
+    }
+
+    /// A profile that stays inside the project, run after one that
+    /// reached a sibling, must keep the wider layout the server holds —
+    /// otherwise `ensure_workspace` refuses it on every run, the rerun it
+    /// asks for included.
+    #[test]
+    fn a_narrower_model_widens_to_the_recorded_anchor() {
+        let workspace = crate::config::WorkspaceKey::from_namespace(
+            "footprint-anchor-tests",
+            Path::new("/w/repo/compose.yaml"),
+        )
+        .unwrap();
+        crate::invocation::forget_workspace(workspace.id());
+
+        let mut first = fp("/w/repo", vec![entry("/w/repo", true)]);
+        first.settle_anchor(workspace.id());
+        assert_eq!(
+            first.anchor,
+            PathBuf::from("/w/repo"),
+            "nothing recorded yet"
+        );
+        assert!(first.whole_anchor);
+
+        crate::invocation::record_anchor(workspace.id(), Path::new("/w"));
+        let mut narrow = fp("/w/repo", vec![entry("/w/repo", true)]);
+        narrow.settle_anchor(workspace.id());
+        assert_eq!(narrow.anchor, PathBuf::from("/w"));
+        assert!(
+            !narrow.whole_anchor,
+            "the project dir is one entry under the wider anchor, not all of it"
+        );
+
+        crate::invocation::forget_workspace(workspace.id());
     }
 
     #[test]

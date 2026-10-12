@@ -371,9 +371,9 @@ pub fn forget(key: &WorkspaceStateKey) {
 /// that are no longer on disk at all.
 ///
 /// "No longer on disk" is stricter than "no longer synced" on purpose.
-/// Newly EXCLUDED files (someone gitignored a directory) stay on the
-/// server: a container may be using them, and the promise has always
-/// been that excluding is not deleting.
+/// Newly EXCLUDED files (someone added a directory to `[sync] exclude`)
+/// stay on the server: a container may be using them, and the promise
+/// has always been that excluding is not deleting.
 ///
 /// Only rows filed under `anchor` are even asked the question. A row
 /// written from a different anchor spells a different local path, so
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn a_newly_excluded_file_is_not_deleted() {
-        // It is still on disk — the user gitignored it, they did not
+        // It is still on disk — the user excluded it, they did not
         // delete it, and a container may be reading it.
         let tmp = tempfile::tempdir().unwrap();
         let anchor = tmp.path();

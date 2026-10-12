@@ -86,7 +86,11 @@ fn write_project_layer(root: &Path, host: Option<&str>) -> Result<()> {
 #namespace = \"alice-laptop\"
 
 [sync]
-# Extra ignore patterns on top of .gitignore (gitignore syntax).
+# Paths here are relative to this compose project's folder; ../ reaches
+# a sibling folder the stack mounts. A pattern with no slash (node_modules)
+# matches at any depth, in every folder that travels.
+
+# Paths to keep off the server (gitignore syntax).
 # Excluded paths are never pushed AND never deleted on the server — a
 # container may have created them there (e.g. node_modules built
 # remotely). To reset the workspace wholesale: ulak clean.
@@ -97,7 +101,7 @@ fn write_project_layer(root: &Path, host: Option<&str>) -> Result<()> {
 # files unprotected to copy them back. `ulak doctor` suggests candidates.
 #protect = [\"data/\", \"uploads/\"]
 
-# Files compose needs on the server even though .gitignore hides them.
+# Paths that travel even where an exclude or a .dockerignore drops them.
 #include = [\".env\"]          # already the default
 
 # Server-side deletions one sync may perform without asking.
@@ -216,7 +220,7 @@ fn write_global_layer(path: &Path) -> Result<bool> {
 #namespace = \"alice-laptop\"
 
 [sync]
-# Extra ignore patterns on top of .gitignore, for every project.
+# Paths to keep off the server (gitignore syntax), for every project.
 #exclude = [\"node_modules\", \".venv\", \"target\"]
 
 # Server-side deletions one sync may perform without asking.

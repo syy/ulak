@@ -667,7 +667,11 @@ fn clean_remote(globals: &[String]) -> Result<ExitCode> {
     }
 
     // Resist when protect paths exist: they are server-owned DATA.
-    let protect = &project.config.sync.protect;
+    // Spelled from the layout the server holds, which no model was
+    // resolved here to say: the one this machine last recorded.
+    let laid_out = crate::invocation::workspace_anchor(workspace_id, project.anchor.clone());
+    let protect =
+        crate::walk::rebase(&project.config.sync, &project.inv.project_dir, &laid_out).protect;
     if !protect.is_empty() {
         ui::warn(&format!(
             "protect paths live only on the server and will be DELETED with the workspace: {}",

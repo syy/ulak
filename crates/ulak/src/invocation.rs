@@ -829,6 +829,9 @@ pub fn record_anchor(workspace_id: &str, anchor: &Path) {
 /// the project anchors it ABOVE the root — while `run`, `create` and
 /// `bake` anchor AT the root. They share a workspace id (all four hash
 /// the root), hence one remote directory, one manifest and one ledger.
+/// A Compose model does the same per profile: the model names only
+/// what the active profiles reach, so a profile that mounts a sibling
+/// anchors a level above one that stays inside the project.
 ///
 /// Left alone, the two spellings alternate, and `ensure_workspace`
 /// answers every change of anchor by laying the workspace out again:

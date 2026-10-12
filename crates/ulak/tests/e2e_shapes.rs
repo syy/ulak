@@ -8,7 +8,7 @@
 //! Shapes 2+3 need a stack RUNNING to prove where its mounts point, and
 //! they are one test for that reason: bringing the stack up and then
 //! generating a file into it from inside the container is one story told
-//! in two halves. Shapes 4 and 5 need no container at all — they ask
+//! in two halves. Shapes 4, 5 and 6 need no container at all — they ask
 //! `doctor` and `sync` where a path belongs — and they are their own
 //! tests because they were the ones being lost: under a single
 //! orchestrating `#[test]`, a stack that would not come up (a missing
@@ -97,6 +97,115 @@ fn absolute_tilde_and_relative_paths_are_told_apart() {
         stack: false,
     };
     shape_escaping_paths(&server, &ws);
+}
+
+/// Shape 6: one compose file, two profiles, and only one of them reaches
+/// a sibling of the project. That profile lays the workspace out a level
+/// up; a later sync under the other computes the narrower anchor from
+/// its own model. It has to keep the server's wider layout on the first
+/// try — it used to be told to run again, on every run — and `[sync]`
+/// has to keep meaning the project: read from the wider root,
+/// `protect = ["data/"]` named a `data/` BESIDE the project and sent
+/// this one's. No container: `sync` is the whole question.
+#[test]
+fn a_profile_that_stays_inside_keeps_the_layout_and_rules_of_one_that_did_not() {
+    let Some(server) = TestServer::shared() else {
+        return;
+    };
+    let ws = Workspace::new();
+    ws.set_host(&server.alias);
+    let _forget = Forget {
+        server: &server,
+        ws: &ws,
+    };
+    ws.write(
+        "compose.yaml",
+        "services:\n  app:\n    image: alpine:3.20\n    profiles: [app]\n    volumes:\n      \
+         - ./src:/src:ro\n      - ./data:/data\n  web:\n    image: alpine:3.20\n    \
+         profiles: [web]\n    volumes:\n      - ./src:/src:ro\n      - ../web:/web:ro\n",
+    );
+    ws.write("ulak.toml", "[sync]\nprotect = [\"data/\"]\n");
+    ws.write("src/main.txt", "SRC-OK\n");
+    ws.write("data/db.txt", "LOCAL-COPY\n");
+    let web = ws.project.parent().expect("a parent").join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(web.join("index.html"), "WEB-OK\n").unwrap();
+    let sync = |profile: &str| {
+        ws.ulak(&server)
+            .args(["--profile", profile, "sync"])
+            .output()
+            .unwrap()
+    };
+
+    let wide = sync("web");
+    assert!(
+        wide.status.success(),
+        "the profile that reaches ../web did not sync:\n{}",
+        String::from_utf8_lossy(&wide.stderr)
+    );
+    assert_eq!(remote_bytes(&server, &ws, "index.html"), "WEB-OK\n");
+    let laid_out = remote_find(&server, &ws, "main.txt", "-print");
+
+    let narrow = sync("app");
+    assert!(
+        narrow.status.success(),
+        "the profile that stays inside the project was refused:\n{}",
+        String::from_utf8_lossy(&narrow.stderr)
+    );
+    assert_eq!(remote_bytes(&server, &ws, "main.txt"), "SRC-OK\n");
+    assert_eq!(
+        remote_find(&server, &ws, "main.txt", "-print"),
+        laid_out,
+        "the narrower profile moved the layout the server holds"
+    );
+    assert_eq!(
+        remote_bytes(&server, &ws, "db.txt"),
+        "",
+        "protect = [\"data/\"] let this project's data/ travel under the wider layout"
+    );
+}
+
+/// Every file of this name in the workspace's remote copy, concatenated.
+/// By name, not by path: which depth the layout puts it at is what the
+/// shapes above are about, and a missing file reads as "".
+fn remote_bytes(server: &TestServer, ws: &Workspace, name: &str) -> String {
+    remote_find(server, ws, name, "-exec cat {} +")
+}
+
+/// `find` over every workspace this test recorded, with `action` applied
+/// to each file of this name. An empty answer has to mean the file is not
+/// there — not that no workspace was recorded or that `find` failed.
+fn remote_find(server: &TestServer, ws: &Workspace, name: &str, action: &str) -> String {
+    let ids = ws.workspace_ids();
+    assert!(
+        !ids.is_empty(),
+        "no workspace recorded, so a missing {name} would prove nothing"
+    );
+    let mut out = String::new();
+    for id in ids {
+        let root = ws.remote_workspace_root(&id);
+        let found = server.ssh(&format!("find {root} -type f -name {name} {action}"));
+        assert!(
+            found.status.success(),
+            "find under {root} failed:\n{}",
+            String::from_utf8_lossy(&found.stderr)
+        );
+        out.push_str(&String::from_utf8_lossy(&found.stdout));
+    }
+    out
+}
+
+/// Removes this test's workspaces on the failure path too; see
+/// `Teardown`, which also stops a stack this scenario never starts.
+struct Forget<'a> {
+    server: &'a TestServer,
+    ws: &'a Workspace,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        self.ws.forget_on_server(self.server);
+    }
 }
 
 /// A monorepo: the stack is a few KB in one corner, the rest is bulk
@@ -514,11 +623,8 @@ impl Drop for Teardown<'_> {
         // Reads the ids locally and removes each workspace by id, so it
         // needs no sync and cannot panic — the old teardown located the
         // remote directory by SYNCING first, which is the one thing that
-        // must not happen while a test is already unwinding.
+        // must not happen while a test is already unwinding. Base images
+        // are shared prerequisites and stay put.
         self.ws.forget_on_server(self.server);
-        if self.server.is_real_host() {
-            self.server
-                .ssh_quiet("docker rmi nginx:alpine >/dev/null 2>&1; true");
-        }
     }
 }

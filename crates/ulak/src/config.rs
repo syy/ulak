@@ -248,7 +248,7 @@ pub struct WorkspaceCfg {
     pub namespace: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyncCfg {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
@@ -288,8 +288,12 @@ impl Default for Config {
             workspace: WorkspaceCfg::default(),
             sync: SyncCfg {
                 exclude: vec![],
-                // .env is usually gitignored but compose needs it on the
-                // server — force-included unless the user overrides.
+                // The project's own `.env` and every env file compose
+                // insists on are footprint entries, but an optional one —
+                // an `include:`d file's own `.env`, an `env_file` with
+                // `required: false` — is not, and a build context's
+                // `.dockerignore` usually lists `.env`. Kept unless the
+                // user overrides; it outranks an exclude like any include.
                 include: vec![".env".into()],
                 protect: vec![],
                 max_delete: DeleteBudget::Limit(25),
@@ -727,7 +731,9 @@ pub struct Project {
     /// Directory whose `ulak*.toml` were merged. Usually the
     /// project directory; for a monorepo it may be an ancestor.
     pub config_home: PathBuf,
-    /// Deepest common ancestor of everything that must reach the server.
+    /// Deepest common ancestor of everything that must reach the server,
+    /// or the wider anchor the workspace already records
+    /// (`Footprint::settle_anchor`, through `adopt`).
     /// The remote workspace reproduces layout relative to this, never its contents —
     /// what actually travels is the footprint (F2).
     pub anchor: PathBuf,
@@ -958,7 +964,11 @@ impl Project {
     /// DIFFERENT project". Measured on a real server by
     /// `e2e_doctor::a_file_doctor_pushed_can_still_be_retired`, on a
     /// fixture whose compose file names itself.
-    pub fn adopt(&mut self, fp: &crate::footprint::Footprint) {
+    ///
+    /// The footprint is widened to the workspace's recorded anchor first,
+    /// so the two agree on the widened one.
+    pub fn adopt(&mut self, fp: &mut crate::footprint::Footprint) {
+        fp.settle_anchor(self.workspace_id());
         self.anchor = fp.anchor.clone();
         self.identity = crate::compose::project_name(&self.inv, &fp.model_json);
     }
@@ -971,8 +981,17 @@ impl Project {
     /// identity would make it abandon the stack that is still running
     /// and start reporting on a different one. `Desired` pins that
     /// identity; only the anchor is allowed to follow the current model.
-    pub fn adopt_existing_stack(&mut self, fp: &crate::footprint::Footprint) {
+    pub fn adopt_existing_stack(&mut self, fp: &mut crate::footprint::Footprint) {
+        fp.settle_anchor(self.workspace_id());
         self.anchor = fp.anchor.clone();
+    }
+
+    /// `[sync]` read from the anchor this project is laid out under.
+    /// `config.sync` stays as written — relative to the project
+    /// directory — for anything that shows it or tells somebody what to
+    /// write; everything that decides what travels asks here.
+    pub fn sync_rules(&self) -> SyncCfg {
+        crate::walk::rebase(&self.config.sync, &self.inv.project_dir, &self.anchor)
     }
 
     /// Remote path of this workspace's manifest — SIBLING of the project
@@ -1014,10 +1033,10 @@ pub(crate) fn is_projectless(err: &anyhow::Error) -> bool {
 pub(crate) fn bind_located(mut project: Project) -> Result<Bound> {
     let dest = project.ssh_dest()?;
     let ssh = crate::ssh::Ssh::new(&dest)?;
-    let footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
+    let mut footprint = crate::footprint::resolve_cached(&project, &ssh, &dest)?;
     // The server's compose has now read the env files and the YAML, so
     // it can answer the three rungs argv never could.
-    project.adopt(&footprint);
+    project.adopt(&mut footprint);
     Ok(Bound {
         project,
         ssh,
@@ -1174,10 +1193,7 @@ pub(crate) fn resolve_layers_in(
     // pointing at /etc/ulak.toml would then move the anchor and re-lay
     // out the workspace on the server.
     let pointed = env_value(env, "ULAK_CONFIG");
-    let global_path = match pointed {
-        Some(raw) => Some(PathBuf::from(raw)),
-        None => global.map(Path::to_path_buf),
-    };
+    let global_path = global_layer_path_in(global.map(Path::to_path_buf), env);
 
     let planned = [
         (global_path, "global", true),
@@ -1383,6 +1399,24 @@ fn declared_workspace_uuid_in(env: &BTreeMap<String, String>) -> Result<Option<S
 /// the way out of a read-only checkout.
 pub(crate) fn env_var_for(key: &str) -> Option<&'static str> {
     ENV_VARS.iter().find(|v| v.key == Some(key)).map(|v| v.name)
+}
+
+/// The file the global layer is read from: `ULAK_CONFIG` when it names
+/// one, otherwise the default slot. `resolve_layers_in` makes the same
+/// choice through here, and so does a reader that only watches the
+/// layers for an edit (`service::config_stamps`).
+pub(crate) fn global_layer_path() -> Option<PathBuf> {
+    global_layer_path_in(global_config_path(), &std::env::vars().collect())
+}
+
+fn global_layer_path_in(
+    default: Option<PathBuf>,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    match env_value(env, "ULAK_CONFIG") {
+        Some(raw) => Some(PathBuf::from(raw)),
+        None => default,
+    }
 }
 
 /// An empty variable is an UNSET one, not an empty value. CI writes
@@ -2571,6 +2605,80 @@ mod tests {
         assert_eq!(p.inv.project_dir, repo.join("stack"));
         assert_eq!(p.name, "stack");
         assert_eq!(p.config.sync.max_delete, DeleteBudget::Limit(7));
+    }
+
+    /// A model that reaches less than the workspace already holds — a
+    /// profile that stays inside the project, after one that mounted a
+    /// sibling — is laid out under the recorded, wider anchor through
+    /// both doors, or `ensure_workspace` refuses it on every rerun. And
+    /// `[sync]` keeps meaning the project directory under that anchor.
+    #[test]
+    fn a_narrower_model_keeps_the_wider_layout_and_its_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        write(&repo.join("compose.yaml"), "services: {}\n");
+        write(
+            &repo.join(PROJECT_CONFIG),
+            "[sync]\nprotect = [\"data/\", \"../web/uploads/\"]\nexclude = [\"/secret.txt\"]\n",
+        );
+        let narrow = || crate::footprint::Footprint {
+            anchor: repo.clone(),
+            entries: Vec::new(),
+            server_refs: Vec::new(),
+            whole_anchor: false,
+            contexts: Vec::new(),
+            pinned: Vec::new(),
+            model_json: String::new(),
+        };
+        type Adopt = fn(&mut Project, &mut crate::footprint::Footprint);
+        let doors: [(&str, Adopt); 2] = [
+            ("adopt", Project::adopt),
+            ("adopt_existing_stack", Project::adopt_existing_stack),
+        ];
+
+        let workspace = load_at(&repo, None).unwrap().workspace_id().to_string();
+        crate::invocation::forget_workspace(&workspace);
+        for (door, adopt) in doors {
+            let mut project = load_at(&repo, None).unwrap();
+            adopt(&mut project, &mut narrow());
+            assert_eq!(project.anchor, repo, "{door}: nothing recorded yet");
+            assert_eq!(project.sync_rules().protect, ["data"], "{door}");
+        }
+
+        crate::invocation::record_anchor(&workspace, &root);
+        for (door, adopt) in doors {
+            let mut project = load_at(&repo, None).unwrap();
+            let mut fp = narrow();
+            adopt(&mut project, &mut fp);
+            assert_eq!(project.anchor, root, "{door}");
+            assert_eq!(
+                fp.anchor, root,
+                "{door}: the footprint lays out the same way"
+            );
+            let rules = project.sync_rules();
+            assert_eq!(rules.protect, ["repo/data", "web/uploads"], "{door}");
+            assert_eq!(rules.exclude, ["/repo/secret.txt", "!/repo/"], "{door}");
+            assert_eq!(project.config.sync.protect, ["data/", "../web/uploads/"]);
+        }
+        crate::invocation::forget_workspace(&workspace);
+    }
+
+    /// `ULAK_CONFIG` relocates the global layer for every reader, the one
+    /// that only watches the files included; an empty one relocates
+    /// nothing.
+    #[test]
+    fn the_global_layer_is_wherever_ulak_config_points() {
+        let default = Some(PathBuf::from("/home/me/.config/ulak/config.toml"));
+        assert_eq!(
+            global_layer_path_in(default.clone(), &env(&[("ULAK_CONFIG", "/etc/ulak.toml")])),
+            Some(PathBuf::from("/etc/ulak.toml"))
+        );
+        assert_eq!(
+            global_layer_path_in(default.clone(), &env(&[("ULAK_CONFIG", "")])),
+            default
+        );
+        assert_eq!(global_layer_path_in(default.clone(), &env(&[])), default);
     }
 
     #[test]
