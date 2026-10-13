@@ -267,31 +267,25 @@ fn uninstall_is_one_command_and_says_the_truth_either_way() {
 fn uninstall_closes_the_tunnels_the_service_owned() {
     let sb = Sandbox::new();
 
-    // A real ssh carrying the tunnel marker, held open by a ProxyCommand
-    // that does nothing but sleep: ssh waits for a banner that never
-    // comes, so it sits there without a packet leaving this machine.
+    // A process carrying the tunnel marker and nothing else: `sleep`,
+    // spelled in its argv as the ssh the service would have started. The
+    // sweep reads the command line through `ps`, never the binary, so
+    // that line is all it can see.
     //
-    // It used to sit on 192.0.2.1 (RFC 5737 TEST-NET-1) and that made the
-    // test a question about the network underneath it. A network that
-    // answers the unroutable address with "unreachable" instead of
-    // silence kills ssh at once; nothing has reaped it yet, so `ps` reads
-    // `[ssh] <defunct>`, the marker is gone with the argv, and the sweep
-    // correctly finds nothing to close. The failure then lands on
-    // `uninstall`, which did its job, and says the message is missing.
-    // CI fell into it on a run whose predecessor had passed.
+    // It used to be a real ssh — aimed at 192.0.2.1, later held open by a
+    // ProxyCommand — and both made the test a question about the machine
+    // underneath it: ssh inherits the runner's HOME, ssh config and shell,
+    // and any of them ending it early leaves a zombie whose `ps` line is
+    // `[ssh] <defunct>`. The sweep then correctly finds nothing to close,
+    // and the failure lands on `uninstall`, which did its job.
     //
     // The sweep only kills processes that still carry the marker — pids
     // are recycled, and a stale file must never become a weapon.
+    use std::os::unix::process::CommandExt;
     let mut orphan = common::ChildGuard(
-        Command::new("ssh")
-            .args([
-                "-o",
-                "SendEnv=ULAK_TUNNEL",
-                "-o",
-                "ProxyCommand=sleep 60",
-                "-N",
-                "stand-in-for-a-tunnel",
-            ])
+        Command::new("sleep")
+            .arg0("ssh -o SendEnv=ULAK_TUNNEL -N stand-in-for-a-tunnel")
+            .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -317,11 +311,24 @@ fn uninstall_closes_the_tunnels_the_service_owned() {
          about whether uninstall closes tunnels"
     );
 
-    sb.ulak()
-        .args(["service", "uninstall"])
-        .assert()
-        .success()
-        .stderr(predicates::str::contains("port tunnel"));
+    let out = sb.ulak().args(["service", "uninstall"]).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    if !said.contains("port tunnel") {
+        // How the stand-in ended is the diagnosis: SIGTERM means the
+        // sweep closed it and did not say so, anything else means it
+        // ended on its own and this run tested nothing.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut ended = orphan.0.try_wait().unwrap();
+        while ended.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            ended = orphan.0.try_wait().unwrap();
+        }
+        let ended = ended.map_or("is still running".to_string(), |s| format!("ended: {s}"));
+        panic!(
+            "uninstall did not report closing the tunnel (pid {pid}); the stand-in {ended}:\n{said}"
+        );
+    }
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while orphan.0.try_wait().unwrap().is_none() {
@@ -442,17 +449,30 @@ fn an_agent_pointing_at_a_binary_that_is_gone_is_named() {
     let moved = sb.ws.home.join("moved-ulak");
     std::fs::copy(assert_cmd::cargo::cargo_bin("ulak"), &moved).unwrap();
 
-    // Install FROM the copy, so the unit names the copy.
-    let ok = Command::new(&moved)
+    // Install FROM the copy, so the unit names the copy. A test on another
+    // thread that forks while the copy is being written holds its write
+    // descriptor until that child execs, and running the copy meanwhile
+    // fails with "text file busy". Measured on Linux under load: 11 of 100.
+    let mut install = Command::new(&moved);
+    install
         .current_dir(&sb.ws.project)
         .env("HOME", &sb.ws.home)
         .env("XDG_STATE_HOME", sb.ws.home.join(".local/state"))
         .env_remove("XDG_CONFIG_HOME")
-        .args(["service", "install", "--no-start"])
-        .status()
-        .expect("install from the copy")
-        .success();
-    assert!(ok);
+        .args(["service", "install", "--no-start"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match install.status() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break other.expect("install from the copy"),
+        }
+    };
+    assert!(status.success());
     std::fs::remove_file(&moved).unwrap();
 
     // doctor stops at "server not configured" here, but the LOCAL rows —
