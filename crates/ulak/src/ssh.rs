@@ -166,6 +166,19 @@ impl Ssh {
         Ok(second.into_output())
     }
 
+    /// The same handle, for readers that must never prompt.
+    ///
+    /// `ulak ui` owns the terminal in raw mode while its workers talk to
+    /// the server; an ssh that asked for a passphrase or a host-key
+    /// decision there would draw over the dashboard and wait for input
+    /// nobody can type. `BatchMode` turns that prompt into an honest
+    /// failure the dashboard can report, while a warm control master
+    /// still carries every connection with no authentication at all.
+    pub fn batch(mut self) -> Ssh {
+        self.identity.push("-oBatchMode=yes".into());
+        self
+    }
+
     /// One bounded question, asked once. No retry, no master surgery:
     /// the caller is the service, which runs on a cadence and has its
     /// own opinion about what a silence means — turning every failed

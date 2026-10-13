@@ -49,6 +49,9 @@ that header when its rationale changes. Modules below are in `crates/ulak/src/`.
 | Service, tunnels and persisted intent | `service.rs`, `agent.rs`, `forward.rs`, `intent.rs` |
 | Project scripts' Docker shim | `shim.rs` |
 | Audit records and user output | `audit.rs`, `ui.rs` |
+| Dashboard terminal and effects; state and input; drawing | `tui.rs`, `app.rs`, `view.rs` |
+| Dashboard server reads, streams, tasks and actions | `engine.rs`, `feed.rs`, `verbs.rs` |
+| ANSI in container output | `ansi.rs` |
 
 Compute each answer once, in its owner:
 

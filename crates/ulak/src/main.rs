@@ -1,4 +1,6 @@
 mod agent;
+mod ansi;
+mod app;
 mod audit;
 mod bake;
 mod baseline;
@@ -15,6 +17,8 @@ mod dirfd;
 mod docker;
 mod dockerignore;
 mod doctor;
+mod engine;
+mod feed;
 mod footprint;
 mod forward;
 mod hashcache;
@@ -37,7 +41,10 @@ mod ssh;
 mod stack;
 mod stream;
 mod sync;
+mod tui;
 mod ui;
+mod verbs;
+mod view;
 mod walk;
 
 use std::process::ExitCode;
@@ -140,6 +147,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         },
         Command::Config { json } => configcmd::run(&globals, json),
         Command::Status => commands::status(&globals),
+        Command::Ui => tui::run(&globals),
         Command::Clean { forget_destination } => {
             commands::clean(&globals, forget_destination.as_deref())
         }

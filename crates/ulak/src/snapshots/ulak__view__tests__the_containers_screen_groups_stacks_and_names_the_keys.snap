@@ -1,0 +1,28 @@
+---
+source: crates/ulak/src/view.rs
+expression: "render(&a, 110, 24)"
+---
+ ulak  demo → box  ● refreshing every few seconds
+  1 Containers 4   2 Images   3 Volumes   4 Networks   5 Ulak
+    NAME                                  STATUS               PORTS                  CPU           MEMORY
+▾ demo  2/2 running  this project
+  ● db-1                                  Up 3 min
+  ● web-1                                 Up 3 min
+▾ other  0/1 running
+  ○ api-1                                 Exited (0) 1 min ago
+▾ standalone  1/1 running
+  ● lonely                                Up 3 min
+
+
+
+
+╭ demo ──────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ stack    2/2 running  this project                                                                         │
+│ local    /work/demo                                                                                        │
+│ compose  -f compose.yaml                                                                                   │
+│ remote   ~/.ulak/workspaces/n/abc/demo                                                                     │
+│                                                                                                            │
+│                                                                                                            │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⏎ fold  l logs  u up  D down  S sync  s stop  r restart  / filter  tab next tab  : command  ? help  q quit

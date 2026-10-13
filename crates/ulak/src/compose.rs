@@ -210,11 +210,11 @@ pub fn remote_prefix(project: &Project) -> Result<String> {
     Ok(cmd)
 }
 
-const PROJECT_LABEL: &str = "com.docker.compose.project";
-const CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
-const WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
-const SERVICE_LABEL: &str = "com.docker.compose.service";
-const ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
+pub(crate) const PROJECT_LABEL: &str = "com.docker.compose.project";
+pub(crate) const CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+pub(crate) const WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+pub(crate) const SERVICE_LABEL: &str = "com.docker.compose.service";
+pub(crate) const ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
 
 pub type ContainerLabels = BTreeMap<String, String>;
 

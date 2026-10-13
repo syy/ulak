@@ -118,6 +118,15 @@ pub enum Command {
     /// Show workspace target, compose ps and disk usage in one round-trip
     Status,
 
+    /// Open the dashboard (beta): containers, images, volumes, networks and logs
+    ///
+    /// A full-screen view of the server's Docker, like Docker Desktop's
+    /// window, with the project you are in at the top. Start, stop,
+    /// restart, delete, follow logs, open a shell or a forwarded port —
+    /// destructive actions always ask first. Press ? inside for every key.
+    /// In beta: keys and layout may still change between releases.
+    Ui,
+
     /// Delete the remote workspace directory (refuses while a stack still uses it)
     Clean {
         /// Forget a destroyed server locally, without contacting it

@@ -1372,7 +1372,7 @@ pub fn help(path: &[&str]) -> anyhow::Result<String> {
         section("Management Commands", &families, &mut out);
         section("Commands", &rest, &mut out);
         out.push_str(
-            "\nUlak's own commands (init, doctor, sync, status, config, clean, service, shim, \
+            "\nUlak's own commands (init, doctor, sync, status, ui, config, clean, service, shim, \
              completions) live at the root:\n  ulak --help\n",
         );
     } else {
