@@ -8,9 +8,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A newer push to the same pull request makes the run in progress moot.
+# Pushes to main are keyed by commit, so each one keeps its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
-  # Lint and the unit tests. The e2e suite runs in the `e2e` jobs below.
-  linux:
+  # The quick checks the e2e jobs wait for, so a formatting slip does not
+  # spend five e2e runners. The unit tests run beside them in `linux`.
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -29,6 +36,14 @@ jobs:
           cargo package -p ulak --locked --no-verify
           tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-MIT$'
           tar tzf target/package/ulak-*.crate | grep -q 'LICENSE-APACHE$'
+
+  # The unit tests. The e2e suite runs in the `e2e` jobs below.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # The agent is for `bake::tests::with_a_real_buildx`, not for ssh:
       # Buildx resolves `ssh = ["default"]` for an ssh-style git context
       # even when only asked to --print, so a runner without one gets a
@@ -41,21 +56,25 @@ jobs:
         env:
           ULAK_TEST_E2E: skip
 
-  # The e2e suite against the dockerized sshd fixture, in three jobs that
-  # run side by side once `linux` has passed: in one job it took about 14
-  # minutes. Groups 1 and 2 name the slowest targets, about 5 minutes
-  # each; group 3 runs every other e2e target, so a new one is never left
-  # out. ubuntu runners allow --privileged, which the DinD fixture needs.
+  # The e2e suite against the dockerized sshd fixture, in five jobs that
+  # run side by side once `lint` has passed: its targets add up to about
+  # 16 minutes. e2e_service is a single test of about 200 s, a floor no
+  # split goes below, so group 1 runs it alone and groups 2-4 name targets
+  # adding up to about the same. Group 5 runs every other e2e target, so a
+  # new one is never left out; rebalance once it outgrows group 1. ubuntu
+  # runners allow --privileged, which the DinD fixture needs.
   e2e:
-    needs: linux
+    needs: lint
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4, 5]
     env:
-      E2E_GROUP_1: e2e_service e2e_bake e2e_composepaths e2e_seed e2e_agent e2e_smoke
-      E2E_GROUP_2: e2e_flags e2e_passthrough e2e_sync e2e_deadline e2e_docker
+      E2E_GROUP_1: e2e_service
+      E2E_GROUP_2: e2e_flags e2e_passthrough e2e_management_context
+      E2E_GROUP_3: e2e_bake e2e_deadline e2e_catalog e2e_context
+      E2E_GROUP_4: e2e_sync e2e_namespace e2e_bridge e2e_shapes e2e_composepaths
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +98,7 @@ jobs:
       - name: Tests (e2e group ${{ matrix.group }} via dockerized sshd)
         run: |
           all=$(ls crates/ulak/tests/e2e_*.rs | xargs -n1 basename | sed 's/\.rs$//' | sort)
-          named=$(printf '%s\n' $E2E_GROUP_1 $E2E_GROUP_2 | sort)
+          named=$(printf '%s\n' $E2E_GROUP_1 $E2E_GROUP_2 $E2E_GROUP_3 $E2E_GROUP_4 | sort)
           for t in $named; do
             [ -f "crates/ulak/tests/$t.rs" ] || { echo "::error::$t is named in ci.yml but crates/ulak/tests/$t.rs does not exist"; exit 1; }
           done
@@ -88,7 +107,9 @@ jobs:
           case "${{ matrix.group }}" in
             1) mine=$E2E_GROUP_1 ;;
             2) mine=$E2E_GROUP_2 ;;
-            3) mine=$(comm -23 <(echo "$all") <(echo "$named")) ;;
+            3) mine=$E2E_GROUP_3 ;;
+            4) mine=$E2E_GROUP_4 ;;
+            5) mine=$(comm -23 <(echo "$all") <(echo "$named")) ;;
           esac
           [ -n "$mine" ] || { echo "::error::e2e group ${{ matrix.group }} has no targets"; exit 1; }
           echo "targets: $(echo $mine)"
