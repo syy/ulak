@@ -49,6 +49,9 @@ that header when its rationale changes. Modules below are in `crates/ulak/src/`.
 | Service, tunnels and persisted intent | `service.rs`, `agent.rs`, `forward.rs`, `intent.rs` |
 | Project scripts' Docker shim | `shim.rs` |
 | Audit records and user output | `audit.rs`, `ui.rs` |
+| Dashboard terminal and effects; state and input; drawing | `tui.rs`, `app.rs`, `view.rs` |
+| Dashboard server reads, streams, tasks and actions | `engine.rs`, `feed.rs`, `verbs.rs` |
+| ANSI in container output | `ansi.rs` |
 
 Compute each answer once, in its owner:
 
@@ -114,6 +117,7 @@ Reports use stdout with `ui::style_stdout()`; other output uses stderr through
 |---|---|
 | `docs/docker-commands.md` | `ULAK_TEST_WRITE_MAP=1 cargo test --bins the_map_on_disk` |
 | `crates/ulak/src/snapshots/*.snap` | `cargo insta review` |
+| `docs/images/dashboard-*.svg` | `ULAK_TEST_WRITE_PICTURES=1 cargo test --bins the_pictures_on_disk` |
 | `.github/workflows/release.yml` | edit `dist-workspace.toml`, regenerate with dist |
 
 Never hand-edit generated files. Keep user-visible behaviour documented in

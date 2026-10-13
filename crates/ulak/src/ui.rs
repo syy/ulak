@@ -51,21 +51,33 @@ fn styled(on: bool) -> Style {
 }
 
 pub fn info(msg: &str) {
+    if hushed(Level::Info, msg) {
+        return;
+    }
     let s = style();
     eprintln!("{}==>{} {msg}", s.blue, s.off);
 }
 
 pub fn ok(msg: &str) {
+    if hushed(Level::Ok, msg) {
+        return;
+    }
     let s = style();
     eprintln!("{} ok {} {msg}", s.green, s.off);
 }
 
 pub fn warn(msg: &str) {
+    if hushed(Level::Warn, msg) {
+        return;
+    }
     let s = style();
     eprintln!("{}warning{} {msg}", s.yellow, s.off);
 }
 
 pub fn dim(msg: &str) {
+    if hushed(Level::Dim, msg) {
+        return;
+    }
     let s = style();
     eprintln!("{}    {msg}{}", s.dim, s.off);
 }
@@ -182,5 +194,75 @@ pub fn render_error(err: &anyhow::Error) {
                 s.bold, s.off
             );
         }
+    }
+}
+
+// ─── while the dashboard owns the terminal ──────────────────────────
+
+/// Which helper a held message came through, so the dashboard can show
+/// it the way the terminal would have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Ok,
+    Warn,
+    Dim,
+}
+
+static HUSHED: std::sync::Mutex<Option<Vec<(Level, String)>>> = std::sync::Mutex::new(None);
+
+/// While this guard lives, `info`, `ok`, `warn` and `dim` hold their
+/// message instead of writing it.
+///
+/// `ulak ui` draws every cell of the screen in raw mode, and a warning
+/// from deep inside the ssh layer — "stopped answering, retrying" —
+/// written there lands on top of the frame and stays until the next full
+/// redraw. Held instead, the dashboard shows it in its own words
+/// (`take_hushed`). Dropping the guard prints whatever is still held, and
+/// the dashboard drops it only after giving the terminal back, so no
+/// warning is ever lost — only moved.
+#[must_use]
+pub struct Hush(());
+
+pub fn hush() -> Hush {
+    *HUSHED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    Hush(())
+}
+
+impl Drop for Hush {
+    fn drop(&mut self) {
+        let held = HUSHED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap_or_default();
+        for (level, msg) in held {
+            match level {
+                Level::Info => info(&msg),
+                Level::Ok => ok(&msg),
+                Level::Warn => warn(&msg),
+                Level::Dim => dim(&msg),
+            }
+        }
+    }
+}
+
+/// Everything held since the last call, oldest first.
+pub fn take_hushed() -> Vec<(Level, String)> {
+    HUSHED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
+
+fn hushed(level: Level, msg: &str) -> bool {
+    match HUSHED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        Some(held) => {
+            held.push((level, msg.to_string()));
+            true
+        }
+        None => false,
     }
 }

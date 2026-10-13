@@ -521,6 +521,44 @@ fn render(prefix: &[&str], inv: &Invocation, identity: Option<&str>, tail: &[Str
     shell_join(&words)
 }
 
+/// A rendered command for a caller that RUNS it instead of printing it:
+/// `ulak ui` starts `ulak … docker compose up -d` itself. `words[0]` is
+/// `ulak`; `env` is the host variable `aim_for` would prefix.
+pub(crate) struct Spawn {
+    pub(crate) env: Option<(&'static str, String)>,
+    pub(crate) words: Vec<String>,
+}
+
+/// The spawnable twin of `compose_command`. Same inputs as
+/// `render_project` — every selector, the historical identity, the aim —
+/// so a command the dashboard runs and the one it would tell you to paste
+/// cannot address different stacks. A test pins the two together.
+pub(crate) fn compose_spawn(project: &Project, tail: &[&str]) -> Spawn {
+    spawn_for(&["ulak", "docker", "compose"], project, tail)
+}
+
+/// The spawnable twin of `root_command`.
+pub(crate) fn root_spawn(project: &Project, tail: &[&str]) -> Spawn {
+    spawn_for(&["ulak"], project, tail)
+}
+
+fn spawn_for(prefix: &[&str], project: &Project, tail: &[&str]) -> Spawn {
+    let mut words: Vec<String> = prefix.iter().map(|word| (*word).to_string()).collect();
+    let mut exact = project.inv.clone();
+    if let Some(identity) = project.compose_model_project_name() {
+        exact.project_name = Some(identity.to_string());
+    }
+    words.extend(exact.globals_argv());
+    words.extend(tail.iter().map(|word| (*word).to_string()));
+    let env = match project.destination() {
+        Ok(destination) if destination.drift.is_some() => {
+            config::env_var_for("host").map(|var| (var, destination.dest))
+        }
+        _ => None,
+    };
+    Spawn { env, words }
+}
+
 fn shell_join(words: &[String]) -> String {
     words
         .iter()
@@ -646,6 +684,38 @@ mod tests {
                 "a drifted project's paste must carry its server: {line}"
             );
             assert!(line.contains("-p api"), "{line}");
+        }
+    }
+
+    /// What the dashboard runs is what it would tell you to paste: the
+    /// same words, and the same host aim once the config has drifted.
+    #[test]
+    fn a_spawned_command_is_the_pasteable_one_word_for_word() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("ulak.toml"), "host = \"new-server\"\n").unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let inv = Invocation::capture_in(&dir, &[], std::collections::BTreeMap::new()).unwrap();
+        let mut project = Project::locate_from(inv).unwrap();
+        let joined = |spawn: Spawn| {
+            let line = shell_join(&spawn.words);
+            match spawn.env {
+                Some((var, dest)) => format!("env {var}={} {line}", sh_quote(&dest)),
+                None => line,
+            }
+        };
+        for pin in ["new-server", "dead server"] {
+            project.pin_existing_stack(pin, "api");
+            assert_eq!(
+                joined(compose_spawn(&project, &["up", "-d"])),
+                compose_command(&project, &["up", "-d"]),
+                "pinned to {pin}"
+            );
+            assert_eq!(
+                joined(root_spawn(&project, &["sync"])),
+                root_command(&project, &["sync"]),
+                "pinned to {pin}"
+            );
         }
     }
 
