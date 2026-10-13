@@ -267,7 +267,7 @@ fn bare_status_reuses_a_declared_nonstandard_compose_context() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        text.contains(&format!("identity  {}", project.identity)) && text.contains(COMPOSE_FILE),
+        text.contains(&format!("stack     {}", project.identity)) && text.contains(COMPOSE_FILE),
         "status lost the declared project's exact Compose context:\n{text}"
     );
     assert!(
@@ -369,10 +369,17 @@ fn bare_clean_sees_the_live_stack_declared_by_a_nonstandard_context() {
     );
     assert!(
         text.contains("workspace is still used by 1 live Docker stack")
-            && text.contains(&project.identity)
-            && text.contains(COMPOSE_FILE)
-            && text.contains("--project-directory"),
+            && text.contains(&project.identity),
         "clean did not reach the live-stack safety gate for the declared workspace:\n{text}"
+    );
+    // The way out is spelled for this shell and still names the exact
+    // stack: its nonstandard file and its project name.
+    assert!(
+        text.contains(&format!(
+            "ulak docker compose -f {COMPOSE_FILE} -p {} down --remove-orphans",
+            project.identity
+        )) && text.contains(&format!("then: ulak clean {}", project.identity)),
+        "clean's next steps do not address the declared stack:\n{text}"
     );
 }
 
@@ -411,17 +418,21 @@ fn an_ancestor_compose_file_cannot_steal_a_declared_child_management_context() {
     );
     assert!(
         text.contains(COMPOSE_FILE)
-            && text.contains(&format!("identity  {}", project.identity))
+            && text.contains(&format!("stack     {}", project.identity))
             && !text.contains("ancestor_decoy"),
         "the ancestor Compose project stole the child's management command:\n{text}"
     );
 }
 
 /// Two equally specific declarations are two real Docker stacks, not two
-/// spellings of one answer. Every management command must refuse to guess;
-/// most importantly, `clean` must never choose one workspace by accident.
+/// spellings of one answer, and no command may guess between them. What
+/// each one does instead is its own: `status` shows both side by side,
+/// commands that act on one refuse without a terminal and list each choice
+/// as its short named command — `clean` above all, which must never remove
+/// a workspace by accident — and each named command then works, from the
+/// checkout and from anywhere else.
 #[test]
-fn equally_specific_declarations_are_refused_with_exact_choices() {
+fn equally_specific_declarations_are_shown_together_and_chosen_by_name() {
     let Some(server) = TestServer::shared() else {
         return;
     };
@@ -446,25 +457,49 @@ fn equally_specific_declarations_are_refused_with_exact_choices() {
     );
 
     let out = project.bare("status");
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let text = both(&out);
+    assert!(
+        out.status.success(),
+        "status refused instead of showing both:\n{text}"
+    );
+    let row = |identity: &str| {
+        text.lines()
+            .find(|line| line.contains(identity) && line.contains(" live "))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        row(&project.identity).contains(COMPOSE_FILE)
+            && row(&second.identity).contains(COMPOSE_FILE),
+        "status did not list both stacks with their files:\n{text}"
     );
     assert!(
-        !out.status.success(),
-        "an ambiguous status guessed:\n{text}"
+        text.contains("details for one: ulak status <name>")
+            && !text.contains("--project-directory")
+            && !text.contains('#'),
+        "status printed raw invocations instead of the names:\n{text}"
     );
-    assert!(
-        text.contains("more than one declared Compose project")
-            && text.contains(&project.identity)
-            && text.contains(&second.identity),
-        "the ambiguity did not name both choices:\n{text}"
-    );
-    assert!(
-        text.matches(COMPOSE_FILE).count() >= 2 && text.matches("--project-directory").count() >= 2,
-        "the choices do not carry both exact invocations:\n{text}"
-    );
+
+    // The full invocations are still there, asked for.
+    let raw = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.cwd)
+        .args(["status", "--raw"])
+        .output()
+        .unwrap();
+    let raw_text = both(&raw);
+    assert!(raw.status.success(), "status --raw failed:\n{raw_text}");
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            raw_text
+                .lines()
+                .any(|line| line.contains(&format!("-p {identity} "))
+                    && line.contains("--project-directory")
+                    && line.trim_end().ends_with(" status")),
+            "status --raw did not spell {identity} in full:\n{raw_text}"
+        );
+    }
 
     let sync = project
         .ws
@@ -473,21 +508,98 @@ fn equally_specific_declarations_are_refused_with_exact_choices() {
         .args(["sync", "--dry-run", "--max-delete", "7"])
         .output()
         .unwrap();
-    let sync_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&sync.stdout),
-        String::from_utf8_lossy(&sync.stderr)
-    );
+    let sync_text = both(&sync);
     assert!(
         !sync.status.success(),
         "an ambiguous sync guessed:\n{sync_text}"
     );
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            sync_text.contains(&format!("ulak sync {identity} --dry-run --max-delete 7")),
+            "the choices changed the requested dry-run into a real sync:\n{sync_text}"
+        );
+    }
+    let raw_sync = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.cwd)
+        .args(["sync", "--raw", "--dry-run"])
+        .output()
+        .unwrap();
+    let raw_sync_text = both(&raw_sync);
     assert!(
-        sync_text.matches("--dry-run").count() >= 2
-            && sync_text.matches("--max-delete").count() >= 2
-            && sync_text.matches(" 7").count() >= 2,
-        "the choices changed the requested dry-run into a real sync:\n{sync_text}"
+        !raw_sync.status.success(),
+        "an ambiguous raw sync guessed:\n{raw_sync_text}"
     );
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            raw_sync_text.contains(&format!(
+                "-p {identity} --project-directory {} sync --dry-run  # {identity} on ",
+                project.cwd.canonicalize().unwrap().display()
+            )),
+            "sync --raw did not list {identity} in full:\n{raw_sync_text}"
+        );
+    }
+
+    let clean = project.bare("clean");
+    let clean_text = both(&clean);
+    assert!(
+        !clean.status.success(),
+        "an ambiguous clean guessed:\n{clean_text}"
+    );
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            clean_text.contains(&format!("ulak clean {identity}")),
+            "clean did not name each choice:\n{clean_text}"
+        );
+    }
+    assert!(
+        project.ws.stacks_dir().is_dir()
+            && desired_for(&project.ws, &project.identity).is_some()
+            && desired_for(&project.ws, &second.identity).is_some(),
+        "a refused clean touched a declaration"
+    );
+
+    // Each named choice is a working command, from the checkout and from
+    // a directory that has nothing to do with it.
+    let named = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.cwd)
+        .args(["status", &second.identity])
+        .output()
+        .unwrap();
+    let named_text = both(&named);
+    assert!(
+        named.status.success(),
+        "a named status failed:\n{named_text}"
+    );
+    assert!(
+        named_text.contains(&format!("stack     {}", second.identity))
+            && named_text.contains(&format!("-f {COMPOSE_FILE} -p {}", second.identity)),
+        "the name did not select its own declaration:\n{named_text}"
+    );
+    let elsewhere = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.ws.home)
+        .args(["status", &project.identity])
+        .output()
+        .unwrap();
+    let elsewhere_text = both(&elsewhere);
+    assert!(
+        elsewhere.status.success()
+            && elsewhere_text.contains(&format!("stack     {}", project.identity)),
+        "a named status from another directory failed:\n{elsewhere_text}"
+    );
+}
+
+fn both(out: &Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// Process environment is input to this invocation, not remembered state.
@@ -525,8 +637,8 @@ fn current_compose_environment_wins_over_a_declared_context() {
         "environment-selected status failed:\n{text}"
     );
     assert!(
-        text.contains(&format!("identity  {current_identity}"))
-            && !text.contains(&format!("identity  {}", project.identity)),
+        text.contains(&format!("stack     {current_identity}"))
+            && !text.contains(&format!("stack     {}", project.identity)),
         "the remembered declaration overrode this invocation's environment:\n{text}"
     );
 }
@@ -637,7 +749,7 @@ fn explicit_init_prints_an_exact_doctor_command_before_any_declaration() {
         .find(|line| line.contains("next:"))
         .unwrap_or_default();
     assert!(
-        next.contains(COMPOSE_FILE) && next.contains("--project-directory"),
+        next.contains(&format!("ulak -f {COMPOSE_FILE} doctor")),
         "init printed a doctor command that cannot rediscover the project:\n{text}"
     );
 }
@@ -666,7 +778,10 @@ fn explicit_doctor_prints_an_exact_up_command_without_a_declaration() {
         .find(|line| line.contains("next:"))
         .unwrap_or_default();
     assert!(
-        next.contains(COMPOSE_FILE) && next.contains("--project-directory"),
+        next.contains(&format!(
+            "ulak docker compose -f {COMPOSE_FILE} -p {} up -d",
+            project.identity
+        )),
         "doctor printed an up command that cannot rediscover the checked model:\n{text}"
     );
 }
@@ -712,8 +827,9 @@ fn explicit_sync_refusal_prints_exact_retry_commands_without_a_declaration() {
         text.contains("review the list:") && text.contains("delete them:"),
         "the refusal did not offer both safe ways forward:\n{text}"
     );
+    let exact = format!("ulak -f {COMPOSE_FILE} -p {} sync", project.identity);
     assert!(
-        text.matches(COMPOSE_FILE).count() >= 2 && text.matches("--project-directory").count() >= 2,
+        text.matches(&exact).count() >= 2,
         "the retry commands cannot rediscover the explicit project:\n{text}"
     );
 }

@@ -99,6 +99,22 @@ pub fn confirm(question: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// Ask the user to pick one of `options`, by index. `None` without a
+/// terminal and on Esc/Ctrl-C, like `confirm`: the caller's refusal then
+/// lists the same choices as commands, so declining loses nothing.
+pub fn pick(question: &str, options: &[String]) -> anyhow::Result<Option<usize>> {
+    if options.is_empty() || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(None);
+    }
+    match inquire::Select::new(question, options.to_vec()).raw_prompt() {
+        Ok(choice) => Ok(Some(choice.index)),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context("selection prompt failed")),
+    }
+}
+
 /// An error with concrete next steps. Rendered by main as:
 ///
 /// ```text

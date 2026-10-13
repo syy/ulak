@@ -624,7 +624,7 @@ fn scenario_status_shows_what_the_service_did(server: &TestServer, ws: &Workspac
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let all = format!("{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "status failed:\n{all}");
-    for needle in ["project", "identity", "web"] {
+    for needle in ["stack", "compose", "web"] {
         assert!(
             text.contains(needle),
             "status must show {needle:?}:\n{text}"

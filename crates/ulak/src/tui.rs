@@ -98,10 +98,11 @@ struct Start {
 
 /// The same selection `ulak status` makes: a project when there is one,
 /// else the workspace's server, else the servers this machine declared
-/// stacks on.
+/// stacks on. Several stacks declared here are each a group on their
+/// server already, so none is singled out.
 fn locate(globals: &[String]) -> Result<Start> {
     let mut known = declared_servers();
-    match crate::management::locate(globals, "ui", &[])? {
+    match crate::management::locate(globals, "ui", &[], None)? {
         Context::Project(project) => {
             // Binding asks the server's compose for the project's real
             // name, which takes a round trip: say so before the wait.
@@ -124,6 +125,22 @@ fn locate(globals: &[String]) -> Result<Start> {
                 here: Some(here),
                 known,
                 ssh: b.ssh,
+            })
+        }
+        Context::Several(several) => {
+            let listed = several.listed();
+            let dest = listed
+                .iter()
+                .find(|stack| stack.desired.live)
+                .or(listed.first())
+                .map(|stack| stack.desired.destination.clone())
+                .unwrap_or_default();
+            ui::info(&format!("connecting to {dest}…"));
+            Ok(Start {
+                ssh: Ssh::new(&dest)?,
+                dest,
+                here: None,
+                known,
             })
         }
         Context::Workspace(workspace) => {

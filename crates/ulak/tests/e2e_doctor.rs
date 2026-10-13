@@ -86,12 +86,20 @@ fn the_demo_project_classifies_clean_and_offers_the_protect_line() {
         text.contains("protect = [\"data/\"]") || text.contains("protect = [\"data\"]"),
         "must suggest a ready-to-paste protect line:\n{text}"
     );
-    // The whole selected invocation, not a bare `up`: since root commands
-    // recover a declared context, the next step carries `-f`, `-p` and
-    // `--project-directory` so a paste addresses exactly this stack.
+    // Not a bare `up`: the next step names the project it just checked,
+    // spelled as short as reads back to it from here (`-p`, since discovery
+    // already finds this project's compose.yaml).
+    let next = text
+        .lines()
+        .find(|line| line.contains("doctor: ready"))
+        .unwrap_or_default();
     assert!(
-        text.contains("ulak docker compose -f ") && text.contains(" up -d"),
+        next.contains("next: ulak docker compose -p ") && next.ends_with(" up -d"),
         "success must point at an exact up:\n{text}"
+    );
+    assert!(
+        !next.contains("--project-directory"),
+        "the next step is spelled for this shell, not in full:\n{text}"
     );
 
     ws.forget_on_server(&server);

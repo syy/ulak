@@ -17,8 +17,9 @@ wrong at [github.com/syy/ulak/issues](https://github.com/syy/ulak/issues).
 
 The same choice `ulak status` makes. Inside a Compose project, it is the
 project's server, and that project is pinned to the top of the Containers tab
-even when nothing runs yet. Inside an Ulak workspace without a project, it is
-the workspace's server. Anywhere else, it is the global `host`, or else a
+even when nothing runs yet. With several stacks declared there, it is the
+server of a running one, and none is pinned. Inside an Ulak workspace without
+a project, it is the workspace's server. Anywhere else, it is the global `host`, or else a
 server this machine has declared stacks on. `@` switches to any server this
 machine knows about.
 
