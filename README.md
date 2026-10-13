@@ -146,6 +146,22 @@ For a persistent shim, use `ulak shim install`, `ulak shim status` and
 `ulak shim uninstall`. Installation asks before changing a shell profile;
 uninstall removes only Ulak's block.
 
+## Dashboard
+
+`ulak ui` opens a full-screen view of the server's Docker in your terminal:
+containers by Compose project with live CPU and memory, logs, stats, images,
+volumes and networks, with start, stop, restart and delete one key away.
+
+```bash
+cd ~/projects/my-app
+ulak ui
+```
+
+The dashboard is in beta: keys and layout may still change. Destructive
+actions ask first, with No as the default. See the
+[dashboard guide](https://github.com/syy/ulak/blob/main/docs/dashboard.md)
+for every key and what it runs on the server.
+
 ## Main commands
 
 | Command | Purpose |
@@ -155,6 +171,7 @@ uninstall removes only Ulak's block.
 | `ulak docker <command>` | Run a supported Docker command on the server. |
 | `ulak sync` | Synchronize the current project once. |
 | `ulak status` | Show the workspace, stack, service, and forwarded ports. |
+| `ulak ui` | Open the dashboard (beta): containers, logs, images, volumes and networks. |
 | `ulak config` | Show the effective settings and the layer that supplied each one. |
 | `ulak shim ...` | Let project scripts use the remote Docker daemon. |
 | `ulak clean` | Remove the selected remote workspace when no stack uses it. |
