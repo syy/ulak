@@ -117,6 +117,7 @@ Reports use stdout with `ui::style_stdout()`; other output uses stderr through
 |---|---|
 | `docs/docker-commands.md` | `ULAK_TEST_WRITE_MAP=1 cargo test --bins the_map_on_disk` |
 | `crates/ulak/src/snapshots/*.snap` | `cargo insta review` |
+| `docs/images/dashboard-*.svg` | `ULAK_TEST_WRITE_PICTURES=1 cargo test --bins the_pictures_on_disk` |
 | `.github/workflows/release.yml` | edit `dist-workspace.toml`, regenerate with dist |
 
 Never hand-edit generated files. Keep user-visible behaviour documented in

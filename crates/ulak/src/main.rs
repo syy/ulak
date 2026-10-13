@@ -32,6 +32,8 @@ mod management;
 mod manifest;
 mod observer;
 mod passthrough;
+#[cfg(test)]
+mod pictures;
 mod proc;
 mod runspec;
 mod selection;

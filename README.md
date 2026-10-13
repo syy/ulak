@@ -157,6 +157,8 @@ cd ~/projects/my-app
 ulak ui
 ```
 
+![ulak ui: containers grouped by Compose project with live CPU and memory](https://raw.githubusercontent.com/syy/ulak/main/docs/images/dashboard-containers.svg)
+
 The dashboard is in beta: keys and layout may still change. Destructive
 actions ask first, with No as the default. See the
 [dashboard guide](https://github.com/syy/ulak/blob/main/docs/dashboard.md)

@@ -11,6 +11,8 @@ releases. Every action goes through the same command table and rules as
 `ulak docker`, and destructive ones ask first. Tell us what is missing or
 wrong at [github.com/syy/ulak/issues](https://github.com/syy/ulak/issues).
 
+![ulak ui: containers grouped by Compose project with live CPU and memory](images/dashboard-containers.svg)
+
 ## Which server it shows
 
 The same choice `ulak status` makes. Inside a Compose project, it is the
@@ -47,9 +49,21 @@ Press `?` for the full list. The ones you need first:
 | `T` | Tasks: everything the dashboard ran, with its output; `x` stops one |
 | `q` `esc` | Back, or quit |
 
+A destructive action says what it will remove and starts on No:
+
+![ulak ui: compose down asks first, with No selected](images/dashboard-confirm.svg)
+
 In logs, `f` pauses and resumes following, `w` wraps long lines, `t` shows
 Docker's timestamps and `c` clears the view. Scrolling up pauses by itself and
-says how many newer lines are waiting.
+says how many newer lines are waiting. On a stack, `l` merges every
+container's lines by time, each in its own colour:
+
+![ulak ui: a stack's logs merged by time, searched for timeout](images/dashboard-logs.svg)
+
+A container's `3 Stats` pane charts its last two minutes of CPU and memory,
+one sample a second:
+
+![ulak ui: two minutes of a container's CPU and memory](images/dashboard-stats.svg)
 
 The mouse works too. Click a tab or a row, and double-click a row to open
 it; the wheel scrolls. Each key named in the bottom line is a button that
