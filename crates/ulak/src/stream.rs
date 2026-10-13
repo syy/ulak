@@ -14,8 +14,11 @@
 //! ones the server made and never crossing a symlink, even one swapped in
 //! while the file lands. Measured: an rsync spawn is ~6 round trips and a
 //! fresh ssh session ~2, so a new file cost three of each; one exchange
-//! here is one round trip. Large or unstable files, new directories and
-//! every conflict still use rsync and the full survey. The helper runs on
+//! here is one round trip. Large files, new directories and every conflict
+//! still use rsync and the full survey. A file a save moves while it is
+//! read does not: rsync would upload whichever version it read, no record
+//! would name it, and every later sync would hold it as the server's edit.
+//! It waits for a later turn instead (`NotAdded::Moving`). The helper runs on
 //! the server's python3, which syncing needs anyway: the survey's
 //! baseline.py requires Python 3.7 or later. Nothing is installed and no
 //! daemon runs; the helper is sent on every connect and EOF ends it.
@@ -126,6 +129,17 @@ pub struct Batch {
     bytes: Vec<u8>,
 }
 
+/// Why `Batch::add` left a file out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotAdded {
+    /// A save moved the regular file the stamp names, before or while it
+    /// was read. sync.rs sends it on a later turn, never through rsync.
+    Moving,
+    /// Not a regular file, beyond the channel's limits, or unreadable:
+    /// rsync's.
+    Unfit,
+}
+
 impl Batch {
     pub fn new() -> Self {
         Self {
@@ -141,36 +155,54 @@ impl Batch {
     /// The bytes sync.rs selected, read through one fd and compared to the
     /// stamp it selected them under (see `prepare`). `create` names a leaf
     /// the ledger does not claim yet; the helper refuses an existing one.
+    /// A file left out leaves nothing in the batch, which stays usable.
     pub fn add(
         &mut self,
         anchor: &Path,
         path: &Path,
         expected: &Stamp,
         create: bool,
-    ) -> Option<()> {
+    ) -> Result<(), NotAdded> {
         if self.entries.len() >= 64 {
-            return None;
+            return Err(NotAdded::Unfit);
         }
-        let name = crate::invocation::anchor_rel(anchor, path)?;
-        let file = File::open(path).ok()?;
-        let before = file.metadata().ok()?;
-        if !before.is_file()
-            || before.len() > MAX_FILE
-            || Stamp::from_metadata(&before) != *expected
-            || self.bytes.len() + before.len() as usize > MAX_BATCH
-        {
-            return None;
+        let name = crate::invocation::anchor_rel(anchor, path).ok_or(NotAdded::Unfit)?;
+        // Before the stamp comparison: a symlink's stamp never matches the
+        // file `open` reaches through it, and is rsync's (`--links`).
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+            return Err(NotAdded::Unfit);
+        }
+        let file = File::open(path).map_err(|_| NotAdded::Unfit)?;
+        let before = file.metadata().map_err(|_| NotAdded::Unfit)?;
+        if !before.is_file() || before.len() > MAX_FILE {
+            return Err(NotAdded::Unfit);
+        }
+        if Stamp::from_metadata(&before) != *expected {
+            return Err(NotAdded::Moving);
+        }
+        if self.bytes.len() + before.len() as usize > MAX_BATCH {
+            return Err(NotAdded::Unfit);
         }
         let start = self.bytes.len();
-        (&file)
+        if (&file)
             .take(MAX_FILE + 1)
             .read_to_end(&mut self.bytes)
-            .ok()?;
+            .is_err()
+        {
+            self.bytes.truncate(start);
+            return Err(NotAdded::Unfit);
+        }
         if self.bytes.len() - start != before.len() as usize
-            || Stamp::from_metadata(&file.metadata().ok()?) != *expected
+            || file
+                .metadata()
+                .ok()
+                .map(|m| Stamp::from_metadata(&m))
+                .as_ref()
+                != Some(expected)
             || Stamp::read(path).as_ref() != Some(expected)
         {
-            return None;
+            self.bytes.truncate(start);
+            return Err(NotAdded::Moving);
         }
         self.entries.push(Entry {
             op: if create { "create" } else { "replace" },
@@ -182,7 +214,7 @@ impl Batch {
             expected: None,
             content: crate::baseline::regular(&self.bytes[start..], before.mode()),
         });
-        Some(())
+        Ok(())
     }
 
     /// A small file the server holds that should come home: its bytes,
@@ -400,15 +432,25 @@ pub struct Applied {
 /// Read through one fd and compare its identity/times before and after.
 /// Opening a replaced symlink cannot send its target: the fd must have the
 /// regular inode that sync.rs selected before any bytes are read.
-pub fn prepare(anchor: &Path, changed: &BTreeMap<PathBuf, Stamp>) -> Option<Batch> {
+///
+/// The batch, or None when a file is rsync's, beside the files a save
+/// moved as they were read, which are left out either way. Reading goes on
+/// past an unfit file, so a moving one is not handed to rsync with it.
+pub fn prepare(anchor: &Path, changed: &BTreeMap<PathBuf, Stamp>) -> (Option<Batch>, Vec<PathBuf>) {
+    let mut moving = Vec::new();
     if changed.is_empty() || changed.len() > 64 {
-        return None;
+        return (None, moving);
     }
     let mut batch = Batch::new();
+    let mut fits = true;
     for (path, expected) in changed {
-        batch.add(anchor, path, expected, false)?;
+        match batch.add(anchor, path, expected, false) {
+            Ok(()) => {}
+            Err(NotAdded::Moving) => moving.push(path.clone()),
+            Err(NotAdded::Unfit) => fits = false,
+        }
     }
-    Some(batch)
+    (fits.then_some(batch), moving)
 }
 
 #[derive(Deserialize)]
@@ -707,7 +749,9 @@ mod tests {
                 (p, stamp)
             })
             .collect();
-        prepare(root, &selected).unwrap()
+        let (batch, moving) = prepare(root, &selected);
+        assert!(moving.is_empty());
+        batch.unwrap()
     }
 
     /// A delayed local save must not erase server output written since the
@@ -859,7 +903,10 @@ mod tests {
     }
 
     /// Cache observations are not permission to read a replaced inode or
-    /// allocate a huge file. Both cases must use the checksum rsync path.
+    /// allocate a huge file, so neither is streamed. The replaced inode
+    /// waits for a turn that observes it again, because rsync would upload
+    /// whichever version it read; the huge file takes the checksum rsync
+    /// path.
     #[test]
     fn changed_observations_and_large_files_are_not_streamed() {
         let local = tempfile::tempdir().unwrap();
@@ -867,10 +914,67 @@ mod tests {
         std::fs::write(&p, "first").unwrap();
         let selected = BTreeMap::from([(p.clone(), Stamp::read(&p).unwrap())]);
         std::fs::write(&p, "second").unwrap();
-        assert!(prepare(local.path(), &selected).is_none());
+        let (batch, moving) = prepare(local.path(), &selected);
+        assert!(batch.is_some_and(|b| b.is_empty()), "nothing for rsync");
+        assert_eq!(moving, std::slice::from_ref(&p));
         File::create(&p).unwrap().set_len(MAX_FILE + 1).unwrap();
         let selected = BTreeMap::from([(p.clone(), Stamp::read(&p).unwrap())]);
-        assert!(prepare(local.path(), &selected).is_none());
+        let (batch, moving) = prepare(local.path(), &selected);
+        assert!(batch.is_none(), "rsync's");
+        assert!(moving.is_empty());
+    }
+
+    /// A save that moved one file leaves nothing of it in the batch, and
+    /// the files around it are still read: an unfit one hands the batch
+    /// to rsync, the moving one is kept out of that too.
+    #[test]
+    fn a_moving_file_is_left_out_whichever_way_the_rest_goes() {
+        let local = tempfile::tempdir().unwrap();
+        let stamped = |name: &str, bytes: &[u8]| {
+            let p = local.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            (p.clone(), Stamp::read(&p).unwrap())
+        };
+        let (a, a_stamp) = stamped("a", b"a before");
+        let (b, b_stamp) = stamped("b", b"b as observed");
+        std::fs::write(&a, b"a saved after it was observed").unwrap();
+        let selected = BTreeMap::from([(a.clone(), a_stamp), (b.clone(), b_stamp)]);
+        let (batch, moving) = prepare(local.path(), &selected);
+        assert_eq!(moving, std::slice::from_ref(&a));
+        let batch = batch.expect("b fits");
+        assert_eq!(batch.bytes, b"b as observed", "nothing of a in the batch");
+        assert_eq!(batch.written(), [b"b".to_vec()]);
+
+        // `big` sorts first, so `c` is read after the batch is already rsync's.
+        let big = local.path().join("big");
+        File::create(&big).unwrap().set_len(MAX_FILE + 1).unwrap();
+        let (c, c_stamp) = stamped("c", b"c before");
+        std::fs::write(&c, b"c saved after it was observed").unwrap();
+        let selected = BTreeMap::from([
+            (big.clone(), Stamp::read(&big).unwrap()),
+            (c.clone(), c_stamp),
+        ]);
+        let (batch, moving) = prepare(local.path(), &selected);
+        assert!(batch.is_none(), "big is rsync's");
+        assert_eq!(moving, [c], "c is not");
+    }
+
+    /// A symlink is rsync's (`--links`), not a file that moved: its stamp
+    /// never matches the file `open` reaches through it, and taking that
+    /// for a save in progress would wait for it forever.
+    #[test]
+    fn a_symlink_is_unfit_not_moving() {
+        let local = tempfile::tempdir().unwrap();
+        let target = local.path().join("target");
+        std::fs::write(&target, b"target").unwrap();
+        let link = local.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut batch = Batch::new();
+        assert_eq!(
+            batch.add(local.path(), &link, &Stamp::read(&link).unwrap(), false),
+            Err(NotAdded::Unfit)
+        );
+        assert!(batch.is_empty());
     }
 
     /// Losing an ACK does not prove the remote worker stopped. Revocation

@@ -75,9 +75,15 @@
 //! change (new or removed leaves under known directories, which walk.rs
 //! rescans alone and `rescanned_plan` splices into the last full plan)
 //! creates and guarded unlinks in the same exchange, with the ledger
-//! claiming before the exchange and retiring on its receipt. Large
-//! or unstable files, unknown ancestors and failed batches use the
-//! checksum-selected rsync path and the removal script. Only an
+//! claiming before the exchange and retiring on its receipt. Large files,
+//! unknown ancestors and failed batches use the checksum-selected rsync
+//! path and the removal script. A file a save moves while the channel
+//! reads it does not (`stream::NotAdded::Moving`): rsync would upload
+//! whichever version it read, no record would name it, and every later
+//! sync would hold the file as the server's edit. The warm path defers it
+//! to the next turn (`Session::deferred`), a structural batch steps aside
+//! to the full reconcile, and the full push reads it again a few times
+//! and then holds it for the next sync (`add_settled`). Only an
 //! acknowledged batch updates the pre-transfer observations. One exchange
 //! is one round trip; stream.rs owns why that beats an rsync.
 //! Directory or rule changes, restarts, ledger writes and missed events require a full
@@ -347,18 +353,19 @@ pub fn reconcile_changes(
         .as_ref()
         .filter(|_| session.signature == signature && session.ledger == ledger_stamp(&state))
         .and_then(|paths| changed_leaves(&fp.anchor, session, paths));
-    if let Some(changed) = candidates {
+    if let Some(mut changed) = candidates {
         if changed.is_empty() {
             return pull_changes(project, fp, ssh, opts, session);
         }
-        let names: Vec<String> = changed
-            .keys()
-            .filter_map(|p| crate::invocation::anchor_rel(&fp.anchor, p))
-            .collect();
         let deadline = crate::proc::Budget::new(crate::proc::RECONCILE);
-        let result = transfer_changed(project, fp, ssh, session, &changed).and_then(|events| {
+        let result = transfer_changed(project, fp, ssh, session, &mut changed).and_then(|events| {
             events.map(Ok).unwrap_or_else(|| {
                 let rsync = local_rsync()?;
+                // Named after the channel read: a file a save moved is out.
+                let names: Vec<String> = changed
+                    .keys()
+                    .filter_map(|p| crate::invocation::anchor_rel(&fp.anchor, p))
+                    .collect();
                 let selected = names
                     .iter()
                     .map(|p| p.as_bytes().to_vec())
@@ -923,8 +930,11 @@ fn stream_structure(
             return Ok(Structure::Rsync);
         };
         let create = !session.owned.contains(&path);
-        if batch.add(&fp.anchor, &path, stamp, create).is_none() {
-            return Ok(Structure::Rsync);
+        match batch.add(&fp.anchor, &path, stamp, create) {
+            Ok(()) => {}
+            // The full push reads it again, and holds it while it moves.
+            Err(crate::stream::NotAdded::Moving) => return Ok(Structure::Full),
+            Err(crate::stream::NotAdded::Unfit) => return Ok(Structure::Rsync),
         }
     }
     for name in doomed {
@@ -1117,14 +1127,24 @@ fn transfer_changed(
     fp: &Footprint,
     ssh: &Ssh,
     session: &mut Session,
-    changed: &std::collections::BTreeMap<PathBuf, crate::selection::Stamp>,
+    changed: &mut std::collections::BTreeMap<PathBuf, crate::selection::Stamp>,
 ) -> Result<Option<Vec<Event>>> {
     if session.stream_unavailable {
         return Ok(None);
     }
-    let Some(mut batch) = crate::stream::prepare(&fp.anchor, changed) else {
+    let (batch, moving) = crate::stream::prepare(&fp.anchor, changed);
+    // Neither sent nor observed: the next turn reads them again, and the
+    // rsync fallback below never sees them (module header).
+    for path in moving {
+        changed.remove(&path);
+        session.deferred.insert(path);
+    }
+    let Some(mut batch) = batch else {
         return Ok(None);
     };
+    if batch.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
     let Some(common) = session.common.as_ref() else {
         return Err(fail!("the common-content state is unavailable")
             .now("run ulak sync before retrying the transfer")
@@ -2141,6 +2161,32 @@ fn on_layout(
     doomed_dirs.clear();
 }
 
+/// Reads of a file a save keeps moving, before the full push holds it.
+const SETTLE_TRIES: usize = 3;
+const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `Batch::add` under the stamp the file carries now, read again while a
+/// save is landing. `Moving` after the last try holds the file for the
+/// next sync; a missing file is rsync's, as it was before.
+fn add_settled(
+    batch: &mut crate::stream::Batch,
+    anchor: &std::path::Path,
+    path: &std::path::Path,
+    create: bool,
+) -> std::result::Result<(), crate::stream::NotAdded> {
+    let mut attempt = 1;
+    loop {
+        let stamp = crate::selection::Stamp::read(path).ok_or(crate::stream::NotAdded::Unfit)?;
+        match batch.add(anchor, path, &stamp, create) {
+            Err(crate::stream::NotAdded::Moving) if attempt < SETTLE_TRIES => {
+                attempt += 1;
+                std::thread::sleep(SETTLE_PAUSE);
+            }
+            done => return done,
+        }
+    }
+}
+
 /// One push, and the claim it owes the ledger, in the one function that
 /// does both.
 ///
@@ -2229,14 +2275,26 @@ fn push_and_claim(
             // batch records exactly the bytes it sends, so a save since the
             // survey goes as it is. Left to rsync, that save reached the
             // server as a version no record named, and every later sync
-            // held the file as the server's edit.
-            let fits = selected.iter().all(|p| {
+            // held the file as the server's edit. A save landing during
+            // the read does the same to rsync, so that file is held.
+            let mut fits = true;
+            let mut moving = Vec::new();
+            for p in &selected {
                 let create = !survey.remote.get(p).is_some_and(Option::is_some);
-                let path = fp.anchor.join(p);
-                crate::selection::Stamp::read(&path)
-                    .is_some_and(|stamp| batch.add(&fp.anchor, &path, &stamp, create).is_some())
-            });
-            if fits {
+                match add_settled(&mut batch, &fp.anchor, &fp.anchor.join(p), create) {
+                    Ok(()) => {}
+                    Err(crate::stream::NotAdded::Moving) => moving.push(p.clone()),
+                    Err(crate::stream::NotAdded::Unfit) => fits = false,
+                }
+            }
+            for p in moving {
+                ui::warn(&format!(
+                    "{p} changed while it was being read and was not sent; the next sync sends it"
+                ));
+                for_rsync.retain(|r| *r != p);
+                held.push(p);
+            }
+            if fits && !batch.is_empty() {
                 // Guarded on the server's copy AS SURVEYED, not on the
                 // common record: `push_selection` has already applied the
                 // record's rule (and `no_history`) to decide these may go
@@ -2275,7 +2333,7 @@ fn push_and_claim(
                         // Nothing landed. A create's missing parent goes
                         // to rsync; the rest moved on the server since the
                         // survey and are held, their fresh claims retired.
-                        let (rest, kept_back) = split_refusal(&selected, &refused);
+                        let (rest, kept_back) = split_refusal(&for_rsync, &refused);
                         let retire: Vec<String> = kept_back
                             .iter()
                             .map(|(p, _)| p.clone())
@@ -6799,6 +6857,101 @@ mod tests {
         );
     }
 
+    /// The same hole one step later: a save landing WHILE the channel
+    /// reads the file. The read is refused, and rsync then uploaded
+    /// whichever version it read, which no record named. Measured in CI:
+    /// the server kept the fourth of five saves and the file stayed in
+    /// conflict for good. Under a busy writer the file goes over the
+    /// channel or is held, and either way the record names what the server
+    /// holds; rsync never runs.
+    #[test]
+    fn a_save_while_the_channel_reads_never_hands_the_file_to_rsync() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, mut ssh) = helper_project(local.path());
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let lp = local.path().join("new.rs");
+        let rp = remote.path().join("new.rs");
+        std::fs::write(&rp, b"agreed").unwrap();
+        let agreed = crate::baseline::fingerprint(&rp).unwrap();
+        std::fs::write(&lp, b"save 0").unwrap();
+        let mut survey = one_file_survey(&project, &ssh, agreed.clone());
+        survey
+            .common
+            .record(crate::baseline::Contents::from([("new.rs".into(), agreed)]))
+            .unwrap();
+        // Saves that truncate and then write, as fast as they go.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (lp, stop) = (lp.clone(), stop.clone());
+            move || {
+                let padding = "x".repeat(64 * 1024);
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n += 1;
+                    std::fs::write(&lp, format!("save {n} {padding}")).unwrap();
+                }
+            }
+        });
+        let result = push_and_claim(
+            &PathBuf::from("rsync-not-invoked"),
+            &project,
+            &inventory_footprint(local.path()),
+            &ssh,
+            &mut survey,
+            &state,
+            &crate::proc::Budget::new(crate::proc::RECONCILE),
+            &mut Some(crate::stream::local_helper(remote.path())),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        result.expect("a moving file is sent by the channel or held, never by rsync");
+        let server = crate::baseline::fingerprint(&rp).unwrap();
+        assert_eq!(survey.common.get("new.rs"), server.as_ref());
+        assert_eq!(
+            crate::baseline::State::load(&state, local.path())
+                .unwrap()
+                .get("new.rs"),
+            server.as_ref(),
+            "the record names what the server holds"
+        );
+    }
+
+    /// The warm path's half: a file saved since it was observed is
+    /// neither sent nor observed, and never reaches the rsync fallback.
+    /// The next turn reads it again (`Session::deferred`).
+    #[test]
+    fn a_warm_save_since_the_observation_waits_for_the_next_turn() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (project, mut ssh) = helper_project(local.path());
+        ssh.offline();
+        let _lock = crate::lockfile::WorkspaceLock::acquire(project.workspace_id()).unwrap();
+        let state = project.state_key(&ssh.dest);
+        let fp = inventory_footprint(local.path());
+        let lp = local.path().join("new.rs");
+        std::fs::write(&lp, b"observed").unwrap();
+        let stamp = crate::selection::Stamp::read(&lp).unwrap();
+        std::fs::write(&lp, b"saved since").unwrap();
+        let mut session = Session {
+            stream: Some(crate::stream::local_helper(remote.path())),
+            common: Some(crate::baseline::State::load(&state, local.path()).unwrap()),
+            ..Session::default()
+        };
+        let mut changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+        let events = transfer_changed(&project, &fp, &ssh, &mut session, &mut changed).unwrap();
+        assert_eq!(
+            events.map(|e| e.len()),
+            Some(0),
+            "nothing sent, and no rsync fallback"
+        );
+        assert!(changed.is_empty(), "not observed");
+        assert!(session.deferred.contains(&lp), "read again next turn");
+        assert!(!remote.path().join("new.rs").exists());
+    }
+
     /// A retry whose receipt is lost again adds its content to the record
     /// instead of leaving the first attempt's: the second upload is the
     /// one on the server, and it must still be ulak's to delete, not a
@@ -8063,8 +8216,8 @@ mod tests {
                         common: Some(common),
                         ..Session::default()
                     };
-                    let changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
-                    transfer_changed(&project, &fp, &ssh, &mut session, &changed).is_err()
+                    let mut changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    transfer_changed(&project, &fp, &ssh, &mut session, &mut changed).is_err()
                 }
                 "stream_structure" => {
                     let mut session = Session {
@@ -8291,8 +8444,8 @@ mod tests {
                         common: Some(common),
                         ..Session::default()
                     };
-                    let changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
-                    transfer_changed(&project, &fp, &ssh, &mut session, &changed).is_err()
+                    let mut changed = std::collections::BTreeMap::from([(lp.clone(), stamp)]);
+                    transfer_changed(&project, &fp, &ssh, &mut session, &mut changed).is_err()
                 }
                 "stream_structure" => {
                     let mut session = Session {
