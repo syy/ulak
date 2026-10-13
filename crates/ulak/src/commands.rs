@@ -49,22 +49,30 @@ fn fleet() -> Result<ExitCode> {
         return finish_fleet(health);
     }
 
+    let raw = crate::management::spelling() == crate::management::Spelling::Raw;
     let rows = catalog
         .iter()
-        .map(|(id, desired)| Row {
-            live: desired.live,
-            selector: crate::management::selector_in(&catalog, desired),
-            destination: desired.destination.clone(),
-            files: None,
-            // A compose file that is gone is a checkout that was deleted
-            // or moved. Named rather than hidden, because the workspace
-            // it left on a server is still taking up space there.
-            detail: row_detail(
-                desired,
-                desired.rebuild_for_stack(id).is_ok(),
-                crate::intent::read_status(id).as_ref(),
-                &s,
-            ),
+        .map(|(id, desired)| {
+            let rebuilt = desired.rebuild_for_stack(id);
+            Row {
+                live: desired.live,
+                selector: crate::management::selector_in(&catalog, desired),
+                destination: desired.destination.clone(),
+                files: None,
+                // A compose file that is gone is a checkout that was deleted
+                // or moved. Named rather than hidden, because the workspace
+                // it left on a server is still taking up space there.
+                detail: row_detail(
+                    desired,
+                    rebuilt.is_ok(),
+                    crate::intent::read_status(id).as_ref(),
+                    &s,
+                ),
+                full: rebuilt
+                    .ok()
+                    .filter(|_| raw)
+                    .map(|rebuilt| crate::management::in_full(desired, &rebuilt, &["status"])),
+            }
         })
         .collect();
     print_stacks(rows, &s);
@@ -86,6 +94,7 @@ fn here(several: &crate::management::Several) -> Result<ExitCode> {
     println!("{}Ulak{} — this directory\n", s.bold, s.off);
     println!("{}service{}   {}", s.bold, s.off, health.line);
 
+    let raw = crate::management::spelling() == crate::management::Spelling::Raw;
     let listed = several.listed();
     let rows = listed
         .iter()
@@ -100,6 +109,7 @@ fn here(several: &crate::management::Several) -> Result<ExitCode> {
                 crate::intent::read_status(stack.stack_id).as_ref(),
                 &s,
             ),
+            full: raw.then(|| stack.in_full(&["status"])),
         })
         .collect();
     print_stacks(rows, &s);
@@ -127,6 +137,8 @@ struct Row {
     /// are what tells apart two stacks of one checkout.
     files: Option<String>,
     detail: String,
+    /// `--raw`: its whole invocation, on a line of its own below it.
+    full: Option<String>,
 }
 
 /// The last column: what the service last saw for a live stack.
@@ -178,7 +190,7 @@ fn stack_lines(mut rows: Vec<Row>, s: &ui::Style) -> Vec<String> {
     let server = width(&|row| row.destination.chars().count());
     let files = width(&|row| row.files.as_ref().map_or(0, |f| f.chars().count()));
     rows.iter()
-        .map(|row| {
+        .flat_map(|row| {
             let word = if row.live {
                 format!("{} live{}", s.green, s.off)
             } else {
@@ -192,7 +204,12 @@ fn stack_lines(mut rows: Vec<Row>, s: &ui::Style) -> Vec<String> {
                 line.push_str(&format!("{}{f:<files$}{}  ", s.dim, s.off));
             }
             line.push_str(&row.detail);
-            line
+            // Under the name column, so the row still reads first.
+            let full = row
+                .full
+                .as_ref()
+                .map(|full| format!("       {}{full}{}", s.dim, s.off));
+            std::iter::once(line).chain(full)
         })
         .collect()
 }
@@ -1100,6 +1117,7 @@ mod tests {
             destination: "devbox".into(),
             files: files.map(String::from),
             detail: detail.into(),
+            full: None,
         }
     }
 
@@ -1125,6 +1143,17 @@ mod tests {
         );
         let fleet = stack_lines(vec![row("a-long-name", true, None, "x")], &plain());
         assert_eq!(fleet, vec![" live  a-long-name  devbox  x"]);
+
+        // `--raw` puts each whole invocation under its own row.
+        let mut full = row("shop", true, None, "x");
+        full.full = Some("ulak -f /code/compose.yaml -p shop status".into());
+        assert_eq!(
+            stack_lines(vec![full], &plain()),
+            vec![
+                " live  shop  devbox  x",
+                "       ulak -f /code/compose.yaml -p shop status",
+            ]
+        );
     }
 
     /// An idle row never claims that a bare `up -d` starts it: in a

@@ -14,3 +14,6 @@ ulak clean shop-test
 Without a name, `doctor` and `sync` ask which one; outside a terminal they
 list one command per stack instead. `clean` always needs the name. Write
 `name@server` when two servers have a stack of that name.
+
+`--raw` on any of these four prints suggested commands in full (absolute `-f`,
+`-p` and `--project-directory`) instead of by name.

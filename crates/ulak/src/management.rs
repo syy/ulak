@@ -44,7 +44,11 @@
 //! anywhere, so it keeps the absolute form (`compose_command`). Either way
 //! the historical identity rides along as `-p`, and every root-command
 //! argument travels with the line so a `--dry-run` cannot turn into a
-//! mutating retry.
+//! mutating retry. `--raw` asks for the absolute form everywhere instead
+//! (`Spelling::Raw`): no names and no shortening, and the several-stacks
+//! refusal goes back to its full lines, each labelled by a shell comment so
+//! it still pastes as it stands. It is a choice made once per process, by
+//! `main`; the `_in` renderers take it as an argument so tests never share it.
 //!
 //! A declaration outranks a later `host` edit, and this module is where that
 //! is said: `warn_on_destination_drift` speaks once, at the one site a
@@ -62,6 +66,7 @@
 //! than the line describes.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context as _, Result};
 
@@ -179,6 +184,30 @@ pub fn project(
     }
 }
 
+/// How the pasteable commands this process prints are spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// By stack name, or the shortest globals that read back in this shell.
+    Short,
+    /// `--raw`: every selector absolute and no stack names, the spelling
+    /// that reads the same from any directory without a declaration to
+    /// look up. Long, so it is asked for rather than shown by default.
+    Raw,
+}
+
+static SPELLING: OnceLock<Spelling> = OnceLock::new();
+
+/// Spell every command this process prints in full. Set once, by `main`,
+/// for `--raw`. Tests call the `_in` renderers instead: a process-wide
+/// switch set by one test would leak into every test beside it.
+pub fn spell_raw() {
+    SPELLING.get_or_init(|| Spelling::Raw);
+}
+
+pub fn spelling() -> Spelling {
+    SPELLING.get().copied().unwrap_or(Spelling::Short)
+}
+
 /// An exact root command for this invocation, safe to paste into a shell.
 ///
 /// By name for a declared project, which reads the same from any
@@ -189,7 +218,14 @@ pub fn project(
 /// whose declaration has since been removed keeps the full spelling,
 /// because the service renders those and its text is read elsewhere.
 pub fn root_command(project: &Project, tail: &[&str]) -> String {
+    root_command_in(spelling(), project, tail)
+}
+
+fn root_command_in(spelling: Spelling, project: &Project, tail: &[&str]) -> String {
     let tail = words(tail);
+    if spelling == Spelling::Raw {
+        return render_project(&["ulak"], project, &tail);
+    }
     match (declared_selector(project), tail.split_first()) {
         (Some(selector), Some((command, args))) => named_command(command, args, &selector),
         _ if project.stack_pin.is_some() => render_project(&["ulak"], project, &tail),
@@ -251,6 +287,9 @@ pub fn compose_command(project: &Project, tail: &[&str]) -> String {
 /// shortest globals that read back to the same invocation from its
 /// directory and environment (`here_globals_in`).
 pub fn compose_command_here(project: &Project, tail: &[&str]) -> String {
+    if spelling() == Spelling::Raw {
+        return compose_command(project, tail);
+    }
     render_here(
         &["ulak", "docker", "compose"],
         project,
@@ -265,6 +304,15 @@ pub fn compose_command_here(project: &Project, tail: &[&str]) -> String {
 /// know `-p` more precisely than today's local inputs; spelling it here
 /// keeps that answer attached to the invocation that can act on it.
 pub fn compose_command_here_as(project: &Project, identity: &str, tail: &[&str]) -> String {
+    if spelling() == Spelling::Raw {
+        let line = render(
+            &["ulak", "docker", "compose"],
+            &project.inv,
+            Some(identity),
+            &words(tail),
+        );
+        return aim_for(project, line);
+    }
     render_here(
         &["ulak", "docker", "compose"],
         project,
@@ -884,12 +932,45 @@ pub struct Listed<'a> {
     pub selector: String,
     /// Its Compose files, relative to this directory when below it.
     pub files: String,
+    rebuilt: &'a Rebuilt,
 }
 
 impl Listed<'_> {
+    /// This stack's whole invocation in full, for `--raw`.
+    pub fn in_full(&self, tail: &[&str]) -> String {
+        in_full(self.desired, self.rebuilt, tail)
+    }
+
     /// The root command that runs `command` on this stack.
-    fn spelled(&self, command: &str, command_args: &[String]) -> String {
-        named_command(command, command_args, &self.selector)
+    fn spelled(&self, spelling: Spelling, command: &str, command_args: &[String]) -> String {
+        match spelling {
+            Spelling::Short => named_command(command, command_args, &self.selector),
+            Spelling::Raw => {
+                let line = command_line(command, command_args);
+                let tail: Vec<&str> = line.iter().map(String::as_str).collect();
+                self.in_full(&tail)
+            }
+        }
+    }
+}
+
+/// A declaration's whole invocation in full, for `--raw`. Through the
+/// pinned project, so `render_project` aims it exactly as it would a
+/// chosen declaration: explicit globals select by config, and unaimed, two
+/// choices on different servers would paste into the same stack.
+pub(crate) fn in_full(desired: &Desired, rebuilt: &Rebuilt, tail: &[&str]) -> String {
+    let copy = Rebuilt {
+        inv: rebuilt.inv.clone(),
+        workspace_key: rebuilt.workspace_key.clone(),
+    };
+    match desired.project_from_rebuilt(copy) {
+        Ok(project) => render_project(&["ulak"], &project, &words(tail)),
+        Err(_) => render(
+            &["ulak"],
+            &rebuilt.inv,
+            Some(&desired.identity),
+            &words(tail),
+        ),
     }
 }
 
@@ -914,6 +995,7 @@ impl Several {
                 desired: &candidate.desired,
                 selector: selector_in(&self.catalog, &candidate.desired),
                 files: files_shown(&self.cwd, &candidate.rebuilt.inv),
+                rebuilt: &candidate.rebuilt,
             })
             .collect()
     }
@@ -931,27 +1013,39 @@ impl Several {
             if let Some(index) = ui::pick(&format!("Which stack {}?", the_one(command)), &labels)?
                 && index < self.candidates.len()
             {
-                let skip = self.listed()[index].spelled(command, command_args);
+                let skip = self.listed()[index].spelled(spelling(), command, command_args);
                 let candidate = self.candidates.swap_remove(index);
                 let project = adopt(&candidate.desired, candidate.rebuilt)?;
                 ui::dim(&format!("skip this question next time: {skip}"));
                 return Ok(project);
             }
         }
-        Err(self.refusal(command, command_args))
+        Err(self.refusal(spelling(), command, command_args))
     }
 
-    /// Each choice as its own command.
-    fn refusal(&self, command: &str, command_args: &[String]) -> anyhow::Error {
+    /// Each choice as its own command. `--raw` prints the old full lines,
+    /// labelled by a shell comment so each still pastes as it stands.
+    fn refusal(&self, spelling: Spelling, command: &str, command_args: &[String]) -> anyhow::Error {
         let mut error = fail!(
             "{} stacks are declared here — name the one {}",
             self.candidates.len(),
             the_one(command)
         );
         for listed in self.listed() {
-            error = error.now(listed.spelled(command, command_args));
+            let line = listed.spelled(spelling, command, command_args);
+            error = error.now(match spelling {
+                Spelling::Short => line,
+                Spelling::Raw => format!(
+                    "{line}  # {} on {}",
+                    listed.desired.identity, listed.desired.destination
+                ),
+            });
         }
-        error.now("each one's state: ulak status").into_err()
+        let state = match spelling {
+            Spelling::Short => "each one's state: ulak status",
+            Spelling::Raw => "each one's state: ulak status --raw",
+        };
+        error.now(state).into_err()
     }
 
     /// Where `init` writes when every stack here shares one settings home.
@@ -1204,8 +1298,8 @@ pub(crate) fn compose_spawn(project: &Project, tail: &[&str]) -> Spawn {
     spawn_for(&["ulak", "docker", "compose"], project, tail)
 }
 
-/// The spawnable twin of a root command in full (`render_project`): a name
-/// would have to be looked up again in the catalog, these words already aim.
+/// The spawnable twin of `root_command`'s `--raw` spelling: a name would
+/// have to be looked up again in the catalog, these words already aim.
 pub(crate) fn root_spawn(project: &Project, tail: &[&str]) -> Spawn {
     spawn_for(&["ulak"], project, tail)
 }
@@ -1398,7 +1492,7 @@ mod tests {
             );
             assert_eq!(
                 joined(root_spawn(&project, &["sync"])),
-                render_project(&["ulak"], &project, &words(&["sync"])),
+                root_command_in(Spelling::Raw, &project, &["sync"]),
                 "pinned to {pin}"
             );
         }
@@ -1843,7 +1937,7 @@ mod tests {
         };
 
         let args = ["--dry-run", "--max-delete", "7"].map(String::from);
-        let refused = said(&several().refusal("sync", &args));
+        let refused = said(&several().refusal(Spelling::Short, "sync", &args));
         assert_eq!(
             refused,
             "2 stacks are declared here — name the one to sync\n\
@@ -1858,7 +1952,7 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(said(&error).contains("ulak doctor shop-test"));
-        let refused = said(&several().refusal("clean", &[]));
+        let refused = said(&several().refusal(Spelling::Short, "clean", &[]));
         assert!(
             refused.contains("name the one whose workspace to remove"),
             "{refused}"
@@ -1871,6 +1965,52 @@ mod tests {
                 "shop        live   devbox   compose.yaml",
                 "shop-test   idle   devbox   compose.test.yaml",
             ]
+        );
+    }
+
+    /// `--raw` keeps the old full lines on request: every selector
+    /// absolute, every typed argument, and a `#` label so each line still
+    /// pastes as it stands.
+    #[test]
+    fn several_stacks_refused_raw_spell_each_invocation_in_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(dir.join("compose.test.yaml"), "services: {}\n").unwrap();
+        let several = Several {
+            cwd: dir.clone(),
+            candidates: vec![
+                candidate(&dir, "compose.yaml", "shop", true),
+                candidate(&dir, "compose.test.yaml", "shop-test", false),
+            ],
+            catalog: Vec::new(),
+        };
+        let args = ["--dry-run".to_string()];
+        let refused = said(&several.refusal(Spelling::Raw, "sync", &args));
+        let at = sh_quote(&dir.display().to_string());
+        for (file, name) in [("compose.yaml", "shop"), ("compose.test.yaml", "shop-test")] {
+            let full = format!(
+                "-f {} -p {name} --project-directory {at} sync --dry-run  # {name} on devbox",
+                sh_quote(&dir.join(file).display().to_string())
+            );
+            assert!(refused.contains(&full), "{full}\nin:\n{refused}");
+        }
+        assert!(
+            !refused.contains("ulak sync shop "),
+            "no stack names: {refused}"
+        );
+        assert!(
+            refused.ends_with("each one's state: ulak status --raw"),
+            "{refused}"
+        );
+
+        let listed = several.listed();
+        assert!(
+            listed[1]
+                .in_full(&["status"])
+                .contains("-p shop-test --project-directory"),
+            "{}",
+            listed[1].in_full(&["status"])
         );
     }
 
@@ -1899,6 +2039,18 @@ mod tests {
         assert_eq!(
             root_command(&project, &["doctor"]),
             format!("ulak doctor {identity}")
+        );
+
+        // `--raw` names no stack: the files, name and directory in full,
+        // aimed at the declared server because the config has moved on.
+        let raw = root_command_in(Spelling::Raw, &project, &["sync", "--max-delete=3"]);
+        assert!(
+            raw.starts_with(&format!("env ULAK_HOST={server} ulak -f "))
+                && raw.ends_with(&format!(
+                    "-p {identity} --project-directory {} sync --max-delete=3",
+                    sh_quote(&dir.display().to_string())
+                )),
+            "{raw}"
         );
     }
 

@@ -87,6 +87,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         init::ensure_global();
         agent::ensure();
     }
+    if cli.raw() {
+        management::spell_raw();
+    }
     match cli.command {
         Command::Init { host } => {
             init::run(host, &globals)?;
@@ -96,6 +99,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             stack,
             dry_run,
             max_delete,
+            ..
         } => {
             let mut command_args = Vec::new();
             if dry_run {
@@ -148,18 +152,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Doctor { stack } => doctor::run(&globals, stack.as_deref()),
+        Command::Doctor { stack, .. } => doctor::run(&globals, stack.as_deref()),
         Command::Service { command } => match command {
             ServiceCommand::Run { foreground } => service::run(foreground),
             ServiceCommand::Install { no_start } => agent::install(!no_start),
             ServiceCommand::Uninstall => agent::uninstall(),
         },
         Command::Config { json } => configcmd::run(&globals, json),
-        Command::Status { stack } => commands::status(&globals, stack.as_deref()),
+        Command::Status { stack, .. } => commands::status(&globals, stack.as_deref()),
         Command::Ui => tui::run(&globals),
         Command::Clean {
             stack,
             forget_destination,
+            ..
         } => commands::clean(&globals, stack.as_deref(), forget_destination.as_deref()),
         Command::Docker { args } => docker::dispatch(&globals, args),
         Command::Shim { command } => match command {

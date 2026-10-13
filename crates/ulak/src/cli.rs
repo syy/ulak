@@ -39,6 +39,17 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// `--raw` on the command that was typed.
+    pub fn raw(&self) -> bool {
+        matches!(
+            self.command,
+            Command::Doctor { raw: true, .. }
+                | Command::Sync { raw: true, .. }
+                | Command::Status { raw: true, .. }
+                | Command::Clean { raw: true, .. }
+        )
+    }
+
     /// The compose globals, back in compose's own argv shape, so the one
     /// canonical invocation is built from a single kind of input no
     /// matter which door the user came through.
@@ -83,6 +94,12 @@ pub enum Command {
         /// NAME@SERVER when two servers have a stack of that name.
         #[arg(value_name = "STACK")]
         stack: Option<String>,
+        /// Spell suggested commands in full instead of by stack name
+        ///
+        /// Absolute Compose files, project name and project directory:
+        /// longer, but the same from any directory.
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Synchronize project files with the server once
@@ -107,6 +124,12 @@ pub enum Command {
         /// (overrides [sync] max_delete from the config)
         #[arg(long, value_name = "N")]
         max_delete: Option<String>,
+        /// Spell suggested commands in full instead of by stack name
+        ///
+        /// Absolute Compose files, project name and project directory:
+        /// longer, but the same from any directory.
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Manage the local background service for sync and port forwarding
@@ -137,6 +160,12 @@ pub enum Command {
         /// Write NAME@SERVER when two servers have a stack of that name.
         #[arg(value_name = "STACK")]
         stack: Option<String>,
+        /// Spell commands in full instead of by stack name
+        ///
+        /// Also lists each stack's whole invocation: absolute Compose files,
+        /// project name and project directory, the same from any directory.
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Open the dashboard (beta): containers, images, volumes, networks and logs
@@ -165,6 +194,12 @@ pub enum Command {
         /// there are neither deleted nor forgotten.
         #[arg(long, value_name = "SSH_DEST")]
         forget_destination: Option<String>,
+        /// Spell suggested commands in full instead of by stack name
+        ///
+        /// Absolute Compose files, project name and project directory:
+        /// longer, but the same from any directory.
+        #[arg(long)]
+        raw: bool,
     },
 
     // Keep routing in catalog: the old clap variants left 316 of Docker's 327
@@ -469,6 +504,27 @@ mod tests {
             panic!("expected status");
         };
         assert_eq!(stack, None);
+    }
+
+    /// The full spelling is asked for on the command it changes, and only
+    /// there: the default stays short.
+    #[test]
+    fn raw_is_asked_for_on_each_management_command_and_off_by_default() {
+        for argv in [
+            ["status", "--raw"].as_slice(),
+            &["doctor", "shop", "--raw"],
+            &["sync", "--raw", "--dry-run"],
+            &["clean", "--raw"],
+        ] {
+            assert!(parse(argv).raw(), "{argv:?}");
+        }
+        for argv in [["status"].as_slice(), &["sync", "--dry-run"], &["doctor"]] {
+            assert!(!parse(argv).raw(), "{argv:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["ulak", "init", "--raw"]).is_err(),
+            "--raw belongs to the commands whose hints it spells"
+        );
     }
 
     /// `--forget-destination` selects by server, so a stack name beside it

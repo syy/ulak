@@ -480,6 +480,27 @@ fn equally_specific_declarations_are_shown_together_and_chosen_by_name() {
         "status printed raw invocations instead of the names:\n{text}"
     );
 
+    // The full invocations are still there, asked for.
+    let raw = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.cwd)
+        .args(["status", "--raw"])
+        .output()
+        .unwrap();
+    let raw_text = both(&raw);
+    assert!(raw.status.success(), "status --raw failed:\n{raw_text}");
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            raw_text
+                .lines()
+                .any(|line| line.contains(&format!("-p {identity} "))
+                    && line.contains("--project-directory")
+                    && line.trim_end().ends_with(" status")),
+            "status --raw did not spell {identity} in full:\n{raw_text}"
+        );
+    }
+
     let sync = project
         .ws
         .ulak(&project.server)
@@ -496,6 +517,27 @@ fn equally_specific_declarations_are_shown_together_and_chosen_by_name() {
         assert!(
             sync_text.contains(&format!("ulak sync {identity} --dry-run --max-delete 7")),
             "the choices changed the requested dry-run into a real sync:\n{sync_text}"
+        );
+    }
+    let raw_sync = project
+        .ws
+        .ulak(&project.server)
+        .current_dir(&project.cwd)
+        .args(["sync", "--raw", "--dry-run"])
+        .output()
+        .unwrap();
+    let raw_sync_text = both(&raw_sync);
+    assert!(
+        !raw_sync.status.success(),
+        "an ambiguous raw sync guessed:\n{raw_sync_text}"
+    );
+    for identity in [&project.identity, &second.identity] {
+        assert!(
+            raw_sync_text.contains(&format!(
+                "-p {identity} --project-directory {} sync --dry-run  # {identity} on ",
+                project.cwd.canonicalize().unwrap().display()
+            )),
+            "sync --raw did not list {identity} in full:\n{raw_sync_text}"
         );
     }
 
