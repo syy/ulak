@@ -7,21 +7,44 @@
 //! files, project name, destination and sync workspace that Ulak is already
 //! maintaining. `Desired` is the one complete, validated answer.
 //!
-//! Selection therefore has three rungs, in this order:
+//! A stack NAME typed after the command (`ulak status shop`) outranks all of
+//! the rungs below: it names one declaration on this machine by its Compose
+//! project name, from any directory, and `name@destination` settles a name
+//! two servers share. Typed on the command line, it also outranks
+//! `COMPOSE_*` from the environment, which is Docker's own precedence:
+//! flags win over the environment. Typed Compose globals are a second answer
+//! to the same question, so they are refused rather than merged.
+//!
+//! Without a name, selection has three rungs, in this order:
 //!   1. globals or owned `COMPOSE_*` input supplied for this command;
 //!   2. the most specific validated Desired declaration for this local
 //!      Ulak workspace and cwd;
 //!   3. ordinary Docker discovery, but never across a nearer Ulak config
 //!      boundary.
 //!
-//! Several declarations at the same specificity are ambiguous. Guessing is
-//! especially unsafe for `clean`, so every root command refuses and prints
-//! the exact explicit invocations instead. A declaration is rebuilt through
-//! `Desired::rebuild_for_stack`; this module never parses its argv or trusts
-//! its paths a second way. This module also owns pasteable command rendering:
-//! every Compose selector, the historical identity when there is one, and
-//! every root-command argument travel together so a `--dry-run` cannot turn
-//! into a mutating retry.
+//! Several declarations at the same specificity are `Context::Several`, and
+//! no rung guesses between them. What that means is each command's own
+//! answer. `status` describes them all side by side. `doctor` and `sync`
+//! ask in a terminal (`Choose::Ask`). `clean` removes a workspace, so it
+//! never takes a choice from an Enter key (`Choose::Named`). Every refusal
+//! lists each choice as its short, named command. A declaration is rebuilt
+//! through `Desired::rebuild_for_stack`; this module never parses its argv
+//! or trusts its paths a second way.
+//!
+//! This module also owns pasteable command rendering. A root command for a
+//! declared project is spelled by name (`ulak sync shop --dry-run`): the
+//! name selects the declaration, and with it the files, project name and
+//! server it pinned. Spelling every absolute `-f` and `--project-directory`
+//! instead made each hint a line nobody would retype. Everything else
+//! printed into the shell that ran the command is spelled for that shell:
+//! the shortest globals that `Invocation::capture_in` reads back to the same
+//! invocation from its directory and environment, measured candidate by
+//! candidate (`here_globals_in`), and every selector in absolute form when
+//! nothing shorter agrees. Text the service keeps is read later and from
+//! anywhere, so it keeps the absolute form (`compose_command`). Either way
+//! the historical identity rides along as `-p`, and every root-command
+//! argument travels with the line so a `--dry-run` cannot turn into a
+//! mutating retry.
 //!
 //! A declaration outranks a later `host` edit, and this module is where that
 //! is said: `warn_on_destination_drift` speaks once, at the one site a
@@ -30,11 +53,13 @@
 //! out for a server that no longer exists is `clean --forget-destination`,
 //! selected by DESTINATION through `declared_on`: today's config no longer
 //! names that server, so nothing that starts from the config could reach the
-//! declaration. Every pasteable command rendered from a project passes
-//! through `render_project`, and that is where a pinned project whose config
-//! no longer answers the same server gets `env ULAK_HOST=<declared>` in front
-//! (`aimed_at`): the globals alone bind a paste to the config, which for a
-//! drifted checkout is a different stack than the line describes.
+//! declaration. A named root command needs no aiming, because the name
+//! carries the declared server. Every other pasteable command rendered from
+//! a project passes through `render_project` or `render_here`, and both
+//! put `env ULAK_HOST=<declared>` in front when a pinned project's config no
+//! longer answers the same server (`aim_for`): the globals alone bind a
+//! paste to the config, which for a drifted checkout is a different stack
+//! than the line describes.
 
 use std::path::{Path, PathBuf};
 
@@ -48,41 +73,62 @@ use crate::ui::{self, fail};
 
 pub enum Context {
     Project(Box<Project>),
+    /// More than one declaration answers this directory equally well.
+    Several(Several),
     Workspace(Box<Workspace>),
     Outside,
 }
 
+/// How a command that acts on ONE stack settles `Context::Several`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choose {
+    /// Ask in a terminal. Without one, or when the question is dismissed,
+    /// refuse and list the named commands.
+    Ask,
+    /// Always refuse and list the named commands. For a command that
+    /// removes something: the name is typed, never taken from an Enter key.
+    Named,
+}
+
 struct Candidate {
+    stack_id: String,
     desired: Desired,
     rebuilt: Rebuilt,
     score: usize,
 }
 
 /// Locate the context for one of Ulak's own root commands.
-pub fn locate(globals: &[String], command: &str, command_args: &[String]) -> Result<Context> {
+///
+/// `stack` is the name typed after the command, if any. It outranks every
+/// other rung; see the module header.
+pub fn locate(
+    globals: &[String],
+    command: &str,
+    command_args: &[String],
+    stack: Option<&str>,
+) -> Result<Context> {
+    if let Some(spec) = stack {
+        return named(globals, command, command_args, spec)
+            .map(|project| Context::Project(Box::new(project)));
+    }
     if !globals.is_empty() || crate::invocation::compose_environment_is_explicit() {
         return Project::locate(globals).map(|project| Context::Project(Box::new(project)));
     }
 
-    let cwd = std::env::current_dir()
-        .context("cannot read current directory")?
-        .canonicalize()
-        .context("cannot canonicalize current directory")?;
+    let cwd = current_dir()?;
     let boundary = config::workspace_home(&cwd);
 
     let mut candidates = declared_candidates(&cwd, boundary.as_deref());
     if let Some(best) = candidates.iter().map(|candidate| candidate.score).max() {
         candidates.retain(|candidate| candidate.score == best);
         if candidates.len() > 1 {
-            return Err(ambiguous(&cwd, command, command_args, &candidates));
+            return Ok(Context::Several(Several::new(cwd, candidates)));
         }
         // `best` came from this vector and `retain` keeps every row with
         // that score, so this branch has exactly one element.
         let candidate = candidates.remove(0);
-        let project = candidate.desired.project_from_rebuilt(candidate.rebuilt)?;
-        warn_on_destination_drift(&project);
-        activate(&project);
-        return Ok(Context::Project(Box::new(project)));
+        return adopt(&candidate.desired, candidate.rebuilt)
+            .map(|project| Context::Project(Box::new(project)));
     }
 
     // Build Docker's discovered answer without activating its audit trail.
@@ -104,9 +150,16 @@ pub fn locate(globals: &[String], command: &str, command_args: &[String]) -> Res
 }
 
 /// The project-only half used by commands that have no workspace form.
-pub fn project(globals: &[String], command: &str, command_args: &[String]) -> Result<Project> {
-    match locate(globals, command, command_args)? {
+pub fn project(
+    globals: &[String],
+    command: &str,
+    command_args: &[String],
+    stack: Option<&str>,
+    how: Choose,
+) -> Result<Project> {
+    match locate(globals, command, command_args, stack)? {
         Context::Project(project) => Ok(*project),
+        Context::Several(several) => several.choose(command, command_args, how),
         Context::Workspace(workspace) => Err(fail!(
             "no Compose project is selected in the Ulak workspace {}",
             workspace.root.display()
@@ -127,53 +180,110 @@ pub fn project(globals: &[String], command: &str, command_args: &[String]) -> Re
 }
 
 /// An exact root command for this invocation, safe to paste into a shell.
+///
+/// By name for a declared project, which reads the same from any
+/// directory: see the module header. A project with no declaration is
+/// only ever rendered by the command a user just typed, so it is spelled
+/// for that shell, never bare: a bare root command would first consult the
+/// declarations and could select a different stack. A pinned project
+/// whose declaration has since been removed keeps the full spelling,
+/// because the service renders those and its text is read elsewhere.
 pub fn root_command(project: &Project, tail: &[&str]) -> String {
-    render_project(
-        &["ulak"],
-        project,
-        &tail
-            .iter()
-            .map(|word| (*word).to_string())
-            .collect::<Vec<_>>(),
-    )
+    let tail = words(tail);
+    match (declared_selector(project), tail.split_first()) {
+        (Some(selector), Some((command, args))) => named_command(command, args, &selector),
+        _ if project.stack_pin.is_some() => render_project(&["ulak"], project, &tail),
+        _ => render_here(
+            &["ulak"],
+            project,
+            project.compose_model_project_name(),
+            &tail,
+            Bare::Refused,
+        ),
+    }
 }
 
-/// An exact Docker Compose command for this invocation, safe to paste.
+/// What to type after a root command to reach one declared stack: its
+/// Compose project name, or `name@destination` when another server in
+/// `catalog` has a stack of the same name. `resolve` reads it back by the
+/// same rule.
+pub(crate) fn selector_in(catalog: &[(String, Desired)], desired: &Desired) -> String {
+    let shared = catalog
+        .iter()
+        .filter(|(_, other)| other.identity == desired.identity)
+        .count();
+    if shared > 1 {
+        format!("{}@{}", desired.identity, desired.destination)
+    } else {
+        desired.identity.clone()
+    }
+}
+
+fn declared_selector(project: &Project) -> Option<String> {
+    let pin = project.stack_pin.as_ref()?;
+    let catalog = intent::catalog();
+    let (_, desired) = catalog.iter().find(|(_, desired)| {
+        desired.identity == pin.identity && desired.destination == pin.destination
+    })?;
+    Some(selector_in(&catalog, desired))
+}
+
+/// `ulak <command> <selector> <args…>`, shell-quoted.
+fn named_command(command: &str, command_args: &[String], selector: &str) -> String {
+    let mut words = vec![
+        "ulak".to_string(),
+        command.to_string(),
+        selector.to_string(),
+    ];
+    words.extend_from_slice(command_args);
+    shell_join(&words)
+}
+
+/// An exact Docker Compose command for this invocation, safe to paste from
+/// any directory. For text read later and elsewhere, such as the service's
+/// notes; a line printed into the shell that ran this command uses
+/// `compose_command_here`.
 pub fn compose_command(project: &Project, tail: &[&str]) -> String {
-    render_project(
+    render_project(&["ulak", "docker", "compose"], project, &words(tail))
+}
+
+/// `compose_command`, spelled for the shell that ran this command: the
+/// shortest globals that read back to the same invocation from its
+/// directory and environment (`here_globals_in`).
+pub fn compose_command_here(project: &Project, tail: &[&str]) -> String {
+    render_here(
         &["ulak", "docker", "compose"],
         project,
-        &tail
-            .iter()
-            .map(|word| (*word).to_string())
-            .collect::<Vec<_>>(),
+        project.compose_model_project_name(),
+        &words(tail),
+        Bare::Allowed,
     )
 }
 
-/// An exact Docker Compose command for a known resolved identity over the
-/// selected files. The server model, historical lifecycle state or Docker
-/// labels may know `-p` more precisely than today's local inputs; spelling it
-/// here keeps that answer attached to the invocation that can act on it.
-pub fn compose_command_for_identity(project: &Project, identity: &str, tail: &[&str]) -> String {
-    aim_for(
+/// `compose_command_here` for a known resolved identity over the selected
+/// files. The server model, historical lifecycle state or Docker labels may
+/// know `-p` more precisely than today's local inputs; spelling it here
+/// keeps that answer attached to the invocation that can act on it.
+pub fn compose_command_here_as(project: &Project, identity: &str, tail: &[&str]) -> String {
+    render_here(
+        &["ulak", "docker", "compose"],
         project,
-        render(
-            &["ulak", "docker", "compose"],
-            &project.inv,
-            Some(identity),
-            &tail
-                .iter()
-                .map(|word| (*word).to_string())
-                .collect::<Vec<_>>(),
-        ),
+        Some(identity),
+        &words(tail),
+        Bare::Allowed,
     )
+}
+
+fn words(tail: &[&str]) -> Vec<String> {
+    tail.iter().map(|word| (*word).to_string()).collect()
 }
 
 /// Say once, here, that a declaration outranks a later config edit.
 ///
-/// ONE site, because this is the only place a declaration is chosen for a
-/// root command. `init` passes through here too and addresses no server,
-/// so the headline is about the checkout, not about "this command".
+/// ONE caller, `adopt`, where every way of choosing a declaration for a
+/// root command ends: by scope, by name or from the picker. `init` passes
+/// through here too and addresses no server, so the headline is about the
+/// checkout, not about "this command".
 fn warn_on_destination_drift(project: &Project) {
     let Ok(destination) = project.destination() else {
         return;
@@ -290,15 +400,20 @@ fn declarations_in_scope(cwd: &Path, boundary: Option<&Path>) -> Vec<intent::Des
         .into_iter()
         .map(|(_, desired)| desired)
         .filter(|desired| {
-            let declared_from = Path::new(&desired.cwd);
             !desired.workspace_id.is_empty()
                 && desired.workspace_id.chars().all(|c| c.is_ascii_hexdigit())
                 && config::validate_ssh_dest(&desired.destination).is_ok()
-                && (boundary.is_none()
-                    || config::workspace_home(declared_from).as_deref() == boundary)
-                && scope_of(cwd, boundary, declared_from).is_some()
+                && in_scope(cwd, boundary, Path::new(&desired.cwd))
         })
         .collect()
+}
+
+/// Whether a declaration made from `declared_from` belongs to a command
+/// typed in `cwd`: inside the same Ulak workspace, and in scope by
+/// `scope_of`.
+fn in_scope(cwd: &Path, boundary: Option<&Path>, declared_from: &Path) -> bool {
+    (boundary.is_none() || config::workspace_home(declared_from).as_deref() == boundary)
+        && scope_of(cwd, boundary, declared_from).is_some()
 }
 
 /// The sync workspaces whose declarations on `destination` a root command
@@ -317,10 +432,7 @@ fn declarations_in_scope(cwd: &Path, boundary: Option<&Path>) -> Vec<intent::Des
 /// at "the checkout that declared it" pointed straight back at this very
 /// directory, which is a dead end wearing a next step.
 pub(crate) fn declared_on(destination: &str) -> Result<Vec<String>> {
-    let cwd = std::env::current_dir()
-        .context("cannot read current directory")?
-        .canonicalize()
-        .context("cannot canonicalize current directory")?;
+    let cwd = current_dir()?;
     let boundary = config::workspace_home(&cwd);
     let declared = declarations_in_scope(&cwd, boundary.as_deref());
     // No best-score filter: `retire_declarations` is keyed by workspace and
@@ -407,6 +519,7 @@ fn declared_candidates(cwd: &Path, boundary: Option<&Path>) -> Vec<Candidate> {
             continue;
         };
         out.push(Candidate {
+            stack_id: id,
             desired,
             rebuilt,
             score,
@@ -434,42 +547,489 @@ fn scope_of(cwd: &Path, boundary: Option<&Path>, declared_from: &Path) -> Option
     (cwd.starts_with(boundary) && declared_from.starts_with(cwd)).then_some(0)
 }
 
-fn ambiguous(
-    cwd: &Path,
+/// Turn the chosen declaration into the project a root command runs on.
+/// Every way of choosing one ends here, so the drift warning speaks once.
+fn adopt(desired: &Desired, rebuilt: Rebuilt) -> Result<Project> {
+    let project = desired.project_from_rebuilt(rebuilt)?;
+    warn_on_destination_drift(&project);
+    activate(&project);
+    Ok(project)
+}
+
+fn current_dir() -> Result<PathBuf> {
+    std::env::current_dir()
+        .context("cannot read current directory")?
+        .canonicalize()
+        .context("cannot canonicalize current directory")
+}
+
+// ─── a stack by name ─────────────────────────────────────────────────
+
+/// The declaration a typed stack name selects, from any directory.
+fn named(
+    globals: &[String],
     command: &str,
     command_args: &[String],
-    candidates: &[Candidate],
+    spec: &str,
+) -> Result<Project> {
+    if !globals.is_empty() {
+        let mut by_files = vec!["ulak".to_string()];
+        by_files.extend_from_slice(globals);
+        by_files.extend(command_line(command, command_args));
+        return Err(fail!(
+            "`{spec}` and `{}` both choose the project",
+            shell_join(globals)
+        )
+        .now(format!(
+            "by its name: {}",
+            named_command(command, command_args, spec)
+        ))
+        .now(format!("or by its files: {}", shell_join(&by_files)))
+        .into_err());
+    }
+    let cwd = current_dir()?;
+    let boundary = config::workspace_home(&cwd);
+    let catalog = intent::catalog();
+    let (stack_id, desired) = resolve(
+        &catalog,
+        spec,
+        &cwd,
+        boundary.as_deref(),
+        command,
+        command_args,
+    )?;
+    let rebuilt = desired
+        .rebuild_for_stack(stack_id)
+        .map_err(|error| unreadable(desired, error, command, command_args))?;
+    adopt(desired, rebuilt)
+}
+
+/// A named stack whose checkout cannot be read any more. The rebuild's own
+/// reason names a path relative to a directory the user never typed, or
+/// none at all, and the fallback step was `ulak doctor`, which meets the
+/// same wall. Say which stack and where it was declared from, and keep
+/// whatever steps the reason did have.
+///
+/// A moved checkout is a new workspace. A live stack is declared again from
+/// there, so the service follows it; an idle one is only run from there.
+/// `clean` gets neither: from the new place it would address the new,
+/// empty workspace and report the old one gone.
+fn unreadable(
+    desired: &Desired,
+    error: anyhow::Error,
+    command: &str,
+    command_args: &[String],
 ) -> anyhow::Error {
-    let mut error = fail!(
-        "more than one declared Compose project matches {}",
-        cwd.display()
-    )
-    .now("choose one explicitly:");
-    let tail = command_line(command, command_args);
-    for candidate in candidates {
-        // Through the pinned project, so `render_project` aims the line
-        // exactly as it would for a chosen declaration: explicit globals
-        // select by config, and without the host both choices would paste
-        // into the SAME stack.
-        let rebuilt = Rebuilt {
-            inv: candidate.rebuilt.inv.clone(),
-            workspace_key: candidate.rebuilt.workspace_key.clone(),
-        };
-        let rendered = match candidate.desired.project_from_rebuilt(rebuilt) {
-            Ok(project) => render_project(&["ulak"], &project, &tail),
-            Err(_) => render(
-                &["ulak"],
-                &candidate.rebuilt.inv,
-                Some(&candidate.desired.identity),
-                &tail,
-            ),
-        };
+    let name = &desired.identity;
+    let from = &desired.cwd;
+    let mut steps = Vec::new();
+    let mut wrapped = if !Path::new(from).is_dir() {
+        if desired.live {
+            steps.push(format!(
+                "if the checkout moved, declare it from there: cd into it, then ulak docker compose -p {} up -d",
+                sh_quote(name)
+            ));
+        } else if command != "clean" {
+            let mut words = vec!["ulak".to_string()];
+            words.extend(command_line(command, command_args));
+            steps.push(format!(
+                "if the checkout moved, cd into it, then: {}",
+                shell_join(&words)
+            ));
+        }
+        fail!("{name} was declared from {from}, which no longer exists")
+    } else if let Some(reason) = error.downcast_ref::<ui::Fail>() {
+        steps.clone_from(&reason.now);
+        fail!("{name} was declared from {from}, but {}", reason.msg)
+    } else {
+        fail!("{name} was declared from {from}, but {error:#}")
+    };
+    steps.push("every stack on this machine: ulak status".to_string());
+    for step in steps {
+        wrapped = wrapped.now(step);
+    }
+    wrapped.into_err()
+}
+
+/// Read a typed `name` or `name@destination` back against the catalog, by
+/// the rule `selector_in` writes it with.
+///
+/// Split at the FIRST `@`: a Compose project name cannot contain one, and a
+/// destination such as `deploy@10.0.0.1` may. A name two servers share is
+/// settled by the checkout it is typed in, when exactly one of them was
+/// declared there; anywhere else it needs its server.
+fn resolve<'a>(
+    catalog: &'a [(String, Desired)],
+    spec: &str,
+    cwd: &Path,
+    boundary: Option<&Path>,
+    command: &str,
+    command_args: &[String],
+) -> Result<(&'a str, &'a Desired)> {
+    let (name, server) = match spec.split_once('@') {
+        Some((name, server)) => (name, Some(server)),
+        None => (spec, None),
+    };
+    if name.is_empty() || server.is_some_and(str::is_empty) {
+        return Err(fail!("`{spec}` is not a stack name")
+            .now(format!(
+                "name a stack by its Compose project name: {}",
+                named_command(command, command_args, "my-app")
+            ))
+            .now(format!(
+                "and add its server when two servers share the name: {}",
+                named_command(command, command_args, "my-app@my-server")
+            ))
+            .into_err());
+    }
+    let same_name: Vec<&(String, Desired)> = catalog
+        .iter()
+        .filter(|(_, desired)| desired.identity == name)
+        .collect();
+    let matching: Vec<&(String, Desired)> = same_name
+        .iter()
+        .copied()
+        .filter(|(_, desired)| server.is_none_or(|server| desired.destination == server))
+        .collect();
+    let chosen = match matching.as_slice() {
+        [] => None,
+        [one] => Some(*one),
+        shared => {
+            let here: Vec<&(String, Desired)> = shared
+                .iter()
+                .copied()
+                .filter(|(_, desired)| in_scope(cwd, boundary, Path::new(&desired.cwd)))
+                .collect();
+            match here.as_slice() {
+                [one] => Some(*one),
+                _ => {
+                    let mut error = fail!("{name} is declared on {} servers", shared.len());
+                    for (_, desired) in shared {
+                        error = error.now(named_command(
+                            command,
+                            command_args,
+                            &format!("{name}@{}", desired.destination),
+                        ));
+                    }
+                    return Err(error.into_err());
+                }
+            }
+        }
+    };
+    if let Some((stack_id, desired)) = chosen {
+        return Ok((stack_id.as_str(), desired));
+    }
+    if let Some(server) = server.filter(|_| !same_name.is_empty()) {
+        let mut error = fail!("{name} is not declared on {server}");
+        for (_, desired) in &same_name {
+            error = error.now(format!(
+                "it is on {}: {}",
+                desired.destination,
+                named_command(command, command_args, &selector_in(catalog, desired))
+            ));
+        }
+        return Err(error.into_err());
+    }
+    Err(unknown(catalog, name, cwd, boundary, command, command_args))
+}
+
+/// No declaration has that name: offer the near miss, then what exists.
+fn unknown(
+    catalog: &[(String, Desired)],
+    name: &str,
+    cwd: &Path,
+    boundary: Option<&Path>,
+    command: &str,
+    command_args: &[String],
+) -> anyhow::Error {
+    let mut error = fail!("no stack named {name} is declared on this machine");
+    let mut declared: Vec<&str> = catalog
+        .iter()
+        .map(|(_, desired)| desired.identity.as_str())
+        .collect();
+    declared.sort_unstable();
+    declared.dedup();
+    if let Some(close) = closest(name, &declared) {
+        for (at, selector) in spelled(catalog, close, cwd, boundary).iter().enumerate() {
+            let lead = if at == 0 { "did you mean" } else { "or" };
+            error = error.now(format!(
+                "{lead}: {}",
+                named_command(command, command_args, selector)
+            ));
+        }
+    }
+    let names = |here: bool| {
+        let mut names: Vec<String> = catalog
+            .iter()
+            .filter(|(_, desired)| !here || in_scope(cwd, boundary, Path::new(&desired.cwd)))
+            .map(|(_, desired)| selector_in(catalog, desired))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let here = names(true);
+    if !here.is_empty() {
+        error = error.now(format!("declared here: {}", some_of(&here)));
+    } else if !catalog.is_empty() {
         error = error.now(format!(
-            "{rendered}  # {} on {}",
-            candidate.desired.identity, candidate.desired.destination
+            "declared on this machine: {}",
+            some_of(&names(false))
         ));
+    } else {
+        error = error.now(
+            "nothing is declared on this machine yet: ulak docker compose up -d declares a stack",
+        );
     }
     error.into_err()
+}
+
+/// The one declared name `typed` most likely meant: the only name it
+/// begins, else the only name nearest it within a few edits. Over NAMES,
+/// not declarations: a name two servers share is one answer, and judged
+/// per declaration it tied with itself and suggested nothing.
+fn closest<'a>(typed: &str, names: &[&'a str]) -> Option<&'a str> {
+    let mut prefixed = names.iter().filter(|name| name.starts_with(typed));
+    if let (Some(only), None) = (prefixed.next(), prefixed.next()) {
+        return Some(only);
+    }
+    let limit = 2.max(typed.chars().count() / 3);
+    let scored: Vec<(usize, &str)> = names
+        .iter()
+        .map(|name| (edits(typed, name), *name))
+        .filter(|(distance, _)| *distance <= limit)
+        .collect();
+    let best = scored.iter().map(|(distance, _)| *distance).min()?;
+    let mut nearest = scored.iter().filter(|(distance, _)| *distance == best);
+    match (nearest.next(), nearest.next()) {
+        (Some((_, only)), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// How to type a declared `name` so `resolve` selects it from here: the
+/// name alone when it is one declaration, or the one declared in this
+/// checkout; once per server otherwise.
+fn spelled(
+    catalog: &[(String, Desired)],
+    name: &str,
+    cwd: &Path,
+    boundary: Option<&Path>,
+) -> Vec<String> {
+    let servers: Vec<&Desired> = catalog
+        .iter()
+        .map(|(_, desired)| desired)
+        .filter(|desired| desired.identity == name)
+        .collect();
+    let here = servers
+        .iter()
+        .filter(|desired| in_scope(cwd, boundary, Path::new(&desired.cwd)))
+        .count();
+    if servers.len() == 1 || here == 1 {
+        return vec![name.to_string()];
+    }
+    servers
+        .iter()
+        .map(|desired| format!("{name}@{}", desired.destination))
+        .collect()
+}
+
+/// Levenshtein distance, over chars.
+fn edits(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// A list a refusal can print on one line, however many stacks there are.
+fn some_of(names: &[String]) -> String {
+    const SHOWN: usize = 8;
+    if names.len() <= SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        names[..SHOWN].join(", "),
+        names.len() - SHOWN
+    )
+}
+
+// ─── several declarations here ───────────────────────────────────────
+
+/// Every declaration that answers this directory equally well.
+pub struct Several {
+    cwd: PathBuf,
+    /// Sorted by name, then server, so every listing reads the same.
+    candidates: Vec<Candidate>,
+    /// Read once, so every selector is spelled against the same catalog.
+    catalog: Vec<(String, Desired)>,
+}
+
+/// One of them, as a listing shows it.
+pub struct Listed<'a> {
+    pub stack_id: &'a str,
+    pub desired: &'a Desired,
+    /// What to type after a root command to reach it.
+    pub selector: String,
+    /// Its Compose files, relative to this directory when below it.
+    pub files: String,
+}
+
+impl Listed<'_> {
+    /// The root command that runs `command` on this stack.
+    fn spelled(&self, command: &str, command_args: &[String]) -> String {
+        named_command(command, command_args, &self.selector)
+    }
+}
+
+impl Several {
+    fn new(cwd: PathBuf, mut candidates: Vec<Candidate>) -> Several {
+        candidates.sort_by(|a, b| {
+            (&a.desired.identity, &a.desired.destination)
+                .cmp(&(&b.desired.identity, &b.desired.destination))
+        });
+        Several {
+            cwd,
+            candidates,
+            catalog: intent::catalog(),
+        }
+    }
+
+    pub fn listed(&self) -> Vec<Listed<'_>> {
+        self.candidates
+            .iter()
+            .map(|candidate| Listed {
+                stack_id: &candidate.stack_id,
+                desired: &candidate.desired,
+                selector: selector_in(&self.catalog, &candidate.desired),
+                files: files_shown(&self.cwd, &candidate.rebuilt.inv),
+            })
+            .collect()
+    }
+
+    /// Settle on one stack the way `how` allows, or refuse with each
+    /// choice spelled as its named command.
+    pub fn choose(
+        mut self,
+        command: &str,
+        command_args: &[String],
+        how: Choose,
+    ) -> Result<Project> {
+        if how == Choose::Ask {
+            let labels = pick_labels(&self.listed());
+            if let Some(index) = ui::pick(&format!("Which stack {}?", the_one(command)), &labels)?
+                && index < self.candidates.len()
+            {
+                let skip = self.listed()[index].spelled(command, command_args);
+                let candidate = self.candidates.swap_remove(index);
+                let project = adopt(&candidate.desired, candidate.rebuilt)?;
+                ui::dim(&format!("skip this question next time: {skip}"));
+                return Ok(project);
+            }
+        }
+        Err(self.refusal(command, command_args))
+    }
+
+    /// Each choice as its own command.
+    fn refusal(&self, command: &str, command_args: &[String]) -> anyhow::Error {
+        let mut error = fail!(
+            "{} stacks are declared here — name the one {}",
+            self.candidates.len(),
+            the_one(command)
+        );
+        for listed in self.listed() {
+            error = error.now(listed.spelled(command, command_args));
+        }
+        error.now("each one's state: ulak status").into_err()
+    }
+
+    /// Where `init` writes when every stack here shares one settings home.
+    pub fn config_home(&self) -> Result<PathBuf> {
+        let mut homes = Vec::new();
+        for candidate in &self.candidates {
+            let rebuilt = Rebuilt {
+                inv: candidate.rebuilt.inv.clone(),
+                workspace_key: candidate.rebuilt.workspace_key.clone(),
+            };
+            homes.push(candidate.desired.project_from_rebuilt(rebuilt)?.config_home);
+        }
+        homes.sort();
+        homes.dedup();
+        match homes.as_slice() {
+            [home] => Ok(home.clone()),
+            _ => {
+                let mut error = fail!(
+                    "the {} stacks declared here keep their settings in different directories",
+                    self.candidates.len()
+                );
+                for home in &homes {
+                    error = error.now(format!(
+                        "initialize one: cd {} && ulak init",
+                        sh_quote(&home.display().to_string())
+                    ));
+                }
+                Err(error.into_err())
+            }
+        }
+    }
+}
+
+/// What a command does with the one stack it needs, completing both
+/// "Which stack …?" and "name the one …".
+fn the_one(command: &str) -> &'static str {
+    match command {
+        "doctor" => "to check",
+        "sync" => "to sync",
+        "clean" => "whose workspace to remove",
+        _ => "to use",
+    }
+}
+
+/// The picker's rows: name, state, server and files, in aligned columns.
+fn pick_labels(listed: &[Listed<'_>]) -> Vec<String> {
+    let name = listed
+        .iter()
+        .map(|l| l.selector.chars().count())
+        .max()
+        .unwrap_or(0);
+    let server = listed
+        .iter()
+        .map(|l| l.desired.destination.chars().count())
+        .max()
+        .unwrap_or(0);
+    listed
+        .iter()
+        .map(|l| {
+            let state = if l.desired.live { "live" } else { "idle" };
+            format!(
+                "{:<name$}   {state}   {:<server$}   {}",
+                l.selector, l.desired.destination, l.files
+            )
+            .trim_end()
+            .to_string()
+        })
+        .collect()
+}
+
+/// A declaration's Compose files as someone standing in `cwd` would name
+/// them.
+fn files_shown(cwd: &Path, inv: &Invocation) -> String {
+    inv.compose_files
+        .iter()
+        .map(|file| file.strip_prefix(cwd).unwrap_or(file).display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 fn workspace_or_outside(boundary: Option<PathBuf>) -> Result<Context> {
@@ -512,13 +1072,120 @@ fn render_project(prefix: &[&str], project: &Project, tail: &[String]) -> String
 
 fn render(prefix: &[&str], inv: &Invocation, identity: Option<&str>, tail: &[String]) -> String {
     let mut words: Vec<String> = prefix.iter().map(|word| (*word).to_string()).collect();
+    words.extend(exact_globals(inv, identity));
+    words.extend_from_slice(tail);
+    shell_join(&words)
+}
+
+/// Every global, absolute: the spelling that reads the same from any
+/// directory.
+fn exact_globals(inv: &Invocation, identity: Option<&str>) -> Vec<String> {
     let mut exact = inv.clone();
     if let Some(identity) = identity {
         exact.project_name = Some(identity.to_string());
     }
-    words.extend(exact.globals_argv());
+    exact.globals_argv()
+}
+
+/// Whether a rendered command may carry no globals at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bare {
+    /// `ulak docker compose …`: argv, environment and discovery are the
+    /// whole of Docker's answer.
+    Allowed,
+    /// `ulak <root command>`: without globals, the declarations are
+    /// consulted before discovery.
+    Refused,
+}
+
+/// `render`, spelled for the shell that ran this command; see
+/// `here_globals_in`.
+fn render_here(
+    prefix: &[&str],
+    project: &Project,
+    identity: Option<&str>,
+    tail: &[String],
+    bare: Bare,
+) -> String {
+    let globals = match std::env::current_dir() {
+        Ok(cwd) => here_globals_in(
+            &cwd,
+            std::env::vars().collect(),
+            &project.inv,
+            identity,
+            bare,
+        ),
+        Err(_) => exact_globals(&project.inv, identity),
+    };
+    let mut words: Vec<String> = prefix.iter().map(|word| (*word).to_string()).collect();
+    words.extend(globals);
     words.extend_from_slice(tail);
-    shell_join(&words)
+    aim_for(project, shell_join(&words))
+}
+
+/// The shortest globals that `Invocation::capture_in` reads back, from
+/// `cwd` and `env`, to the Compose files, project directory, env files,
+/// profiles and project name of `inv`. Measured rather than reasoned: each
+/// candidate is captured exactly as the pasted line will be, and the full
+/// absolute spelling remains the answer when no shorter one agrees.
+///
+/// `-p` is kept whenever the identity is known. Dropping it could hand the
+/// name to a `name:` inside a Compose file, which this crate never opens.
+///
+/// Only for a line printed into the shell that ran this command, which is
+/// the one place `cwd` and `env` are the reader's. At the filesystem root,
+/// where the service runs, "relative" would mean every path, so the
+/// absolute spelling is used there unconditionally.
+fn here_globals_in(
+    cwd: &Path,
+    env: std::collections::BTreeMap<String, String>,
+    inv: &Invocation,
+    identity: Option<&str>,
+    bare: Bare,
+) -> Vec<String> {
+    let exact = exact_globals(inv, identity);
+    let Ok(cwd) = cwd.canonicalize() else {
+        return exact;
+    };
+    if cwd.parent().is_none() {
+        return exact;
+    }
+    let shown = |path: &Path| match path.strip_prefix(&cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    };
+    let named: Vec<String> = identity
+        .map(|identity| vec!["-p".to_string(), identity.to_string()])
+        .unwrap_or_default();
+    let mut spelled = Vec::new();
+    for file in &inv.compose_files {
+        spelled.extend(["-f".to_string(), shown(file)]);
+    }
+    spelled.extend(named.iter().cloned());
+    for profile in &inv.profiles {
+        spelled.extend(["--profile".to_string(), profile.clone()]);
+    }
+    for env_file in &inv.env_files {
+        spelled.extend(["--env-file".to_string(), shown(env_file)]);
+    }
+    let mut with_dir = spelled.clone();
+    with_dir.extend(["--project-directory".to_string(), shown(&inv.project_dir)]);
+
+    let reads_back = |argv: &[String]| {
+        Invocation::capture_in(&cwd, argv, env.clone()).is_ok_and(|got| {
+            got.compose_files == inv.compose_files
+                && got.project_dir == inv.project_dir
+                && got.env_files == inv.env_files
+                && got.profiles == inv.profiles
+                && got.project_name.as_deref() == identity
+        })
+    };
+    [named, spelled, with_dir]
+        .into_iter()
+        .filter(|argv| bare == Bare::Allowed || !argv.is_empty())
+        .find(|argv| reads_back(argv))
+        .unwrap_or(exact)
 }
 
 /// A rendered command for a caller that RUNS it instead of printing it:
@@ -537,7 +1204,8 @@ pub(crate) fn compose_spawn(project: &Project, tail: &[&str]) -> Spawn {
     spawn_for(&["ulak", "docker", "compose"], project, tail)
 }
 
-/// The spawnable twin of `root_command`.
+/// The spawnable twin of a root command in full (`render_project`): a name
+/// would have to be looked up again in the catalog, these words already aim.
 pub(crate) fn root_spawn(project: &Project, tail: &[&str]) -> Spawn {
     spawn_for(&["ulak"], project, tail)
 }
@@ -562,7 +1230,17 @@ fn spawn_for(prefix: &[&str], project: &Project, tail: &[&str]) -> Spawn {
 fn shell_join(words: &[String]) -> String {
     words
         .iter()
-        .map(|word| sh_quote(word))
+        .enumerate()
+        .map(|(at, word)| match word.split_once('=') {
+            // After the program name an `=` is an ordinary byte, and quoting
+            // the whole word printed `'--max-delete=3'`, which reads like a
+            // mistake. Quoting each side keeps the bytes; the first word is
+            // never split, because there `A=b` would be an assignment.
+            Some((flag, value)) if at > 0 && !flag.is_empty() => {
+                format!("{}={}", sh_quote(flag), sh_quote(value))
+            }
+            _ => sh_quote(word),
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -655,6 +1333,11 @@ mod tests {
     /// server once the config has moved — root and Compose forms alike —
     /// and none does while the two agree. One site renders them all, so
     /// one test reads them all.
+    ///
+    /// A pinned project WITHOUT a declaration on disk, deliberately: with
+    /// one, root commands are spelled by name and need no aiming (see
+    /// `a_root_command_for_a_declared_stack_is_its_name_with_every_argument`),
+    /// so the identity is unique to this test.
     #[test]
     fn every_command_rendered_from_a_drifted_project_is_aimed_and_none_otherwise() {
         let tmp = tempfile::tempdir().unwrap();
@@ -663,27 +1346,29 @@ mod tests {
         std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
         let inv = Invocation::capture_in(&dir, &[], std::collections::BTreeMap::new()).unwrap();
         let mut project = Project::locate_from(inv).unwrap();
+        let api = format!("undeclared-{}", std::process::id());
+        let api = api.as_str();
 
-        project.pin_existing_stack("new-server", "api");
+        project.pin_existing_stack("new-server", api);
         for line in [
             root_command(&project, &["clean"]),
             compose_command(&project, &["down"]),
-            compose_command_for_identity(&project, "api", &["up", "-d"]),
+            compose_command_here_as(&project, api, &["up", "-d"]),
         ] {
             assert!(line.starts_with("ulak "), "no drift, no prefix: {line}");
         }
 
-        project.pin_existing_stack("dead-server", "api");
+        project.pin_existing_stack("dead-server", api);
         for line in [
             root_command(&project, &["clean"]),
             compose_command(&project, &["down"]),
-            compose_command_for_identity(&project, "api", &["up", "-d"]),
+            compose_command_here_as(&project, api, &["up", "-d"]),
         ] {
             assert!(
                 line.starts_with("env ULAK_HOST=dead-server ulak "),
                 "a drifted project's paste must carry its server: {line}"
             );
-            assert!(line.contains("-p api"), "{line}");
+            assert!(line.contains(&format!("-p {api}")), "{line}");
         }
     }
 
@@ -713,7 +1398,7 @@ mod tests {
             );
             assert_eq!(
                 joined(root_spawn(&project, &["sync"])),
-                root_command(&project, &["sync"]),
+                render_project(&["ulak"], &project, &words(&["sync"])),
                 "pinned to {pin}"
             );
         }
@@ -810,6 +1495,499 @@ mod tests {
                 &["clean".into()]
             ),
             "ulak -f '/repo with space/compose.dev.yaml' -p historical --project-directory '/repo with space' clean"
+        );
+    }
+
+    // ─── a stack by name, several here, and spelling for this shell ────
+
+    fn declared(identity: &str, destination: &str, cwd: &str, live: bool) -> Desired {
+        Desired {
+            schema: intent::SCHEMA,
+            live,
+            workspace_id: "abc123".into(),
+            workspace_namespace: "client-a".into(),
+            destination: destination.into(),
+            identity: identity.into(),
+            cwd: cwd.into(),
+            argv_globals: Vec::new(),
+            compose_env: std::collections::BTreeMap::new(),
+            updated_unix: 1,
+        }
+    }
+
+    fn catalog_of(entries: &[Desired]) -> Vec<(String, Desired)> {
+        entries.iter().map(|d| (d.stack_id(), d.clone())).collect()
+    }
+
+    /// The message and every "now" line, as a user reads them.
+    fn said(error: &anyhow::Error) -> String {
+        let fail = error
+            .downcast_ref::<ui::Fail>()
+            .expect("a refusal with next steps");
+        format!("{}\n{}", fail.msg, fail.now.join("\n"))
+    }
+
+    fn resolved(catalog: &[(String, Desired)], spec: &str, cwd: &str) -> Result<String> {
+        resolve(catalog, spec, Path::new(cwd), None, "status", &[])
+            .map(|(_, desired)| format!("{}@{}", desired.identity, desired.destination))
+    }
+
+    /// The name is the whole selector when no other server shares it, and
+    /// it reaches a stack declared from any directory.
+    #[test]
+    fn a_name_alone_selects_the_only_stack_of_that_name_from_anywhere() {
+        let catalog = catalog_of(&[
+            declared("shop", "devbox", "/code/shop", true),
+            declared("shop-test", "devbox", "/code/shop", false),
+            declared("blog", "other", "/code/blog", true),
+        ]);
+        assert_eq!(resolved(&catalog, "shop", "/home").unwrap(), "shop@devbox");
+        assert_eq!(
+            resolved(&catalog, "blog", "/code/shop").unwrap(),
+            "blog@other"
+        );
+        assert_eq!(
+            resolved(&catalog, "shop-test@devbox", "/").unwrap(),
+            "shop-test@devbox"
+        );
+    }
+
+    /// Two servers with a stack of one name: the checkout it is typed in
+    /// settles it when exactly one was declared there; anywhere else both
+    /// spelled choices are offered and neither is guessed.
+    #[test]
+    fn a_name_two_servers_share_is_settled_by_the_checkout_or_by_its_server() {
+        let catalog = catalog_of(&[
+            declared("shop", "old-server", "/work/shop", false),
+            declared("shop", "new-server", "/play/shop", true),
+        ]);
+        assert_eq!(
+            resolved(&catalog, "shop", "/work/shop/src").unwrap(),
+            "shop@old-server"
+        );
+        assert_eq!(
+            resolved(&catalog, "shop@new-server", "/work/shop").unwrap(),
+            "shop@new-server"
+        );
+
+        let refused = said(&resolved(&catalog, "shop", "/elsewhere").unwrap_err());
+        assert!(refused.contains("declared on 2 servers"), "{refused}");
+        assert!(
+            refused.contains("ulak status shop@old-server")
+                && refused.contains("ulak status shop@new-server"),
+            "{refused}"
+        );
+    }
+
+    /// A Compose project name cannot hold `@`, and a destination may.
+    #[test]
+    fn a_name_is_split_at_the_first_at_sign_so_the_server_keeps_its_user() {
+        let catalog = catalog_of(&[
+            declared("shop", "deploy@10.0.0.1", "/a", true),
+            declared("shop", "other", "/b", true),
+        ]);
+        assert_eq!(
+            resolved(&catalog, "shop@deploy@10.0.0.1", "/").unwrap(),
+            "shop@deploy@10.0.0.1"
+        );
+    }
+
+    /// A typo is answered with the name it most plausibly meant, spelled
+    /// as the whole command with every argument, then with what exists.
+    #[test]
+    fn an_unknown_name_offers_the_near_miss_and_what_is_declared() {
+        let catalog = catalog_of(&[
+            declared("shop", "devbox", "/code/shop", true),
+            declared("shop-test", "devbox", "/code/shop", false),
+            declared("blog", "devbox", "/code/blog", true),
+        ]);
+        let args = ["--dry-run".to_string()];
+        let error = resolve(&catalog, "shpo", Path::new("/home"), None, "sync", &args)
+            .map(|_| ())
+            .unwrap_err();
+        let refused = said(&error);
+        assert!(refused.contains("no stack named shpo"), "{refused}");
+        assert!(
+            refused.contains("did you mean: ulak sync shop --dry-run"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("declared on this machine: blog, shop, shop-test"),
+            "{refused}"
+        );
+
+        // Typed inside a checkout, the list narrows to what was declared
+        // there.
+        let refused = said(&resolved(&catalog, "nope", "/code/shop").unwrap_err());
+        assert!(
+            refused.contains("declared here: shop, shop-test"),
+            "{refused}"
+        );
+        assert!(!refused.contains("did you mean"), "{refused}");
+
+        let refused = said(&resolved(&[], "shop", "/").unwrap_err());
+        assert!(
+            refused.contains("nothing is declared on this machine yet"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_name_on_the_wrong_server_says_which_server_has_it() {
+        let catalog = catalog_of(&[declared("shop", "devbox", "/code/shop", true)]);
+        let refused = said(&resolved(&catalog, "shop@elsewhere", "/").unwrap_err());
+        assert!(
+            refused.contains("shop is not declared on elsewhere"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("it is on devbox: ulak status shop"),
+            "{refused}"
+        );
+    }
+
+    /// A name chosen from anywhere can point at a checkout that has since
+    /// moved. The bare rebuild error named no stack, and its fallback step,
+    /// `ulak doctor`, hit the same wall again.
+    #[test]
+    fn a_named_stack_whose_checkout_is_gone_says_where_it_was_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("moved-away");
+        let gone = gone.to_str().unwrap();
+        let refusal = |desired: &Desired, command: &str| {
+            let error = desired.rebuild_for_stack(&desired.stack_id()).unwrap_err();
+            said(&unreadable(desired, error, command, &["--dry-run".into()]))
+        };
+
+        let live = declared("blog", "devbox", gone, true);
+        let refused = refusal(&live, "sync");
+        assert!(
+            refused.starts_with(&format!(
+                "blog was declared from {gone}, which no longer exists"
+            )),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("cd into it, then ulak docker compose -p blog up -d"),
+            "{refused}"
+        );
+        assert!(refused.contains("ulak status"), "{refused}");
+        assert!(!refused.contains("ulak doctor"), "{refused}");
+
+        // Idle stays idle: it is only run from the new place, and never
+        // cleaned from there, where the workspace is a different one.
+        let idle = declared("blog", "devbox", gone, false);
+        let refused = refusal(&idle, "sync");
+        assert!(
+            refused.contains("cd into it, then: ulak sync --dry-run"),
+            "{refused}"
+        );
+        assert!(!refused.contains("up -d"), "{refused}");
+        let refused = refusal(&idle, "clean");
+        assert!(!refused.contains("cd into it"), "{refused}");
+
+        // The checkout is there but its file is not: the reason and its
+        // own step survive under the stack's name.
+        let mut missing_file = declared("shop-test", "devbox", tmp.path().to_str().unwrap(), false);
+        missing_file.argv_globals = vec!["-f".into(), "compose.test.yaml".into()];
+        let refused = refusal(&missing_file, "status");
+        assert!(
+            refused.starts_with("shop-test was declared from ")
+                && refused.contains("compose file compose.test.yaml (from -f) cannot be read"),
+            "{refused}"
+        );
+        assert!(refused.contains("check the path from"), "{refused}");
+    }
+
+    #[test]
+    fn an_empty_name_or_server_is_refused_with_both_spellings() {
+        for spec in ["", "@devbox", "shop@"] {
+            let refused = said(&resolved(&[], spec, "/").unwrap_err());
+            assert!(
+                refused.contains("is not a stack name"),
+                "{spec:?}: {refused}"
+            );
+            assert!(
+                refused.contains("ulak status my-app") && refused.contains("my-app@my-server"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Typed flags and a typed name are two answers to one question.
+    #[test]
+    fn a_name_and_compose_flags_together_are_refused_with_each_way_alone() {
+        let globals = ["-f".to_string(), "compose.dev.yaml".to_string()];
+        let args = ["--dry-run".to_string()];
+        let refused = said(&named(&globals, "sync", &args, "shop").unwrap_err());
+        assert!(refused.contains("both choose the project"), "{refused}");
+        assert!(refused.contains("ulak sync shop --dry-run"), "{refused}");
+        assert!(
+            refused.contains("ulak -f compose.dev.yaml sync --dry-run"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_selector_names_the_server_only_when_another_server_shares_the_name() {
+        let shop = declared("shop", "devbox", "/a", true);
+        let blog = declared("blog", "devbox", "/b", true);
+        let blog_elsewhere = declared("blog", "other", "/c", true);
+        let catalog = catalog_of(&[shop.clone(), blog.clone(), blog_elsewhere.clone()]);
+        assert_eq!(selector_in(&catalog, &shop), "shop");
+        assert_eq!(selector_in(&catalog, &blog), "blog@devbox");
+        assert_eq!(selector_in(&catalog, &blog_elsewhere), "blog@other");
+    }
+
+    #[test]
+    fn the_near_miss_is_one_unique_answer_or_none() {
+        let names = ["blob", "blog", "shop", "shop-test"];
+        let near = |typed| closest(typed, &names);
+        assert_eq!(near("shpo"), Some("shop"), "two edits away");
+        assert_eq!(near("shop-t"), Some("shop-test"), "the only name it begins");
+        assert_eq!(
+            near("blo"),
+            None,
+            "begins two names, and is as near to both"
+        );
+        assert_eq!(near("zzzzzz"), None, "nothing is near");
+        assert_eq!(edits("kitten", "sitting"), 3);
+        assert_eq!(edits("", "abc"), 3);
+    }
+
+    /// A name two servers share is still one near miss. Judged per
+    /// declaration it tied with itself, and `apii` suggested nothing.
+    #[test]
+    fn a_near_miss_two_servers_share_is_spelled_to_resolve_from_here() {
+        let catalog = catalog_of(&[
+            declared("api", "devbox", "/code/api", true),
+            declared("api", "staging", "/work/api", true),
+            declared("blog", "devbox", "/code/blog", true),
+        ]);
+        let args = ["--dry-run".to_string()];
+        let refused = |cwd: &str| {
+            said(
+                &resolve(&catalog, "apii", Path::new(cwd), None, "sync", &args)
+                    .map(|_| ())
+                    .unwrap_err(),
+            )
+        };
+
+        // The checkout settles which server, so the name alone resolves.
+        let here = refused("/code/api");
+        assert!(
+            here.contains("did you mean: ulak sync api --dry-run"),
+            "{here}"
+        );
+        assert!(!here.contains("or: "), "{here}");
+
+        // Anywhere else it takes the server, once for each.
+        let elsewhere = refused("/");
+        assert!(
+            elsewhere.contains("did you mean: ulak sync api@devbox --dry-run")
+                && elsewhere.contains("or: ulak sync api@staging --dry-run"),
+            "{elsewhere}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_names_stays_one_line() {
+        let names: Vec<String> = (0..11).map(|i| format!("s{i:02}")).collect();
+        assert_eq!(
+            some_of(&names),
+            "s00, s01, s02, s03, s04, s05, s06, s07, and 3 more"
+        );
+        assert_eq!(some_of(&names[..2]), "s00, s01");
+    }
+
+    fn candidate(cwd: &Path, file: &str, identity: &str, live: bool) -> Candidate {
+        let inv = Invocation::capture_in(
+            cwd,
+            &["-f".to_string(), file.to_string()],
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let desired = declared(identity, "devbox", &cwd.display().to_string(), live);
+        Candidate {
+            stack_id: desired.stack_id(),
+            rebuilt: Rebuilt {
+                workspace_key: crate::config::WorkspaceKey::from_namespace(
+                    "client-a",
+                    inv.workspace_identity_path(),
+                )
+                .unwrap(),
+                inv,
+            },
+            desired,
+            score: 1,
+        }
+    }
+
+    /// The refusal that replaced a screen of absolute `-f`,
+    /// `--project-directory` and `# comment` lines: one short command per
+    /// stack, each carrying every argument typed, so a `--dry-run` stays a
+    /// dry run. Without a terminal, `Choose::Ask` ends here too.
+    #[test]
+    fn several_stacks_here_are_refused_with_one_short_named_command_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(dir.join("compose.test.yaml"), "services: {}\n").unwrap();
+        let several = || Several {
+            cwd: dir.clone(),
+            candidates: vec![
+                candidate(&dir, "compose.yaml", "shop", true),
+                candidate(&dir, "compose.test.yaml", "shop-test", false),
+            ],
+            catalog: Vec::new(),
+        };
+
+        let args = ["--dry-run", "--max-delete", "7"].map(String::from);
+        let refused = said(&several().refusal("sync", &args));
+        assert_eq!(
+            refused,
+            "2 stacks are declared here — name the one to sync\n\
+             ulak sync shop --dry-run --max-delete 7\n\
+             ulak sync shop-test --dry-run --max-delete 7\n\
+             each one's state: ulak status"
+        );
+        assert!(!refused.contains('#') && !refused.contains("--project-directory"));
+
+        let error = several()
+            .choose("doctor", &[], Choose::Ask)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(said(&error).contains("ulak doctor shop-test"));
+        let refused = said(&several().refusal("clean", &[]));
+        assert!(
+            refused.contains("name the one whose workspace to remove"),
+            "{refused}"
+        );
+
+        let labels = pick_labels(&several().listed());
+        assert_eq!(
+            labels,
+            vec![
+                "shop        live   devbox   compose.yaml",
+                "shop-test   idle   devbox   compose.test.yaml",
+            ]
+        );
+    }
+
+    /// A declared project's next steps are its name: the same line from
+    /// every directory, and drift-proof without `env ULAK_HOST=`, since the
+    /// name selects the declaration and the declaration pins the server.
+    #[test]
+    fn a_root_command_for_a_declared_stack_is_its_name_with_every_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("ulak.toml"), "host = \"new-server\"\n").unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let inv = Invocation::capture_in(&dir, &[], std::collections::BTreeMap::new()).unwrap();
+        let mut project = Project::locate_from(inv).unwrap();
+        let tag = std::process::id();
+        let identity = format!("named-{tag}");
+        let server = format!("pinned-{tag}");
+        let declaration = declared(&identity, &server, &dir.display().to_string(), true);
+        intent::write_desired(&declaration.stack_id(), &declaration).unwrap();
+        project.pin_existing_stack(&server, &identity);
+
+        assert_eq!(
+            root_command(&project, &["sync", "--max-delete=3"]),
+            format!("ulak sync {identity} --max-delete=3")
+        );
+        assert_eq!(
+            root_command(&project, &["doctor"]),
+            format!("ulak doctor {identity}")
+        );
+    }
+
+    fn captured(dir: &Path, argv: &[&str]) -> Invocation {
+        let argv: Vec<String> = argv.iter().map(|word| word.to_string()).collect();
+        Invocation::capture_in(dir, &argv, std::collections::BTreeMap::new()).unwrap()
+    }
+
+    fn here(cwd: &Path, inv: &Invocation, identity: Option<&str>, bare: Bare) -> String {
+        here_globals_in(cwd, std::collections::BTreeMap::new(), inv, identity, bare).join(" ")
+    }
+
+    /// Each hint is the shortest line that reads back, from where the user
+    /// stands, to the exact stack: measured by capturing it, never assumed.
+    #[test]
+    fn a_line_for_this_shell_is_the_shortest_spelling_that_reads_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(app.join("compose.test.yaml"), "services: {}\n").unwrap();
+
+        // Discovery already finds the default file: only the name is said.
+        let default = captured(&app, &[]);
+        assert_eq!(here(&app, &default, Some("shop"), Bare::Allowed), "-p shop");
+        assert_eq!(here(&app, &default, None, Bare::Allowed), "");
+        // A root command never goes bare: declarations come first there.
+        assert_eq!(here(&app, &default, None, Bare::Refused), "-f compose.yaml");
+
+        // A second file is named, relative to where the user stands.
+        let test = captured(&app, &["-f", "compose.test.yaml"]);
+        assert_eq!(
+            here(&app, &test, Some("shop-test"), Bare::Allowed),
+            "-f compose.test.yaml -p shop-test"
+        );
+        assert_eq!(
+            here(&root, &test, Some("shop-test"), Bare::Allowed),
+            "-f app/compose.test.yaml -p shop-test"
+        );
+
+        // From an unrelated directory the path is absolute, and the
+        // project directory still goes unsaid because it is Docker's own
+        // default for that file.
+        let away = tempfile::tempdir().unwrap();
+        let file = app.join("compose.test.yaml");
+        assert_eq!(
+            here(away.path(), &test, Some("shop-test"), Bare::Allowed),
+            format!("-f {} -p shop-test", file.display())
+        );
+
+        // A project directory that is not the default is kept.
+        let moved = captured(
+            &app,
+            &["-f", "compose.test.yaml", "--project-directory", ".."],
+        );
+        assert_eq!(
+            here(&app, &moved, Some("x"), Bare::Allowed),
+            format!(
+                "-f compose.test.yaml -p x --project-directory {}",
+                root.display()
+            )
+        );
+
+        // At the filesystem root, where the service runs, nothing is
+        // relative: its text is read later, from anywhere.
+        assert_eq!(
+            here(Path::new("/"), &test, Some("shop-test"), Bare::Allowed),
+            exact_globals(&test, Some("shop-test")).join(" ")
+        );
+    }
+
+    /// The environment of the shell is part of what a paste reads: a
+    /// `COMPOSE_FILE` there would turn the bare form into another project,
+    /// so the files are spelled.
+    #[test]
+    fn a_compose_file_in_this_shells_environment_keeps_the_files_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().canonicalize().unwrap();
+        std::fs::write(app.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(app.join("other.yaml"), "services: {}\n").unwrap();
+        let default = captured(&app, &[]);
+        let env = std::collections::BTreeMap::from([(
+            "COMPOSE_FILE".to_string(),
+            "other.yaml".to_string(),
+        )]);
+        assert_eq!(
+            here_globals_in(&app, env, &default, Some("shop"), Bare::Allowed).join(" "),
+            "-f compose.yaml -p shop"
         );
     }
 }

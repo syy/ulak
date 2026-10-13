@@ -31,9 +31,13 @@ use crate::sync;
 use crate::ui::{self, fail};
 use crate::walk;
 
-pub fn run(globals: &[String]) -> Result<ExitCode> {
-    match crate::management::locate(globals, "doctor", &[])? {
+pub fn run(globals: &[String], stack: Option<&str>) -> Result<ExitCode> {
+    use crate::management::Choose;
+    match crate::management::locate(globals, "doctor", &[], stack)? {
         crate::management::Context::Project(project) => run_compose(*project),
+        crate::management::Context::Several(several) => {
+            run_compose(several.choose("doctor", &[], Choose::Ask)?)
+        }
         crate::management::Context::Workspace(workspace) => run_workspace(*workspace),
         crate::management::Context::Outside => {
             // Keep the workspace-specific refusal and next step owned by
@@ -47,7 +51,14 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
     let s = ui::style_stdout();
     let mut problems: Vec<String> = Vec::new();
 
-    println!("{}ulak doctor{} — {}", s.bold, s.off, project.name);
+    // The Compose project when argv or a declaration names it: two stacks
+    // of one checkout share the directory name, and a report headed by it
+    // could not say which of them it checked.
+    let checked = project
+        .compose_model_project_name()
+        .unwrap_or(&project.name)
+        .to_string();
+    println!("{}ulak doctor{} — {checked}", s.bold, s.off);
 
     // ─── LOCAL ──────────────────────────────────────────────────────
     println!("\n{}LOCAL{}", s.bold, s.off);
@@ -611,7 +622,7 @@ fn finish(project: &Project, problems: &[String]) -> Result<ExitCode> {
     let s = ui::style_stdout();
     println!();
     if problems.is_empty() {
-        let up = crate::management::compose_command_for_identity(
+        let up = crate::management::compose_command_here_as(
             project,
             &project.compose_identity(),
             &["up", "-d"],

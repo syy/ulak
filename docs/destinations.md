@@ -2,12 +2,14 @@
 
 A stack declaration records the server it was brought up on, and that
 declaration outranks a later `host` edit for Ulak's own commands typed without
-`-f` or `-p` (`doctor`, `status`, `sync`, `clean`): otherwise a config change
-would move a running stack's background job to a different daemon. When the two
-disagree, those commands say so and keep addressing the declared server, and
-every command they print carries `env ULAK_HOST=<declared>` so a paste reaches
-the same stack. `ulak docker ...` and any command given explicit `-f`/`-p`
-follow the configuration as usual. If the declared server no longer exists,
+`-f` or `-p` (`doctor`, `status`, `sync`, `clean`) or with a stack name:
+otherwise a config change would move a running stack's background job to a
+different daemon. When the two disagree, those commands say so and keep
+addressing the declared server. The commands they print reach it too: Ulak's
+by the stack's name, Docker's with `env ULAK_HOST=<declared>`. `ulak docker ...`
+and any command given explicit `-f`/`-p` follow the configuration as usual.
+
+If the declared server no longer exists,
 `ulak clean --forget-destination <ssh-host>` retires the declaration from this
 machine. It never contacts the server and deletes nothing on it. The checkout
 keeps its record of what it sent there, so `env ULAK_HOST=<ssh-host> ulak clean`

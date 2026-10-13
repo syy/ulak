@@ -49,52 +49,152 @@ fn fleet() -> Result<ExitCode> {
         return finish_fleet(health);
     }
 
-    let mut rows: Vec<(bool, String)> = Vec::new();
-    let (mut live, mut idle) = (0, 0);
-    for (id, desired) in &catalog {
-        let where_ = match desired.rebuild_for_stack(id) {
-            Ok(_) => Some((desired.identity.clone(), desired.destination.clone())),
-            // The compose file it names is gone: a checkout that was
-            // deleted or moved. Named rather than hidden, because the
-            // workspace it left on a server is still taking up space there.
-            Err(_) => None,
-        };
-        let status = crate::intent::read_status(id);
-        let detail = match (&where_, desired.live) {
-            (None, _) => format!(
-                "{}the compose file it named is gone — its workspace may still be on {}{}",
-                s.dim, desired.destination, s.off
+    let rows = catalog
+        .iter()
+        .map(|(id, desired)| Row {
+            live: desired.live,
+            selector: crate::management::selector_in(&catalog, desired),
+            destination: desired.destination.clone(),
+            files: None,
+            // A compose file that is gone is a checkout that was deleted
+            // or moved. Named rather than hidden, because the workspace
+            // it left on a server is still taking up space there.
+            detail: row_detail(
+                desired,
+                desired.rebuild_for_stack(id).is_ok(),
+                crate::intent::read_status(id).as_ref(),
+                &s,
             ),
-            (Some(_), false) => {
-                format!(
-                    "{}not maintained (ulak docker compose up -d starts it){}",
-                    s.dim, s.off
-                )
-            }
-            (Some(_), true) => fleet_detail(status.as_ref(), &s),
-        };
-        let (name, dest) =
-            where_.unwrap_or_else(|| (desired.identity.clone(), desired.destination.clone()));
-        let word = if desired.live {
-            live += 1;
-            format!("{} live{}", s.green, s.off)
-        } else {
-            idle += 1;
-            format!("{} idle{}", s.dim, s.off)
-        };
-        rows.push((
-            desired.live,
-            format!("{word}  {name:<24} {dest:<20} {detail}"),
-        ));
-    }
-    println!("{}stacks{}      {live} live · {idle} idle", s.bold, s.off);
-    println!();
-    rows.sort_by(|a, b| (!a.0).cmp(&(!b.0)).then_with(|| a.1.cmp(&b.1)));
-    for (_, row) in &rows {
-        println!("{row}");
-    }
-    println!("\ndetails for one: cd into it, then ulak status");
+        })
+        .collect();
+    print_stacks(rows, &s);
+    // By name, from right here: "cd into it" named no directory, and a
+    // checkout with two stacks answered the cd with a refusal.
+    println!("\ndetails for one: ulak status <name>");
     finish_fleet(health)
+}
+
+/// Every stack declared in this directory, side by side.
+///
+/// Status used to refuse here and print each stack's full invocation.
+/// But it asks nothing that needs ONE stack: "what is going on here?" has
+/// an answer for all of them, read from local files like the fleet's, plus
+/// the name that opens one in full.
+fn here(several: &crate::management::Several) -> Result<ExitCode> {
+    let s = ui::style_stdout();
+    let health = crate::agent::health();
+    println!("{}Ulak{} — this directory\n", s.bold, s.off);
+    println!("{}service{}   {}", s.bold, s.off, health.line);
+
+    let listed = several.listed();
+    let rows = listed
+        .iter()
+        .map(|stack| Row {
+            live: stack.desired.live,
+            selector: stack.selector.clone(),
+            destination: stack.desired.destination.clone(),
+            files: Some(stack.files.clone()),
+            detail: row_detail(
+                stack.desired,
+                true,
+                crate::intent::read_status(stack.stack_id).as_ref(),
+                &s,
+            ),
+        })
+        .collect();
+    print_stacks(rows, &s);
+    let others = crate::intent::catalog()
+        .iter()
+        .filter(|(id, d)| d.live && !listed.iter().any(|stack| stack.stack_id == id))
+        .count();
+    if others > 0 {
+        println!(
+            "\n{}others{}    {others} more stack(s) live on this machine   {}(all of them: ulak status, outside a project){}",
+            s.bold, s.off, s.dim, s.off
+        );
+    }
+    println!("\ndetails for one: ulak status <name>");
+    finish_fleet(health)
+}
+
+/// One stack as the fleet and the directory view list it.
+struct Row {
+    live: bool,
+    /// What `ulak status <name>` takes to open it.
+    selector: String,
+    destination: String,
+    /// Its Compose files. Only the directory view shows them: there they
+    /// are what tells apart two stacks of one checkout.
+    files: Option<String>,
+    detail: String,
+}
+
+/// The last column: what the service last saw for a live stack.
+fn row_detail(
+    desired: &crate::intent::Desired,
+    rebuilds: bool,
+    status: Option<&crate::intent::Status>,
+    s: &ui::Style,
+) -> String {
+    match (rebuilds, desired.live) {
+        (false, _) => format!(
+            "{}the compose file it named is gone — its workspace may still be on {}{}",
+            s.dim, desired.destination, s.off
+        ),
+        // Not "ulak docker compose up -d starts it": that bare line starts
+        // whatever Docker discovers, which in a checkout with two stacks is
+        // at most one of them. `ulak status <name>` spells the exact one.
+        (true, false) => match desired.updated_unix {
+            0 => format!("{}not maintained{}", s.dim, s.off),
+            at => format!("{}not maintained · since {}{}", s.dim, ago(at), s.off),
+        },
+        (true, true) => fleet_detail(status, s),
+    }
+}
+
+/// Print the count line and the rows.
+fn print_stacks(rows: Vec<Row>, s: &ui::Style) {
+    let live = rows.iter().filter(|row| row.live).count();
+    println!(
+        "{}stacks{}      {live} live · {} idle",
+        s.bold,
+        s.off,
+        rows.len() - live
+    );
+    println!();
+    for line in stack_lines(rows, s) {
+        println!("{line}");
+    }
+}
+
+/// The rows, live first and then by name, in aligned columns. Built apart
+/// from the printing so the layout has a test.
+fn stack_lines(mut rows: Vec<Row>, s: &ui::Style) -> Vec<String> {
+    rows.sort_by(|a, b| {
+        (!a.live, &a.selector, &a.destination).cmp(&(!b.live, &b.selector, &b.destination))
+    });
+    let width = |cell: &dyn Fn(&Row) -> usize| rows.iter().map(cell).max().unwrap_or(0);
+    let name = width(&|row| row.selector.chars().count());
+    let server = width(&|row| row.destination.chars().count());
+    let files = width(&|row| row.files.as_ref().map_or(0, |f| f.chars().count()));
+    rows.iter()
+        .map(|row| {
+            let word = if row.live {
+                format!("{} live{}", s.green, s.off)
+            } else {
+                format!("{} idle{}", s.dim, s.off)
+            };
+            let mut line = format!(
+                "{word}  {:<name$}  {:<server$}  ",
+                row.selector, row.destination
+            );
+            if let Some(f) = &row.files {
+                line.push_str(&format!("{}{f:<files$}{}  ", s.dim, s.off));
+            }
+            line.push_str(&row.detail);
+            line
+        })
+        .collect()
 }
 
 fn fleet_detail(status: Option<&crate::intent::Status>, s: &ui::Style) -> String {
@@ -179,15 +279,17 @@ fn finish_fleet(health: crate::agent::Health) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn status(globals: &[String]) -> Result<ExitCode> {
+pub fn status(globals: &[String], stack: Option<&str>) -> Result<ExitCode> {
     // Typed anywhere else, this is not a mistake to correct. The answer
     // to "these workspaces pile up" is not a TTL, it is being able to SEE
     // them — and seeing them must not need a new
     // command, because the question is the same one: what is going on?
-    let crate::management::Context::Project(selected) =
-        crate::management::locate(globals, "status", &[])?
-    else {
-        return fleet();
+    let selected = match crate::management::locate(globals, "status", &[], stack)? {
+        crate::management::Context::Project(selected) => selected,
+        crate::management::Context::Several(several) => return here(&several),
+        crate::management::Context::Workspace(_) | crate::management::Context::Outside => {
+            return fleet();
+        }
     };
     let Bound {
         project,
@@ -196,7 +298,11 @@ pub fn status(globals: &[String]) -> Result<ExitCode> {
         footprint,
     } = config::bind_located(*selected)?;
     let s = ui::style_stdout();
-    println!("{}project{}   {}", s.bold, s.off, project.name);
+    // The name `ulak status <name>` takes leads, rather than the workspace
+    // directory's name: one checkout can hold several stacks, and naming
+    // the directory made `ulak status shop-test` answer "project shop".
+    let identity = project.compose_identity();
+    println!("{}stack{}     {identity}", s.bold, s.off);
     println!(
         "{}local{}     {}",
         s.bold,
@@ -222,13 +328,11 @@ pub fn status(globals: &[String]) -> Result<ExitCode> {
     println!("{}syncs{}     {what}   (details: {doctor})", s.bold, s.off);
     println!("{}server{}    {}", s.bold, s.off, dest);
     println!(
-        "{}workspace{}    {}",
+        "{}workspace{} {}",
         s.bold,
         s.off,
         project.remote_dir_shown()
     );
-    let identity = project.compose_identity();
-    println!("{}identity{}  {identity}", s.bold, s.off);
 
     // Local truth, before a single byte goes over the wire: what did you
     // ASK for, and what has the background actually managed? Everything
@@ -238,8 +342,8 @@ pub fn status(globals: &[String]) -> Result<ExitCode> {
     let live = crate::intent::read_desired(&id);
     // Rendered from the pinned project, so when the config has moved on the
     // lines carry the declared server — see `management::render_project`.
-    let down = crate::management::compose_command(&project, &["down"]);
-    let up = crate::management::compose_command(&project, &["up", "-d"]);
+    let down = crate::management::compose_command_here(&project, &["down"]);
+    let up = crate::management::compose_command_here(&project, &["up", "-d"]);
     match &live {
         Some(d) if d.live => println!(
             "{}intent{}    live since {}   (ends with: {down})",
@@ -456,10 +560,10 @@ fn summarize_states(states: &str) -> Stack {
 /// this checkout's memory that it ever declared a stack on one server. The
 /// split is the point: one needs the server, the other exists precisely
 /// because the server is gone.
-pub fn clean(globals: &[String], forget: Option<&str>) -> Result<ExitCode> {
+pub fn clean(globals: &[String], stack: Option<&str>, forget: Option<&str>) -> Result<ExitCode> {
     match forget {
         Some(destination) => forget_destination(globals, destination),
-        None => clean_remote(globals),
+        None => clean_remote(globals, stack),
     }
 }
 
@@ -565,14 +669,20 @@ fn forget_receipt(destination: &str, report: &crate::intent::Retired) -> Vec<Str
     lines
 }
 
-fn clean_remote(globals: &[String]) -> Result<ExitCode> {
+fn clean_remote(globals: &[String], stack: Option<&str>) -> Result<ExitCode> {
     // Cleaning asks who owns an already-transported directory, not what
     // today's Compose model says. Going through `config::bind` here made
     // a syntax error in compose.yaml prevent the very cleanup that could
     // safely remove its old workspace. The invocation fixes the local
     // workspace id; intent and Docker's labels below decide whether it is
     // still in use. No resolved model or project identity participates.
-    let project = crate::management::project(globals, "clean", &[])?;
+    let project = crate::management::project(
+        globals,
+        "clean",
+        &[],
+        stack,
+        crate::management::Choose::Named,
+    )?;
     let dest = project.ssh_dest()?;
     let ssh = crate::ssh::Ssh::new(&dest)?;
     let workspace_id = project.workspace_id();
@@ -610,7 +720,10 @@ fn clean_remote(globals: &[String]) -> Result<ExitCode> {
         let stop = match first.project_for_stack(&first.stack_id()) {
             Ok(first_project) => format!(
                 "stop each one first, for example: {}",
-                crate::management::compose_command(&first_project, &["down", "--remove-orphans"])
+                crate::management::compose_command_here(
+                    &first_project,
+                    &["down", "--remove-orphans"]
+                )
             ),
             Err(_) => format!(
                 "stop each one first from its declaring checkout: {}",
@@ -651,7 +764,7 @@ fn clean_remote(globals: &[String]) -> Result<ExitCode> {
     let labels = compose::container_labels(&ssh, None)?;
     let existing = compose::projects_using_workspace(&labels, &project.remote_workspace_root());
     if !existing.is_empty() {
-        let stop = crate::management::compose_command_for_identity(
+        let stop = crate::management::compose_command_here_as(
             &project,
             &existing[0],
             &["down", "--remove-orphans"],
@@ -715,7 +828,7 @@ fn clean_remote(globals: &[String]) -> Result<ExitCode> {
         crate::invocation::forget_workspace_destination(&state, &dest);
         crate::footprint::forget_cache_destination(workspace_id, &dest);
         ui::ok(&format!("workspace removed from {dest} ({hash_dir})"));
-        let volumes = crate::management::compose_command(&project, &["down", "--volumes"]);
+        let volumes = crate::management::compose_command_here(&project, &["down", "--volumes"]);
         ui::dim(&format!(
             "named volumes were kept — remove them with: {volumes} (before clean)"
         ));
@@ -978,5 +1091,65 @@ mod tests {
         // A broken engine must not be reported as an empty stack: the
         // compose error printed above is the real news.
         assert_eq!(summarize_states("NO_ENGINE\n"), Stack::Unknown);
+    }
+
+    fn row(selector: &str, live: bool, files: Option<&str>, detail: &str) -> Row {
+        Row {
+            live,
+            selector: selector.into(),
+            destination: "devbox".into(),
+            files: files.map(String::from),
+            detail: detail.into(),
+        }
+    }
+
+    /// Live first, then by name, with every column starting at the same
+    /// place however long the names are. The directory view has a files
+    /// column because there it is what tells two stacks of one checkout
+    /// apart; the fleet has none.
+    #[test]
+    fn stack_rows_put_live_first_and_line_up_their_columns() {
+        let lines = stack_lines(
+            vec![
+                row("shop-test", false, Some("compose.test.yaml"), "idle detail"),
+                row("shop", true, Some("compose.yaml"), "link up"),
+            ],
+            &plain(),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                " live  shop       devbox  compose.yaml       link up",
+                " idle  shop-test  devbox  compose.test.yaml  idle detail",
+            ]
+        );
+        let fleet = stack_lines(vec![row("a-long-name", true, None, "x")], &plain());
+        assert_eq!(fleet, vec![" live  a-long-name  devbox  x"]);
+    }
+
+    /// An idle row never claims that a bare `up -d` starts it: in a
+    /// checkout with two stacks that line starts whichever one Docker
+    /// discovers.
+    #[test]
+    fn an_idle_row_says_since_when_and_promises_no_bare_command() {
+        let mut desired = crate::intent::Desired {
+            schema: crate::intent::SCHEMA,
+            live: false,
+            workspace_id: "abc".into(),
+            workspace_namespace: "client-a".into(),
+            destination: "devbox".into(),
+            identity: "shop-test".into(),
+            cwd: "/code/shop".into(),
+            argv_globals: Vec::new(),
+            compose_env: std::collections::BTreeMap::new(),
+            updated_unix: crate::intent::now_unix() - 3 * 86_400,
+        };
+        let detail = row_detail(&desired, true, None, &plain());
+        assert_eq!(detail, "not maintained · since 3d ago");
+        desired.updated_unix = 0;
+        assert_eq!(row_detail(&desired, true, None, &plain()), "not maintained");
+        assert!(
+            row_detail(&desired, false, None, &plain()).contains("compose file it named is gone")
+        );
     }
 }

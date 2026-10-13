@@ -18,10 +18,15 @@ pub fn run(host_arg: Option<String>, globals: &[String]) -> Result<()> {
     // the natural home for ulak.toml; otherwise the current workspace
     // (or simply cwd) is enough to start using daemon-only commands.
     let command_args = host_arg.iter().cloned().collect::<Vec<_>>();
-    let (root, doctor) = match crate::management::locate(globals, "init", &command_args)? {
+    let (root, doctor) = match crate::management::locate(globals, "init", &command_args, None)? {
         crate::management::Context::Project(project) => {
             let doctor = crate::management::root_command(&project, &["doctor"]);
             (project.config_home, Some(doctor))
+        }
+        // Bare `ulak doctor` is the right next step here: it asks which
+        // of the stacks to check.
+        crate::management::Context::Several(several) => {
+            (several.config_home()?, Some("ulak doctor".to_string()))
         }
         crate::management::Context::Workspace(workspace) => (workspace.root, None),
         crate::management::Context::Outside => (config::Workspace::for_init()?.root, None),

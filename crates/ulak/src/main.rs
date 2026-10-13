@@ -93,6 +93,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Sync {
+            stack,
             dry_run,
             max_delete,
         } => {
@@ -104,7 +105,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 command_args.push("--max-delete".to_string());
                 command_args.push(value.clone());
             }
-            let project = management::project(&globals, "sync", &command_args)?;
+            let project = management::project(
+                &globals,
+                "sync",
+                &command_args,
+                stack.as_deref(),
+                management::Choose::Ask,
+            )?;
             let b = config::bind_located(project)?;
             let stack_id = intent::stack_id(&b.dest, &b.project.compose_identity());
             if let Some(said) = agent::stack_complaint(&stack_id, "sync") {
@@ -141,18 +148,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Doctor => doctor::run(&globals),
+        Command::Doctor { stack } => doctor::run(&globals, stack.as_deref()),
         Command::Service { command } => match command {
             ServiceCommand::Run { foreground } => service::run(foreground),
             ServiceCommand::Install { no_start } => agent::install(!no_start),
             ServiceCommand::Uninstall => agent::uninstall(),
         },
         Command::Config { json } => configcmd::run(&globals, json),
-        Command::Status => commands::status(&globals),
+        Command::Status { stack } => commands::status(&globals, stack.as_deref()),
         Command::Ui => tui::run(&globals),
-        Command::Clean { forget_destination } => {
-            commands::clean(&globals, forget_destination.as_deref())
-        }
+        Command::Clean {
+            stack,
+            forget_destination,
+        } => commands::clean(&globals, stack.as_deref(), forget_destination.as_deref()),
         Command::Docker { args } => docker::dispatch(&globals, args),
         Command::Shim { command } => match command {
             ShimCommand::Install => shim::install(),

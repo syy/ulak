@@ -436,7 +436,7 @@ fn declaration_holds(
                         ));
                         ui::dim(&format!(
                             "    see them: {}",
-                            crate::management::compose_command_for_identity(
+                            crate::management::compose_command_here_as(
                                 project,
                                 &project.compose_identity(),
                                 &["ps", "-a"],
@@ -444,7 +444,7 @@ fn declaration_holds(
                         ));
                         ui::dim(&format!(
                             "    take them down: {}",
-                            crate::management::compose_command_for_identity(
+                            crate::management::compose_command_here_as(
                                 project,
                                 &project.compose_identity(),
                                 &["down"],
@@ -460,7 +460,7 @@ fn declaration_holds(
                     ui::warn(
                         "compose finished without moving this project's existing containers: they all use a different workspace — Ulak did not declare this one live, so it will not sync the wrong bytes",
                     );
-                    let up = crate::management::compose_command_for_identity(
+                    let up = crate::management::compose_command_here_as(
                         project,
                         &project.compose_identity(),
                         &["up", "-d", "--force-recreate", "--remove-orphans"],
@@ -471,7 +471,7 @@ fn declaration_holds(
                     ui::warn(
                         "this Docker project is split across old and new workspaces — Ulak did not assign the mixed stack to this workspace",
                     );
-                    let up = crate::management::compose_command_for_identity(
+                    let up = crate::management::compose_command_here_as(
                         project,
                         &project.compose_identity(),
                         &["up", "-d", "--force-recreate", "--remove-orphans"],
@@ -497,7 +497,7 @@ fn declaration_holds(
             // declaration is the only thing missing. Saying so matters
             // because an undeclared stack is silent — the service will
             // not sync it and `ps`/`logs` will not mention its tunnels.
-            let up = crate::management::compose_command_for_identity(
+            let up = crate::management::compose_command_here_as(
                 project,
                 &project.compose_identity(),
                 &["up", "-d"],

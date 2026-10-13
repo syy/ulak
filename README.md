@@ -169,17 +169,19 @@ for every key and what it runs on the server.
 | Command | Purpose |
 |---|---|
 | `ulak init [host]` | Create an optional project configuration. |
-| `ulak doctor` | Check local tools, the server, and Compose references. |
+| `ulak doctor [stack]` | Check local tools, the server, and Compose references. |
 | `ulak docker <command>` | Run a supported Docker command on the server. |
-| `ulak sync` | Synchronize the current project once. |
-| `ulak status` | Show the workspace, stack, service, and forwarded ports. |
+| `ulak sync [stack]` | Synchronize the current project once. |
+| `ulak status [stack]` | Show the workspace, stack, service, and forwarded ports. |
 | `ulak ui` | Open the dashboard (beta): containers, logs, images, volumes and networks. |
 | `ulak config` | Show the effective settings and the layer that supplied each one. |
 | `ulak shim ...` | Let project scripts use the remote Docker daemon. |
-| `ulak clean` | Remove the selected remote workspace when no stack uses it. |
+| `ulak clean [stack]` | Remove the selected remote workspace when no stack uses it. |
 | `ulak clean --forget-destination <ssh-host>` | Retire what this checkout declared on a server that no longer exists, without contacting it. |
 | `ulak service ...` | Install, remove, or run the local background service. |
 | `ulak completions <shell>` | Generate Bash, Zsh, or Fish completions. |
+
+`[stack]` is a Compose project name; see [several stacks in one checkout](https://github.com/syy/ulak/blob/main/docs/stacks.md).
 
 `ulak sync --dry-run` previews uploads and remote deletions, not downloads.
 It still contacts the server; its upload list can differ from the real sync.

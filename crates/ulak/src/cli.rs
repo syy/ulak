@@ -76,13 +76,26 @@ pub enum Command {
     },
 
     /// Preflight checks: local tools, remote server, compose file references
-    Doctor,
+    Doctor {
+        /// One declared stack, by its Compose project name
+        ///
+        /// Asked for in a terminal when several are declared here. Write
+        /// NAME@SERVER when two servers have a stack of that name.
+        #[arg(value_name = "STACK")]
+        stack: Option<String>,
+    },
 
     /// Synchronize project files with the server once
     ///
     /// Send local changes and bring back files written by the stack.
     /// Only paths referenced by the Compose model are synchronized.
     Sync {
+        /// One declared stack, by its Compose project name
+        ///
+        /// Asked for in a terminal when several are declared here. Write
+        /// NAME@SERVER when two servers have a stack of that name.
+        #[arg(value_name = "STACK")]
+        stack: Option<String>,
         /// Preview uploads and remote deletions without applying them
         ///
         /// Resolving the Compose model may upload temporary configuration
@@ -116,7 +129,15 @@ pub enum Command {
     },
 
     /// Show workspace target, compose ps and disk usage in one round-trip
-    Status,
+    Status {
+        /// One declared stack, by its Compose project name, from anywhere
+        ///
+        /// Without it: this project; every stack declared here when there
+        /// are several; or, outside a project, every stack on this machine.
+        /// Write NAME@SERVER when two servers have a stack of that name.
+        #[arg(value_name = "STACK")]
+        stack: Option<String>,
+    },
 
     /// Open the dashboard (beta): containers, images, volumes, networks and logs
     ///
@@ -129,6 +150,13 @@ pub enum Command {
 
     /// Delete the remote workspace directory (refuses while a stack still uses it)
     Clean {
+        /// One declared stack, by its Compose project name
+        ///
+        /// Required when several are declared here: clean never picks one
+        /// for you. Write NAME@SERVER when two servers have a stack of that
+        /// name.
+        #[arg(value_name = "STACK", conflicts_with = "forget_destination")]
+        stack: Option<String>,
         /// Forget a destroyed server locally, without contacting it
         ///
         /// Named in full, never a bare --force: this retires the stack
@@ -414,5 +442,40 @@ mod tests {
             status.get_about().map(ToString::to_string).as_deref(),
             Some("Show workspace target, compose ps and disk usage in one round-trip")
         );
+    }
+
+    /// One declared stack is addressed by name after the command, with the
+    /// command's own flags on either side of it.
+    #[test]
+    fn a_stack_name_follows_the_management_commands() {
+        let Command::Status { stack, .. } = parse(&["status", "shop"]).command else {
+            panic!("expected status");
+        };
+        assert_eq!(stack.as_deref(), Some("shop"));
+        let Command::Doctor { stack, .. } = parse(&["doctor", "shop@devbox"]).command else {
+            panic!("expected doctor");
+        };
+        assert_eq!(stack.as_deref(), Some("shop@devbox"));
+        let Command::Sync { stack, dry_run, .. } = parse(&["sync", "--dry-run", "shop"]).command
+        else {
+            panic!("expected sync");
+        };
+        assert_eq!((stack.as_deref(), dry_run), (Some("shop"), true));
+        let Command::Clean { stack, .. } = parse(&["clean", "shop"]).command else {
+            panic!("expected clean");
+        };
+        assert_eq!(stack.as_deref(), Some("shop"));
+        let Command::Status { stack, .. } = parse(&["status"]).command else {
+            panic!("expected status");
+        };
+        assert_eq!(stack, None);
+    }
+
+    /// `--forget-destination` selects by server, so a stack name beside it
+    /// would be a second, contradicting answer.
+    #[test]
+    fn clean_takes_a_stack_or_a_destination_to_forget_but_not_both() {
+        let refused = Cli::try_parse_from(["ulak", "clean", "shop", "--forget-destination", "old"]);
+        assert!(refused.is_err(), "both were accepted");
     }
 }
