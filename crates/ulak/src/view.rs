@@ -205,8 +205,11 @@ fn tab_bar(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     let mut spans = vec![Span::raw(" ")];
     let mut x = area.x + 1;
     for (i, tab) in TABS.iter().enumerate() {
+        // The Ulak tab is where the service's trouble is spelled out.
+        let flagged = *tab == Tab::Project && app.local.service_problem.is_some();
         let label = match tab_count(app, *tab) {
             Some(n) => format!(" {} {} {n} ", i + 1, tab.title()),
+            None if flagged => format!(" {} {} ! ", i + 1, tab.title()),
             None => format!(" {} {} ", i + 1, tab.title()),
         };
         let w = label.width() as u16;
@@ -215,6 +218,8 @@ fn tab_bar(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
                 .fg(Color::Black)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD)
+        } else if flagged {
+            Style::new().fg(BAD)
         } else {
             Style::new().fg(Color::Gray)
         };
@@ -753,6 +758,10 @@ fn group_summary(app: &App, group: &Group) -> Vec<Span<'static>> {
         spans.push(Span::styled(" · ", dim()));
         if d.live {
             match app.stack_status(&group.key) {
+                _ if !app.local.service_running => spans.push(Span::styled(
+                    "kept live · no service running",
+                    Style::new().fg(BAD),
+                )),
                 Some(st) if st.connection != "up" && !st.connection.is_empty() => {
                     spans.push(Span::styled(
                         format!("kept · link {}", st.connection),
@@ -1117,21 +1126,26 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
     };
     let mut detail: Vec<Span> = Vec::new();
     if live && let Some(st) = status {
-        let tone = if st.connection == "up" { GOOD } else { BAD };
-        detail.push(Span::styled(
-            format!("link {}", st.connection),
-            Style::new().fg(tone),
-        ));
-        let open: Vec<String> = st
-            .tunnels
-            .iter()
-            .filter(|t| t.open)
-            .take(3)
-            .map(|t| format!("localhost:{}", t.port))
-            .collect();
-        if !open.is_empty() {
-            detail.push(Span::styled(" · ", dim()));
-            detail.push(Span::styled(open.join(" "), Style::new().fg(ACCENT)));
+        // A stopped service's last word is history: its link is not up.
+        if app.local.service_running {
+            let tone = if st.connection == "up" { GOOD } else { BAD };
+            detail.push(Span::styled(
+                format!("link {}", st.connection),
+                Style::new().fg(tone),
+            ));
+            let open: Vec<String> = st
+                .tunnels
+                .iter()
+                .filter(|t| t.open)
+                .take(3)
+                .map(|t| format!("localhost:{}", t.port))
+                .collect();
+            if !open.is_empty() {
+                detail.push(Span::styled(" · ", dim()));
+                detail.push(Span::styled(open.join(" "), Style::new().fg(ACCENT)));
+            }
+        } else {
+            detail.push(Span::styled("no service running", Style::new().fg(BAD)));
         }
         if st.last_sync_unix > 0 {
             detail.push(Span::styled(
@@ -1445,7 +1459,12 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
         Line::from(field("server", Span::raw(dest.clone()))),
     ];
     if let Some((_, st)) = app.local.statuses.iter().find(|(sid, _)| *sid == id) {
-        let mut l = field("link", Span::raw(st.connection.clone()));
+        let link = if app.local.service_running {
+            Span::raw(st.connection.clone())
+        } else {
+            Span::styled("no service running", Style::new().fg(BAD))
+        };
+        let mut l = field("link", link);
         if st.last_sync_unix > 0 {
             l.push(Span::styled(
                 format!(" · synced {} ago", ago(app.clock, st.last_sync_unix)),
@@ -1465,7 +1484,7 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
                 )
             })
             .collect();
-        if !tunnels.is_empty() {
+        if app.local.service_running && !tunnels.is_empty() {
             lines.push(Line::from(field("tunnels", Span::raw(tunnels.join("  ")))));
         }
         if let Some(note) = &st.note {
@@ -2133,6 +2152,10 @@ fn status_line(f: &mut Frame, area: Rect, app: &App) {
         Line::styled(format!(" ✕ {why}"), Style::new().fg(BAD))
     } else if let Some(t) = app.trouble.first() {
         Line::styled(format!(" ! {t}"), Style::new().fg(BUSY))
+    } else if let Some(problem) = &app.local.service_problem {
+        // On every tab, not just the Ulak one: without the service no
+        // port comes home, and the ports are what people look for.
+        Line::styled(format!(" ! {problem}"), Style::new().fg(BAD))
     } else {
         Line::raw("")
     };
@@ -2992,7 +3015,7 @@ pub fn ago(now: u64, then: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{app, code, key};
+    use crate::app::tests::{app, code, declare, key};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::time::Instant;
@@ -3082,6 +3105,62 @@ mod tests {
             .map(|x| buffer[(x, button.y)].symbol().to_string())
             .collect();
         assert_eq!(cells, " q  leave now, killing what is left", "{text}");
+    }
+
+    /// What `draw` registered, and the cells under one hit.
+    fn drawn(a: &App, width: u16, height: u16) -> (Hits, Terminal<TestBackend>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = Hits::default();
+        terminal.draw(|f| hits = draw(f, a)).unwrap();
+        (hits, terminal)
+    }
+
+    fn cells(terminal: &Terminal<TestBackend>, r: Rect) -> String {
+        let buffer = terminal.backend().buffer();
+        (r.x..r.right())
+            .map(|x| buffer[(x, r.y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_ulak_tab_shows_no_link_or_port_while_no_service_runs() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        a.on_key(key('5'), Instant::now());
+        let text = render(&a, 120, 24);
+        assert!(
+            text.contains("link up") && text.contains("localhost:8080"),
+            "{text}"
+        );
+        a.local.service_running = false;
+        a.local.service_problem = Some(
+            "the service agent is installed but nothing is running — now: ulak service install"
+                .into(),
+        );
+        let text = render(&a, 120, 24);
+        assert!(
+            !text.contains("link up") && !text.contains("localhost:8080"),
+            "a stopped service's last report is history:\n{text}"
+        );
+        assert!(text.contains("no service running"), "{text}");
+    }
+
+    #[test]
+    fn a_service_problem_is_said_on_every_tab() {
+        let mut a = app();
+        a.local.service_problem =
+            Some("the running service is v0.1.0 and this ulak is v0.2.0".into());
+        let (_, terminal) = drawn(&a, 100, 24);
+        let status = cells(&terminal, Rect::new(0, 22, 100, 1));
+        assert!(
+            status.starts_with(" ! the running service is v0.1.0"),
+            "{status}"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(1, 22)].fg,
+            BAD,
+            "said as a fault"
+        );
     }
 
     #[test]

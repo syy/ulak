@@ -732,6 +732,9 @@ fn is_ulak(pid: u32) -> bool {
 pub struct Health {
     pub line: String,
     pub problem: Option<String>,
+    /// A service is running and reporting: what makes the tunnels a
+    /// stack's `status.json` lists more than history.
+    pub running: bool,
 }
 
 pub fn health() -> Health {
@@ -740,6 +743,7 @@ pub fn health() -> Health {
         return Health {
             line: "not available on this platform".into(),
             problem: None,
+            running: false,
         };
     };
     let text = unit_path(kind)
@@ -772,6 +776,7 @@ pub fn health() -> Health {
                 }
             ),
             problem: None,
+            running: alive == Alive::Yes,
         };
     }
     // "Not installed" is only a PROBLEM where ulak would have
@@ -788,6 +793,7 @@ pub fn health() -> Health {
             problem: here.then(|| {
                 "nothing will look after your stacks once that terminal closes — now: ulak service install".into()
             }),
+            running: true,
         },
         (false, _) => Health {
             line: if here {
@@ -798,6 +804,7 @@ pub fn health() -> Health {
             problem: here.then(|| {
                 "no background service on this machine: the stacks you leave up are not synced and their ports are not forwarded — now: ulak service install".into()
             }),
+            running: false,
         },
         (true, Alive::No) => match vanished {
             Some(gone) => Health {
@@ -806,6 +813,7 @@ pub fn health() -> Health {
                     "the service agent still names {}, which is not there any more, so it has been running nothing — now: ulak service install   (points it at this ulak)",
                     gone.display()
                 )),
+                running: false,
             },
             None => Health {
                 line: "installed, NOT running".into(),
@@ -813,6 +821,7 @@ pub fn health() -> Health {
                     "the service agent is installed but nothing is running — now: ulak service install   (and read {})",
                     log_path().map(|p| p.display().to_string()).unwrap_or_default()
                 )),
+                running: false,
             },
         },
         (true, Alive::Wedged) => Health {
@@ -826,6 +835,7 @@ pub fn health() -> Health {
                 "the service process is alive but has stopped reporting — now: ulak service install   (restarts it; then read {})",
                 log_path().map(|p| p.display().to_string()).unwrap_or_default()
             )),
+            running: false,
         },
         (true, Alive::Yes) => {
             let beat = beat.expect("Alive::Yes needs a heartbeat");
@@ -844,7 +854,11 @@ pub fn health() -> Health {
                     )
                 });
             }
-            Health { line, problem }
+            Health {
+                line,
+                problem,
+                running: true,
+            }
         }
     }
 }

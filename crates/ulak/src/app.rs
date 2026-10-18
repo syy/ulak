@@ -995,7 +995,10 @@ impl App {
             .catalog
             .iter()
             .any(|(sid, d)| *sid == id && d.live);
-        if !live {
+        // A tunnel no running service holds open is history too, the way
+        // `ulak status` reads it, and a port shown from history is one
+        // that connects to nothing.
+        if !live || !self.local.service_running {
             return Vec::new();
         }
         let mut ports: Vec<u32> = self
@@ -3251,7 +3254,7 @@ pub(crate) mod tests {
         assert!(rung(&fx).is_empty(), "{fx:?}");
     }
 
-    fn declare(a: &mut App, identity: &str, live: bool, ports: &[(u32, &str, bool)]) {
+    pub(crate) fn declare(a: &mut App, identity: &str, live: bool, ports: &[(u32, &str, bool)]) {
         let desired = Desired {
             schema: crate::intent::SCHEMA,
             live,
@@ -3286,6 +3289,7 @@ pub(crate) mod tests {
                 catalog: vec![(id.clone(), desired)],
                 statuses: vec![(id, status)],
                 drivers,
+                service_running: true,
                 ..Local::default()
             })),
             Instant::now(),
@@ -3318,6 +3322,20 @@ pub(crate) mod tests {
         a.select(2);
         let fx = a.on_key(key('o'), Instant::now());
         assert_eq!(fx, vec![Effect::Open("http://localhost:8080".into())]);
+    }
+
+    #[test]
+    fn a_service_that_is_not_running_brings_no_port_home() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        assert_eq!(a.ports_home("demo", "web"), vec![8080]);
+        let mut dead = a.local.clone();
+        dead.service_running = false;
+        a.on_msg(Msg::Local(Box::new(dead)), Instant::now());
+        assert!(
+            a.ports_home("demo", "web").is_empty(),
+            "its status.json is history now"
+        );
     }
 
     #[test]

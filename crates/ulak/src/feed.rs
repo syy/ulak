@@ -157,6 +157,8 @@ pub struct Local {
     pub drivers: BTreeMap<String, Driver>,
     pub service_line: String,
     pub service_problem: Option<String>,
+    /// `agent::Health::running`.
+    pub service_running: bool,
 }
 
 // ─── the poller ─────────────────────────────────────────────────────
@@ -768,6 +770,7 @@ pub fn local(out: Sender<Msg>) -> LocalReader {
                 drivers,
                 service_line: health.line,
                 service_problem: health.problem,
+                service_running: health.running,
             };
             if out.send(Msg::Local(Box::new(view))).is_err() {
                 return;
