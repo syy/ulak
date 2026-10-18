@@ -466,6 +466,38 @@ pub enum Overlay {
     Tasks { selected: usize, scroll: usize },
     Servers { selected: usize },
     Leaving { since: Instant },
+    Ports(Ports),
+}
+
+/// The ports list: what Ulak forwards for one stack, by its id, or for
+/// one service of it when `service` is not empty (`App::forwards`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ports {
+    pub stack: String,
+    pub service: String,
+    pub selected: usize,
+}
+
+/// A port Ulak forwards to this machine, as the ports list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Forward {
+    pub port: u32,
+    pub service: String,
+    /// `TunnelState::open`. When false, something on this machine holds
+    /// the port, and opening it would reach that instead.
+    pub open: bool,
+    /// `TunnelState::service_running`: `Some(false)` when no container
+    /// answers behind it.
+    pub running: Option<bool>,
+}
+
+/// What `o` does with a stack's ports, or one service's: `App::port_key`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PortKey {
+    /// The only port, and it is tunneled: straight to the browser.
+    Open(u32),
+    /// Several, or one that is not tunneled: the ports list, which says why.
+    List,
 }
 
 #[derive(Debug, Clone)]
@@ -982,37 +1014,63 @@ impl App {
         }
     }
 
-    /// localhost ports Ulak keeps for this container's service, from the
-    /// service's own report — and only while the stack is declared live,
-    /// because a report about a stack nobody keeps is history.
+    /// What Ulak forwards for a stack, by its id, or for one service of
+    /// it, from the service's own report. Only while the stack is
+    /// declared live, because a report about a stack nobody keeps is
+    /// history.
+    pub fn forwards(&self, stack: &str, service: &str) -> Vec<Forward> {
+        // A tunnel no running service holds open is history too, the way
+        // `ulak status` reads it, and a port shown from history is one
+        // that connects to nothing.
+        if !self.kept_live(stack) || !self.local.service_running {
+            return Vec::new();
+        }
+        let mut forwards: Vec<Forward> = self
+            .local
+            .statuses
+            .iter()
+            .filter(|(sid, _)| sid == stack)
+            .flat_map(|(_, st)| st.tunnels.iter())
+            .filter(|t| service.is_empty() || t.service == service)
+            .map(|t| Forward {
+                port: t.port,
+                service: t.service.clone(),
+                open: t.open,
+                running: t.service_running,
+            })
+            .collect();
+        forwards.sort_by_key(|f| f.port);
+        forwards.dedup_by_key(|f| f.port);
+        forwards
+    }
+
+    fn kept_live(&self, stack: &str) -> bool {
+        self.local
+            .catalog
+            .iter()
+            .any(|(sid, d)| sid == stack && d.live)
+    }
+
+    /// The localhost ports that reach this container's service.
     pub fn ports_home(&self, project: &str, service: &str) -> Vec<u32> {
         if project.is_empty() {
             return Vec::new();
         }
         let id = crate::intent::stack_id(&self.dest, project);
-        let live = self
-            .local
-            .catalog
-            .iter()
-            .any(|(sid, d)| *sid == id && d.live);
-        // A tunnel no running service holds open is history too, the way
-        // `ulak status` reads it, and a port shown from history is one
-        // that connects to nothing.
-        if !live || !self.local.service_running {
-            return Vec::new();
+        self.forwards(&id, service)
+            .into_iter()
+            .filter(|f| f.open)
+            .map(|f| f.port)
+            .collect()
+    }
+
+    /// What `o` does here; the footer names the same thing.
+    pub fn port_key(&self, stack: &str, service: &str) -> Option<PortKey> {
+        match self.forwards(stack, service).as_slice() {
+            [] => None,
+            [only] if only.open => Some(PortKey::Open(only.port)),
+            _ => Some(PortKey::List),
         }
-        let mut ports: Vec<u32> = self
-            .local
-            .statuses
-            .iter()
-            .filter(|(sid, _)| *sid == id)
-            .flat_map(|(_, st)| st.tunnels.iter())
-            .filter(|t| t.open && (service.is_empty() || t.service == service))
-            .map(|t| t.port)
-            .collect();
-        ports.sort_unstable();
-        ports.dedup();
-        ports
     }
 
     pub fn stack_status(&self, project: &str) -> Option<&crate::intent::Status> {
@@ -1419,6 +1477,7 @@ impl App {
             Overlay::Input(input) => return self.on_input_key(input, key, now),
             Overlay::Tasks { selected, scroll } => return self.on_tasks_key(selected, scroll, key),
             Overlay::Servers { selected } => return self.on_servers_key(selected, key, now),
+            Overlay::Ports(list) => return self.on_ports_key(list, key, now),
         }
         // Keys every screen shares.
         match key.code {
@@ -1755,34 +1814,95 @@ impl App {
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => self.act(verbs::remove(&[c]), now),
-            KeyCode::Char('o') => self.open_browser(&c.project, &c.service, &c.name, now),
+            KeyCode::Char('o') => {
+                let stack = crate::intent::stack_id(&self.dest, &c.project);
+                self.open_ports(&stack, &c.service, &c.name, now)
+            }
             KeyCode::Char('y') => self.copy(c.id.clone(), now),
             _ => Vec::new(),
         }
     }
 
-    fn open_browser(
-        &mut self,
-        project: &str,
-        service: &str,
-        name: &str,
-        now: Instant,
-    ) -> Vec<Effect> {
-        match self.ports_home(project, service).first() {
-            Some(port) => {
-                let url = format!("http://localhost:{port}");
-                self.toast(Tone::Note, format!("opening {url}"), now);
-                vec![Effect::Open(url)]
+    fn open_ports(&mut self, stack: &str, service: &str, name: &str, now: Instant) -> Vec<Effect> {
+        match self.port_key(stack, service) {
+            Some(PortKey::Open(port)) => self.open_url(port, now),
+            Some(PortKey::List) => {
+                let selected = self
+                    .forwards(stack, service)
+                    .iter()
+                    .position(|f| f.open)
+                    .unwrap_or(0);
+                self.overlay = Overlay::Ports(Ports {
+                    stack: stack.to_string(),
+                    service: service.to_string(),
+                    selected,
+                });
+                Vec::new()
             }
             None => {
-                self.toast(
-                    Tone::Note,
-                    format!("{name} has no localhost port — Ulak forwards the published ports of stacks it keeps live"),
-                    now,
-                );
+                let said = if self.kept_live(stack) && !self.local.service_running {
+                    format!("no Ulak service is running, so nothing forwards {name}'s ports")
+                } else {
+                    format!(
+                        "{name} has no localhost port — Ulak forwards the published ports of stacks it keeps live"
+                    )
+                };
+                self.toast(Tone::Note, said, now);
                 Vec::new()
             }
         }
+    }
+
+    fn open_url(&mut self, port: u32, now: Instant) -> Vec<Effect> {
+        let url = format!("http://localhost:{port}");
+        self.toast(Tone::Note, format!("opening {url}"), now);
+        vec![Effect::Open(url)]
+    }
+
+    fn on_ports_key(&mut self, mut list: Ports, key: KeyEvent, now: Instant) -> Vec<Effect> {
+        let forwards = self.forwards(&list.stack, &list.service);
+        let chosen = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                return Vec::new();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                list.selected = list.selected.saturating_sub(1);
+                self.overlay = Overlay::Ports(list);
+                return Vec::new();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                list.selected = (list.selected + 1).min(forwards.len().saturating_sub(1));
+                self.overlay = Overlay::Ports(list);
+                return Vec::new();
+            }
+            KeyCode::Enter | KeyCode::Char('o') => forwards.get(list.selected),
+            KeyCode::Char(c @ '1'..='9') => forwards.get(c as usize - '1' as usize),
+            KeyCode::Char('y') => {
+                let Some(f) = forwards.get(list.selected) else {
+                    return Vec::new();
+                };
+                self.overlay = Overlay::None;
+                return self.copy(format!("localhost:{}", f.port), now);
+            }
+            _ => None,
+        };
+        let Some(f) = chosen else {
+            return Vec::new();
+        };
+        self.overlay = Overlay::None;
+        if !f.open {
+            self.toast(
+                Tone::Bad,
+                format!(
+                    "localhost:{0} is not tunneled: something on this machine holds it — lsof -i :{0}",
+                    f.port
+                ),
+                now,
+            );
+            return Vec::new();
+        }
+        self.open_url(f.port, now)
     }
 
     fn copy(&mut self, text: String, now: Instant) -> Vec<Effect> {
@@ -1904,7 +2024,10 @@ impl App {
                 }
                 None => no_driver(self),
             },
-            KeyCode::Char('o') => self.open_browser(&group.key, "", &stack, now),
+            KeyCode::Char('o') => {
+                let id = crate::intent::stack_id(&self.dest, &group.key);
+                self.open_ports(&id, "", &stack, now)
+            }
             _ => Vec::new(),
         }
     }
@@ -1958,6 +2081,11 @@ impl App {
                     _ => verbs::doctor(&d, &stack),
                 };
                 self.act(action, now)
+            }
+            // Its ports reach this machine whichever server is shown.
+            KeyCode::Char('o') => {
+                let id = crate::intent::stack_id(&dest, &stack);
+                self.open_ports(&id, "", &stack, now)
             }
             _ => Vec::new(),
         }
@@ -2539,6 +2667,17 @@ impl App {
             .last_click
             .is_some_and(|(t, p)| now.duration_since(t) < DOUBLE_CLICK && p.y == at.y);
         self.last_click = Some((now, at));
+        if let Overlay::Ports(mut list) = self.overlay.clone()
+            && index < self.forwards(&list.stack, &list.service).len()
+        {
+            list.selected = index;
+            self.overlay = Overlay::Ports(list);
+            if double {
+                self.last_click = None;
+                return self.on_key(KeyEvent::from(KeyCode::Enter), now);
+            }
+            return Vec::new();
+        }
         match self.overlay {
             Overlay::Tasks { .. } if index < self.tasks.len() => {
                 self.overlay = Overlay::Tasks {
@@ -3335,6 +3474,155 @@ pub(crate) mod tests {
         assert!(
             a.ports_home("demo", "web").is_empty(),
             "its status.json is history now"
+        );
+        a.select(2);
+        let fx = a.on_key(key('o'), Instant::now());
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Open(_))),
+            "o opens no dead port: {fx:?}"
+        );
+        let said = &a.toasts.last().unwrap().text;
+        assert!(
+            said.starts_with("no Ulak service is running, so nothing forwards demo-web-1's ports"),
+            "the reason: {said}"
+        );
+    }
+
+    fn ports_listed(a: &App) -> (Vec<u32>, String, usize) {
+        let Overlay::Ports(list) = &a.overlay else {
+            panic!("no ports list: {:?}", a.overlay);
+        };
+        let ports = a
+            .forwards(&list.stack, &list.service)
+            .iter()
+            .map(|f| f.port)
+            .collect();
+        (ports, list.service.clone(), list.selected)
+    }
+
+    #[test]
+    fn o_opens_the_only_port_and_lists_several_or_one_that_is_not_tunneled() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        a.select(2);
+        assert_eq!(
+            a.on_key(key('o'), Instant::now()),
+            vec![Effect::Open("http://localhost:8080".into())]
+        );
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(8443, "web", true), (8080, "web", true), (5432, "db", true)],
+        );
+        assert!(a.on_key(key('o'), Instant::now()).is_empty());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![8080, 8443], "web".to_string(), 0),
+            "the web row lists web's ports, in order"
+        );
+        a.overlay = Overlay::None;
+        a.select(0);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![5432, 8080, 8443], String::new(), 0),
+            "the stack's row lists every service's"
+        );
+        a.overlay = Overlay::None;
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(5432, "db", false), (8080, "web", true)],
+        );
+        a.select(1);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![5432], "db".to_string(), 0),
+            "one port that is not tunneled is listed, so the list can say why"
+        );
+    }
+
+    #[test]
+    fn the_ports_list_opens_by_number_or_enter_copies_with_y_and_explains_a_held_port() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[
+                (5432, "db", false),
+                (3000, "web", true),
+                (8080, "web", true),
+            ],
+        );
+        a.select(0);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![3000, 5432, 8080], String::new(), 0),
+            "the cursor starts on a port that opens"
+        );
+        assert_eq!(
+            a.on_key(key('3'), Instant::now()),
+            vec![Effect::Open("http://localhost:8080".into())]
+        );
+        assert_eq!(a.overlay, Overlay::None);
+
+        a.on_key(key('o'), Instant::now());
+        assert!(a.on_key(key('2'), Instant::now()).is_empty());
+        let toast = a.toasts.last().unwrap();
+        assert_eq!(toast.tone, Tone::Bad);
+        assert!(toast.text.contains("lsof -i :5432"), "{}", toast.text);
+
+        a.on_key(key('o'), Instant::now());
+        assert!(
+            a.on_key(key('9'), Instant::now()).is_empty(),
+            "no ninth port: nothing happens"
+        );
+        assert!(matches!(a.overlay, Overlay::Ports(_)));
+        for _ in 0..3 {
+            a.on_key(code(KeyCode::Down), Instant::now());
+        }
+        assert_eq!(ports_listed(&a).2, 2, "down stops at the last");
+        assert_eq!(
+            a.on_key(key('y'), Instant::now()),
+            vec![Effect::Copy("localhost:8080".into())]
+        );
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter), Instant::now()),
+            vec![Effect::Open("http://localhost:3000".into())]
+        );
+        a.on_key(key('o'), Instant::now());
+        assert!(a.on_key(code(KeyCode::Esc), Instant::now()).is_empty());
+        assert_eq!(a.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn a_click_picks_a_port_and_a_double_click_opens_it() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(3000, "web", true), (8080, "web", true)],
+        );
+        a.select(2);
+        a.on_key(key('o'), Instant::now());
+        let hits = Hits {
+            picks: Some((Rect::new(30, 10, 40, 2), 0)),
+            dialog: Some(Rect::new(29, 9, 42, 4)),
+            ..Hits::default()
+        };
+        let t0 = Instant::now();
+        assert!(a.on_mouse(left_click(35, 11), &hits, t0).is_empty());
+        assert_eq!(ports_listed(&a).2, 1);
+        assert_eq!(
+            a.on_mouse(left_click(35, 11), &hits, t0 + Duration::from_millis(100)),
+            vec![Effect::Open("http://localhost:8080".into())]
         );
     }
 

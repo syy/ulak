@@ -44,7 +44,7 @@ Press `?` for the full list. The ones you need first:
 | `s` `r` `p` `K` | Stop or start, restart, pause or resume, kill |
 | `d` `P` | Delete the selected item; prune the tab's unused ones — both ask first |
 | `u` `D` `S` | `compose up -d`, `compose down` (asks first), sync now |
-| `o` `y` | Open its forwarded `localhost` port in a browser; copy its id |
+| `o` `y` | Open its forwarded `localhost` port in a browser, or list several; copy its id |
 | `/` | Filter the list; in logs and inspect, search (`n` older, `N` newer) |
 | `:` | Run any `ulak docker …` command and watch its output |
 | `T` | Tasks: everything the dashboard ran, with its output; `x` stops one |
@@ -61,6 +61,12 @@ stopped containers. Named volumes are never pruned; `d` deletes one. On the
 Images tab, `B` prunes the build cache Docker counts as reclaimable. The
 question quotes `docker system df`'s own numbers, and a prune that worked
 says how much Docker freed.
+
+A stack's row shows as many of its forwarded ports as fit, then how many
+more. `o` on a stack, or on a container with more than one port, lists them
+all: `⏎` or `1`–`9` opens one in the browser and `y` copies
+`localhost:<port>`. The list also says why a port would not answer:
+something on this machine holds it, or no container is running for it.
 
 In logs, `f` pauses and resumes following, `w` wraps long lines, `t` shows
 Docker's timestamps and `c` clears the view. Scrolling up pauses by itself and

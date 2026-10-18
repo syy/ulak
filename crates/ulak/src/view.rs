@@ -10,8 +10,10 @@
 //! the link; tabs; the body; one status line (running work, or the newest
 //! notice); one line of the keys that apply to what is selected. Columns
 //! that do not fit are dropped from the least useful end rather than
-//! squeezed into unreadable stubs. A footer with more keys than room
-//! drops its last ones, never `?` or `q`, because help names every key.
+//! squeezed into unreadable stubs. A list that does not fit keeps its
+//! first items whole and accounts for the rest: a row's ports count them
+//! (`+3`) and `o` lists them all; the footer drops its last keys, never
+//! `?` or `q`, because help names every key.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -24,8 +26,8 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, Detail, Group, History, Hits, Link, LogView, Overlay, Pane, Prompt, Row, Screen, Sel,
-    Subject, TABS, Tab, TaskView, Tone,
+    App, Detail, Group, History, Hits, Link, LogView, Overlay, Pane, PortKey, Ports, Prompt, Row,
+    Screen, Sel, Subject, TABS, Tab, TaskView, Tone,
 };
 use crate::engine::{self, Container, Tone as Dot};
 
@@ -720,7 +722,8 @@ pub fn short_ports(raw: &str) -> String {
     out.join(" ")
 }
 
-fn group_summary(app: &App, group: &Group) -> Vec<Span<'static>> {
+/// `room` is the cells left of the row once its title is drawn.
+fn group_summary(app: &App, group: &Group, room: usize) -> Vec<Span<'static>> {
     let members: Vec<&Container> = group.members.iter().map(|&i| &app.containers[i]).collect();
     let running = members.iter().filter(|c| c.running()).count();
     let bad = members.iter().any(|c| c.tone() == Dot::Bad);
@@ -742,46 +745,98 @@ fn group_summary(app: &App, group: &Group) -> Vec<Span<'static>> {
             Style::new().fg(tone),
         ));
     }
-    let ports = app.ports_home(&group.key, "");
-    if !ports.is_empty() {
-        spans.push(Span::styled(" · ", dim()));
-        let shown: Vec<String> = ports
-            .iter()
-            .take(3)
-            .map(|p| format!("localhost:{p}"))
-            .collect();
-        spans.push(Span::styled(shown.join(" "), Style::new().fg(ACCENT)));
-        if ports.len() > 3 {
-            spans.push(Span::styled(format!(" +{}", ports.len() - 3), dim()));
-        }
-    }
+    let mut tail = Vec::new();
     if let Some(d) = &group.declared {
-        spans.push(Span::styled(" · ", dim()));
+        tail.push(Span::styled(" · ", dim()));
         if d.live {
             match app.stack_status(&group.key) {
-                _ if !app.local.service_running => spans.push(Span::styled(
+                _ if !app.local.service_running => tail.push(Span::styled(
                     "kept live · no service running",
                     Style::new().fg(BAD),
                 )),
                 Some(st) if st.connection != "up" && !st.connection.is_empty() => {
-                    spans.push(Span::styled(
+                    tail.push(Span::styled(
                         format!("kept · link {}", st.connection),
                         Style::new().fg(BAD),
                     ))
                 }
-                _ => spans.push(Span::styled("kept live by Ulak", Style::new().fg(GOOD))),
+                _ => tail.push(Span::styled("kept live by Ulak", Style::new().fg(GOOD))),
             }
         } else {
-            spans.push(Span::styled("declared here, not live", dim()));
+            tail.push(Span::styled("declared here, not live", dim()));
         }
     }
     if group.current {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             "  this project",
             Style::new().fg(ACCENT).add_modifier(Modifier::ITALIC),
         ));
     }
+    let ports = app.ports_home(&group.key, "");
+    if !ports.is_empty() {
+        let taken = width_of(&spans) + width_of(&tail) + 3;
+        spans.push(Span::styled(" · ", dim()));
+        spans.extend(port_spans(&ports, room.saturating_sub(taken)));
+    }
+    spans.extend(tail);
     spans
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// As many `words` as fit in `room` cells, joined by `sep`, leaving
+/// room for the `+N` that counts the rest: `(shown, rest)`.
+fn words_fitting(words: &[String], sep: &str, room: usize) -> (String, usize) {
+    let mut shown = String::new();
+    let mut count = 0;
+    for (i, word) in words.iter().enumerate() {
+        let rest = words.len() - i - 1;
+        let more = if rest > 0 {
+            sep.width() + format!("+{rest}").width()
+        } else {
+            0
+        };
+        let gap = if count > 0 { sep.width() } else { 0 };
+        if shown.width() + gap + word.width() + more > room {
+            break;
+        }
+        if count > 0 {
+            shown.push_str(sep);
+        }
+        shown.push_str(word);
+        count += 1;
+    }
+    (shown, words.len() - count)
+}
+
+/// As many `localhost:<port>` as fit in `room` cells; `o` lists them all.
+pub fn ports_fitting(ports: &[u32], room: usize) -> (String, usize) {
+    let words: Vec<String> = ports.iter().map(|p| format!("localhost:{p}")).collect();
+    words_fitting(&words, " ", room)
+}
+
+fn port_spans(ports: &[u32], room: usize) -> Vec<Span<'static>> {
+    let (shown, hidden) = ports_fitting(ports, room);
+    let mut spans = Vec::new();
+    if !shown.is_empty() {
+        spans.push(Span::styled(shown, Style::new().fg(ACCENT)));
+    }
+    match (spans.is_empty(), hidden) {
+        (_, 0) => {}
+        (true, n) => spans.push(Span::styled(format!("{n} ports"), Style::new().fg(ACCENT))),
+        (false, n) => spans.push(Span::styled(format!(" +{n}"), dim())),
+    }
+    spans
+}
+
+/// The footer's word for `o`.
+fn port_word(key: PortKey) -> &'static str {
+    match key {
+        PortKey::Open(_) => "open",
+        PortKey::List => "ports",
+    }
 }
 
 fn container_row(
@@ -800,7 +855,8 @@ fn container_row(
                 Span::styled(group.title().to_string(), bold()),
                 Span::raw("  "),
             ];
-            spans.extend(group_summary(app, group));
+            let room = width.saturating_sub(width_of(&spans));
+            spans.extend(group_summary(app, group, room));
             pad_line(spans, width)
         }
         Row::Empty(g) => {
@@ -852,11 +908,11 @@ fn container_row(
                         if home.is_empty() {
                             Span::styled(fit(&short_ports(&c.ports), *w), dim())
                         } else {
-                            let text = home
-                                .iter()
-                                .map(|p| format!("localhost:{p}"))
-                                .collect::<Vec<_>>()
-                                .join(" ");
+                            let text = match ports_fitting(&home, *w) {
+                                (shown, 0) => shown,
+                                (shown, n) if shown.is_empty() => format!("{n} ports"),
+                                (shown, n) => format!("{shown} +{n}"),
+                            };
                             Span::styled(fit(&text, *w), Style::new().fg(ACCENT))
                         }
                     }
@@ -1126,6 +1182,7 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
         (true, false) => Span::styled(fit("idle", 10), dim()),
     };
     let mut detail: Vec<Span> = Vec::new();
+    let mut synced = Vec::new();
     if live && let Some(st) = status {
         // A stopped service's last word is history: its link is not up.
         if app.local.service_running {
@@ -1134,22 +1191,11 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
                 format!("link {}", st.connection),
                 Style::new().fg(tone),
             ));
-            let open: Vec<String> = st
-                .tunnels
-                .iter()
-                .filter(|t| t.open)
-                .take(3)
-                .map(|t| format!("localhost:{}", t.port))
-                .collect();
-            if !open.is_empty() {
-                detail.push(Span::styled(" · ", dim()));
-                detail.push(Span::styled(open.join(" "), Style::new().fg(ACCENT)));
-            }
         } else {
             detail.push(Span::styled("no service running", Style::new().fg(BAD)));
         }
         if st.last_sync_unix > 0 {
-            detail.push(Span::styled(
+            synced.push(Span::styled(
                 format!(" · synced {} ago", ago(app.clock, st.last_sync_unix)),
                 dim(),
             ));
@@ -1175,7 +1221,20 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
         state,
         Span::raw(" "),
     ];
+    let ports: Vec<u32> = app
+        .forwards(&id, "")
+        .iter()
+        .filter(|f| f.open)
+        .map(|f| f.port)
+        .collect();
+    if !ports.is_empty() {
+        let mine = if here { "  this project".width() } else { 0 };
+        let taken = width_of(&spans) + width_of(&detail) + width_of(&synced) + mine + 3;
+        detail.push(Span::styled(" · ", dim()));
+        detail.extend(port_spans(&ports, width.saturating_sub(taken)));
+    }
     spans.extend(detail);
+    spans.extend(synced);
     if here {
         spans.push(Span::styled(
             "  this project",
@@ -1289,7 +1348,7 @@ fn preview_lines(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
             let group = &app.groups[g];
             let mut lines = vec![Line::from({
                 let mut l = field("stack", Span::raw(String::new()));
-                l.extend(group_summary(app, group));
+                l.extend(group_summary(app, group, width.saturating_sub(10)));
                 l
             })];
             if group.current
@@ -1473,8 +1532,8 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
             ));
         }
         lines.push(Line::from(l));
-        let tunnels: Vec<String> = st
-            .tunnels
+        let tunnels: Vec<String> = app
+            .forwards(&id, "")
             .iter()
             .map(|t| {
                 format!(
@@ -1485,8 +1544,13 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
                 )
             })
             .collect();
-        if app.local.service_running && !tunnels.is_empty() {
-            lines.push(Line::from(field("tunnels", Span::raw(tunnels.join("  ")))));
+        if !tunnels.is_empty() {
+            let (shown, rest) = words_fitting(&tunnels, "  ", width.saturating_sub(10));
+            let mut l = field("tunnels", Span::raw(shown));
+            if rest > 0 {
+                l.push(Span::styled(format!("  +{rest}"), dim()));
+            }
+            lines.push(Line::from(l));
         }
         if let Some(note) = &st.note {
             lines.push(Line::styled(
@@ -1549,11 +1613,15 @@ fn detail_bar(f: &mut Frame, area: Rect, app: &App, d: &Detail, hits: &mut Hits)
         Some(Some(c)) => {
             spans.push(dot(c.tone()));
             spans.push(Span::styled(short_status(&c.status), dim()));
-            if let Some(p) = app.ports_home(&c.project, &c.service).first() {
+            let home = app.ports_home(&c.project, &c.service);
+            if let Some(p) = home.first() {
                 spans.push(Span::styled(
                     format!("  localhost:{p}"),
                     Style::new().fg(ACCENT),
                 ));
+            }
+            if home.len() > 1 {
+                spans.push(Span::styled(format!(" +{}", home.len() - 1), dim()));
             }
         }
         Some(None) => spans.push(Span::styled("gone — it was removed", Style::new().fg(BAD))),
@@ -2239,6 +2307,15 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
         Overlay::Servers { .. } => {
             return vec![h("↑↓", "server"), h("⏎", "switch"), h("esc", "close")];
         }
+        Overlay::Ports(_) => {
+            return vec![
+                h("↑↓", "port"),
+                h("⏎", "open"),
+                h("1-9", "open that one"),
+                h("y", "copy"),
+                h("esc", "close"),
+            ];
+        }
         Overlay::Help { .. } => return vec![h("↑↓", "scroll"), h("any other key", "close")],
         Overlay::Leaving { .. } => return vec![h("q", "leave now")],
         Overlay::None => {}
@@ -2296,8 +2373,9 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     ));
                     out.push(h("r", "restart"));
                     out.push(h("d", "delete"));
-                    if !app.ports_home(&c.project, &c.service).is_empty() {
-                        out.push(h("o", "open"));
+                    let stack = crate::intent::stack_id(&app.dest, &c.project);
+                    if let Some(k) = app.port_key(&stack, &c.service) {
+                        out.push(h("o", port_word(k)));
                     }
                     out.push(h("i", "inspect"));
                     out.push(h("p", "pause"));
@@ -2307,6 +2385,10 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("⏎", "fold"));
                     if !group.members.is_empty() {
                         out.push(h("l", "logs"));
+                    }
+                    let stack = crate::intent::stack_id(&app.dest, &group.key);
+                    if let Some(k) = app.port_key(&stack, "") {
+                        out.push(h("o", port_word(k)));
                     }
                     if group.driver.is_some() {
                         out.push(h("u", "up"));
@@ -2328,8 +2410,14 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("⏎", "inspect"));
                     out.push(h("d", "delete"));
                 }
-                Some(Row::Here | Row::Stack(_)) => {
+                Some(row @ (Row::Here | Row::Stack(_))) => {
                     out.push(h("⏎", "show"));
+                    if let Some((identity, dest, _)) = app.stack_of(row) {
+                        let stack = crate::intent::stack_id(&dest, &identity);
+                        if let Some(k) = app.port_key(&stack, "") {
+                            out.push(h("o", port_word(k)));
+                        }
+                    }
                     out.push(h("u", "up"));
                     out.push(h("D", "down"));
                     out.push(h("S", "sync"));
@@ -2507,6 +2595,7 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
         }
         Overlay::Tasks { selected, scroll } => tasks(f, area, app, *selected, *scroll, hits),
         Overlay::Leaving { .. } => leaving(f, area, app, hits),
+        Overlay::Ports(list) => ports(f, area, app, list, hits),
         Overlay::Servers { selected } => {
             let servers = app.servers();
             let height = (servers.len() as u16 + 4).min(area.height.saturating_sub(2));
@@ -2561,6 +2650,119 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             );
         }
     }
+}
+
+/// Every port Ulak forwards for a stack, or one service of it, numbered
+/// for `1`–`9`, each with the reason it would not answer when there is
+/// one: the list `o` opens when there is more than one way to go.
+fn ports(f: &mut Frame, area: Rect, app: &App, list: &Ports, hits: &mut Hits) {
+    let (stack, service, selected) = (list.stack.as_str(), list.service.as_str(), list.selected);
+    let forwards = app.forwards(stack, service);
+    let name = app
+        .local
+        .catalog
+        .iter()
+        .find(|(id, _)| id == stack)
+        .map(|(_, d)| d.identity.clone())
+        .unwrap_or_default();
+    let title = if service.is_empty() {
+        format!(" Ports · {name} ")
+    } else {
+        format!(" Ports · {name} · {service} ")
+    };
+    let words: Vec<String> = forwards
+        .iter()
+        .map(|fw| format!("localhost:{}", fw.port))
+        .collect();
+    let port_w = words.iter().map(|w| w.width()).max().unwrap_or(0);
+    let service_w = forwards
+        .iter()
+        .map(|fw| fw.service.width())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let mut lines: Vec<Line> = forwards
+        .iter()
+        .zip(&words)
+        .enumerate()
+        .map(|(i, (fw, word))| {
+            let (note, tone) = if !fw.open {
+                (
+                    format!(
+                        "not tunneled: something here holds it (lsof -i :{})",
+                        fw.port
+                    ),
+                    Style::new().fg(BAD),
+                )
+            } else if fw.running == Some(false) {
+                ("no container is running for it".to_string(), dim())
+            } else {
+                (String::new(), Style::new())
+            };
+            Line::from(vec![
+                Span::styled(
+                    if i < 9 {
+                        format!(" {} ", i + 1)
+                    } else {
+                        "   ".to_string()
+                    },
+                    key_style(),
+                ),
+                Span::styled(
+                    fit(word, port_w),
+                    if fw.open {
+                        Style::new().fg(ACCENT)
+                    } else {
+                        dim()
+                    },
+                ),
+                Span::raw("  "),
+                Span::raw(fit(&fw.service, service_w)),
+                Span::raw("  "),
+                Span::styled(note, tone),
+            ])
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled(" Nothing is forwarded now.", dim()));
+    }
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (widest.max(title.width() + 2) as u16 + 3).min(area.width.saturating_sub(2));
+    // Padded to the frame, so the cursor's highlight spans the row.
+    let inner = width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let style = line.style;
+            let line = pad_line(line.spans, inner).style(style);
+            if i == selected && !forwards.is_empty() {
+                under_cursor(line)
+            } else {
+                line
+            }
+        })
+        .collect();
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let visible = height.saturating_sub(2) as usize;
+    let first = (selected + 1).saturating_sub(visible);
+    let r = centered(area, width, height);
+    f.render_widget(Clear, r);
+    hits.dialog = Some(r);
+    hits.picks = Some((
+        Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(2), visible as u16),
+        first,
+    ));
+    let lines: Vec<Line> = lines.into_iter().skip(first).collect();
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Span::styled(title, bold())),
+        ),
+        r,
+    );
 }
 
 /// Quitting while tasks stop: what is being waited for, and the way out.
@@ -2772,7 +2974,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("s · r", "stop / start · restart"),
             ("p · K", "pause / resume · kill"),
             ("d", "delete (asks first)"),
-            ("o", "open its localhost port"),
+            ("o", "open its port, or pick one of several"),
             ("i · y", "inspect · copy id"),
             ("a", "show / hide stopped"),
             ("P", "delete every stopped one (asks)"),
@@ -3148,6 +3350,23 @@ mod tests {
     }
 
     #[test]
+    fn ports_fit_their_room_and_count_the_rest() {
+        let ports = [3000, 8080, 9090];
+        assert_eq!(
+            ports_fitting(&ports, 200),
+            ("localhost:3000 localhost:8080 localhost:9090".into(), 0)
+        );
+        // Two and their " +1" are 32 cells; a third would not fit.
+        assert_eq!(
+            ports_fitting(&ports, 32),
+            ("localhost:3000 localhost:8080".into(), 1)
+        );
+        assert_eq!(ports_fitting(&ports, 31), ("localhost:3000".into(), 2));
+        assert_eq!(ports_fitting(&ports, 16), (String::new(), 3));
+        assert_eq!(ports_fitting(&[], 10), (String::new(), 0));
+    }
+
+    #[test]
     fn a_row_with_more_keys_than_room_loses_its_last_ones_never_help_or_quit() {
         let h = |k: &str, l: &str| (k.to_string(), l.to_string());
         let hints = vec![
@@ -3171,6 +3390,83 @@ mod tests {
         // keys keep their order: once one is dropped, so is the rest.
         assert_eq!(keys(44), ["⏎", "e", "?", "q"]);
         assert_eq!(keys(45), ["⏎", "e", "r", "?", "q"]);
+    }
+
+    #[test]
+    fn the_ports_list_numbers_every_port_and_says_why_one_would_not_answer() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[
+                (3000, "web", true),
+                (5432, "db", false),
+                (8080, "web", true),
+            ],
+        );
+        a.local.statuses[0].1.tunnels[2].service_running = Some(false);
+        a.on_key(key('o'), Instant::now());
+        let (hits, terminal) = drawn(&a, 100, 24);
+        let text = render(&a, 100, 24);
+        assert!(text.contains(" Ports · demo "), "{text}");
+        assert!(text.contains(" 1 localhost:3000  web"), "{text}");
+        assert!(
+            text.contains(
+                " 2 localhost:5432  db   not tunneled: something here holds it (lsof -i :5432)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(" 3 localhost:8080  web  no container is running for it"),
+            "{text}"
+        );
+        let (picks, first) = hits.picks.expect("its rows can be clicked");
+        assert_eq!(first, 0);
+        assert!(
+            cells(&terminal, Rect::new(picks.x, picks.y, picks.width, 1))
+                .contains("localhost:3000")
+        );
+        assert!(hits.dialog.is_some_and(|d| d.contains(picks.as_position())));
+        assert_eq!(
+            hints(&a).into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            ["↑↓", "⏎", "1-9", "y", "esc"]
+        );
+    }
+
+    #[test]
+    fn a_stacks_row_shows_the_ports_that_fit_and_counts_the_rest() {
+        let mut a = app();
+        let ports: Vec<(u32, &str, bool)> = (0..8).map(|i| (3000 + i, "web", true)).collect();
+        declare(&mut a, "demo", true, &ports);
+        let row = |text: &str| {
+            text.lines()
+                .find(|l| l.contains("▾ demo"))
+                .unwrap()
+                .to_string()
+        };
+        let wide = render(&a, 220, 24);
+        assert!(
+            row(&wide).contains("localhost:3007") && !row(&wide).contains(" +"),
+            "{wide}"
+        );
+        let narrow = render(&a, 100, 24);
+        let line = row(&narrow);
+        assert!(
+            line.contains("localhost:3000 localhost:3001 +6"),
+            "{narrow}"
+        );
+        assert!(
+            line.contains("kept live by Ulak") && line.contains("this project"),
+            "the rest of the row still fits: {line}"
+        );
+        assert!(narrow.lines().all(|l| l.width() <= 100), "{narrow}");
+        // `o` on that row lists them; the footer says so.
+        assert!(
+            hints(&a).contains(&("o".to_string(), "ports".to_string())),
+            "{:?}",
+            hints(&a)
+        );
     }
 
     #[test]
