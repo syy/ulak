@@ -422,6 +422,78 @@ pub fn doctor(driver: &Driver, stack: &str) -> Action {
     }
 }
 
+/// What `ulak service install` does to the service this machine has.
+/// The button beside a service problem and the question `I` asks both
+/// name it from here, so they cannot disagree: `App::service_fix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    /// No login agent and nothing running: it writes one and starts it.
+    Fresh,
+    /// The agent is written and runs nothing that reports: it is
+    /// rewritten for this ulak and started, which ends a silent one.
+    Again,
+    /// The agent's service runs, and is restarted on this ulak.
+    Restart,
+    /// A service started by hand runs without an agent. It stays in
+    /// charge: the agent written now steps aside for it
+    /// (`lockfile::ServiceLock`) and takes over at the next login.
+    Beside,
+}
+
+impl Install {
+    pub fn of(running: bool, installed: bool) -> Install {
+        match (running, installed) {
+            (false, false) => Install::Fresh,
+            (false, true) => Install::Again,
+            (true, true) => Install::Restart,
+            (true, false) => Install::Beside,
+        }
+    }
+
+    /// The words after `I` on that button.
+    pub fn button(self) -> &'static str {
+        match self {
+            Install::Fresh | Install::Beside => "install it",
+            Install::Again => "start it",
+            Install::Restart => "restart it",
+        }
+    }
+}
+
+/// `ulak service install`, the fix every service problem names, asked as
+/// what it will do to the service there is. A restart says so: whatever
+/// the service is in the middle of starts over.
+pub fn install_service(cwd: PathBuf, how: Install) -> Action {
+    let (title, question) = match how {
+        Install::Fresh => (
+            "install the Ulak service",
+            "Install Ulak's background service and start it (ulak service install)? It starts again at every login, syncs the stacks you leave up and forwards their ports. ulak service uninstall removes it.",
+        ),
+        Install::Again => (
+            "start the Ulak service",
+            "Start Ulak's background service again (ulak service install)? It rewrites the login agent for this ulak and starts it, so the stacks you leave up are synced and their ports forwarded.",
+        ),
+        Install::Restart => (
+            "restart the Ulak service",
+            "Restart Ulak's background service on this ulak (ulak service install)? Its tunnels close for a moment, and a sync it is in the middle of starts over.",
+        ),
+        Install::Beside => (
+            "install the Ulak service",
+            "Install Ulak's background service (ulak service install)? The one you started by hand stays in charge until it stops; from your next login, the installed one syncs the stacks you leave up and forwards their ports.",
+        ),
+    };
+    Action {
+        title: title.into(),
+        confirm: Some(question.into()),
+        plan: Plan::Ulak(Driven {
+            cwd,
+            env: None,
+            args: vec!["service".into(), "install".into()],
+        }),
+        refresh: Want::default(),
+    }
+}
+
 /// A command typed after `:` — `compose pull`, `image ls`, … — run as
 /// `ulak docker <words>` so the catalog and every route's own rules
 /// apply exactly as on the command line. Words are split like a shell

@@ -1073,6 +1073,16 @@ impl App {
         }
     }
 
+    /// Every problem the service has names `ulak service install` as its
+    /// fix, which `I` runs: what that would do, or `None` with no problem.
+    pub fn service_fix(&self) -> Option<verbs::Install> {
+        let local = &self.local;
+        local
+            .service_problem
+            .is_some()
+            .then(|| verbs::Install::of(local.service_running, local.service_installed))
+    }
+
     pub fn stack_status(&self, project: &str) -> Option<&crate::intent::Status> {
         let id = crate::intent::stack_id(&self.dest, project);
         self.local
@@ -1514,6 +1524,7 @@ impl App {
                 });
                 return Vec::new();
             }
+            KeyCode::Char('I') => return self.install_service(now),
             _ => {}
         }
         match &self.screen {
@@ -1841,7 +1852,12 @@ impl App {
             }
             None => {
                 let said = if self.kept_live(stack) && !self.local.service_running {
-                    format!("no Ulak service is running, so nothing forwards {name}'s ports")
+                    let fix = if self.service_fix().is_some() {
+                        " — I starts it"
+                    } else {
+                        ""
+                    };
+                    format!("no Ulak service is running, so nothing forwards {name}'s ports{fix}")
                 } else {
                     format!(
                         "{name} has no localhost port — Ulak forwards the published ports of stacks it keeps live"
@@ -1903,6 +1919,21 @@ impl App {
             return Vec::new();
         }
         self.open_url(f.port, now)
+    }
+
+    /// `I`: what the service's problem says to type, asked first.
+    fn install_service(&mut self, now: Instant) -> Vec<Effect> {
+        let Some(how) = self.service_fix() else {
+            let said = if self.local.service_running {
+                "the Ulak service is running; nothing to install".to_string()
+            } else {
+                format!("the Ulak service: {}", self.local.service_line)
+            };
+            self.toast(Tone::Note, said, now);
+            return Vec::new();
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        self.act(verbs::install_service(cwd, how), now)
     }
 
     fn copy(&mut self, text: String, now: Instant) -> Vec<Effect> {
@@ -3429,6 +3460,7 @@ pub(crate) mod tests {
                 statuses: vec![(id, status)],
                 drivers,
                 service_running: true,
+                service_installed: true,
                 ..Local::default()
             })),
             Instant::now(),
@@ -3483,9 +3515,28 @@ pub(crate) mod tests {
         );
         let said = &a.toasts.last().unwrap().text;
         assert!(
-            said.starts_with("no Ulak service is running, so nothing forwards demo-web-1's ports"),
-            "the reason: {said}"
+            said.starts_with("no Ulak service is running, so nothing forwards demo-web-1's ports")
+                && !said.contains("I starts it"),
+            "the reason, and no key that would not help: {said}"
         );
+        service(
+            &mut a,
+            Some("the service agent is installed but nothing is running"),
+            false,
+            true,
+        );
+        a.on_key(key('o'), Instant::now());
+        let said = &a.toasts.last().unwrap().text;
+        assert!(said.ends_with(" — I starts it"), "{said}");
+    }
+
+    /// The service as `agent::health` would report it.
+    fn service(a: &mut App, problem: Option<&str>, running: bool, installed: bool) {
+        let mut local = a.local.clone();
+        local.service_problem = problem.map(str::to_string);
+        local.service_running = running;
+        local.service_installed = installed;
+        a.on_msg(Msg::Local(Box::new(local)), Instant::now());
     }
 
     fn ports_listed(a: &App) -> (Vec<u32>, String, usize) {
@@ -3624,6 +3675,125 @@ pub(crate) mod tests {
             a.on_mouse(left_click(35, 11), &hits, t0 + Duration::from_millis(100)),
             vec![Effect::Open("http://localhost:8080".into())]
         );
+    }
+
+    #[test]
+    fn i_asks_then_runs_ulak_service_install_while_the_service_has_a_problem() {
+        let mut a = app();
+        service(
+            &mut a,
+            Some(
+                "the service agent is installed but nothing is running — now: ulak service install",
+            ),
+            false,
+            true,
+        );
+        assert!(
+            a.on_key(key('I'), Instant::now()).is_empty(),
+            "it asks first"
+        );
+        let Overlay::Confirm(c) = a.overlay.clone() else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question
+                .starts_with("Start Ulak's background service again"),
+            "{}",
+            c.question
+        );
+        assert!(!c.yes, "No is the default");
+        let fx = a.on_key(key('y'), Instant::now());
+        let [Effect::Run { action, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let verbs::Plan::Ulak(driven) = &action.plan else {
+            panic!("{:?}", action.plan);
+        };
+        assert_eq!(driven.args, vec!["service", "install"]);
+        assert_eq!(driven.env, None);
+    }
+
+    #[test]
+    fn i_restarts_a_running_service_only_after_saying_so_and_leaves_a_healthy_one_alone() {
+        let mut a = app();
+        service(
+            &mut a,
+            Some(
+                "the running service is v0.1.0 and this ulak is v0.2.0 — When nothing is mid-flight: ulak service install",
+            ),
+            true,
+            true,
+        );
+        a.on_key(key('I'), Instant::now());
+        let Overlay::Confirm(c) = a.overlay.clone() else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question.starts_with("Restart Ulak's background service")
+                && c.question.contains("starts over"),
+            "{}",
+            c.question
+        );
+        a.on_key(key('n'), Instant::now());
+        service(&mut a, None, true, true);
+        assert!(a.on_key(key('I'), Instant::now()).is_empty());
+        assert_eq!(a.overlay, Overlay::None, "nothing to ask");
+        assert_eq!(
+            a.toasts.last().unwrap().text,
+            "the Ulak service is running; nothing to install"
+        );
+    }
+
+    #[test]
+    fn i_asks_what_installing_does_to_the_service_there_is_and_its_button_agrees() {
+        // (running, installed): how the question opens, and the button.
+        let kinds = [
+            (
+                false,
+                false,
+                "Install Ulak's background service and start it",
+                "install it",
+            ),
+            (
+                false,
+                true,
+                "Start Ulak's background service again",
+                "start it",
+            ),
+            (
+                true,
+                true,
+                "Restart Ulak's background service on this ulak",
+                "restart it",
+            ),
+            (
+                true,
+                false,
+                "Install Ulak's background service (ulak service install)? The one you started by hand stays in charge",
+                "install it",
+            ),
+        ];
+        for (running, installed, opens, button) in kinds {
+            let mut a = app();
+            service(
+                &mut a,
+                Some("… — now: ulak service install"),
+                running,
+                installed,
+            );
+            assert_eq!(a.service_fix().map(verbs::Install::button), Some(button));
+            a.on_key(key('I'), Instant::now());
+            let Overlay::Confirm(c) = a.overlay.clone() else {
+                panic!("{:?}", a.overlay);
+            };
+            assert!(c.question.starts_with(opens), "{}", c.question);
+            assert_eq!(
+                c.question.contains("starts over"),
+                running && installed,
+                "only a restart interrupts the service: {}",
+                c.question
+            );
+        }
     }
 
     #[test]

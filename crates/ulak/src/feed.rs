@@ -159,6 +159,8 @@ pub struct Local {
     pub service_problem: Option<String>,
     /// `agent::Health::running`.
     pub service_running: bool,
+    /// `agent::Health::installed`.
+    pub service_installed: bool,
 }
 
 // ─── the poller ─────────────────────────────────────────────────────
@@ -771,6 +773,7 @@ pub fn local(out: Sender<Msg>) -> LocalReader {
                 service_line: health.line,
                 service_problem: health.problem,
                 service_running: health.running,
+                service_installed: health.installed,
             };
             if out.send(Msg::Local(Box::new(view))).is_err() {
                 return;

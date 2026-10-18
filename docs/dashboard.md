@@ -48,6 +48,7 @@ Press `?` for the full list. The ones you need first:
 | `/` | Filter the list; in logs and inspect, search (`n` older, `N` newer) |
 | `:` | Run any `ulak docker …` command and watch its output |
 | `T` | Tasks: everything the dashboard ran, with its output; `x` stops one |
+| `I` | Install, start or restart Ulak's background service when it has a problem (asks first) |
 | `q` `esc` | Back, or quit |
 
 A destructive action says what it will remove and starts on No:
@@ -116,6 +117,12 @@ your SSH connection, recorded in the same audit trail as the commands you type.
   live stacks now, instead of when its retry backoff next comes round. When
   no service is running, the bottom line says so on every tab and no stack
   shows forwarded ports: nothing is forwarding them.
+- Whenever the service has a problem, `I`, or the button beside the
+  warning, runs `ulak service install`, the fix the warning names, after
+  asking. It installs and starts a missing service, starts a stopped one
+  again and restarts one that runs an older build; the button and the
+  question say which. A service you started by hand stays in charge, and
+  the installed one takes over at your next login.
 
 Quitting with `q` while tasks still run asks first. Running tasks are then
 stopped the way Ctrl-C would stop them, and the dashboard stays up, saying

@@ -735,6 +735,9 @@ pub struct Health {
     /// A service is running and reporting: what makes the tunnels a
     /// stack's `status.json` lists more than history.
     pub running: bool,
+    /// The login agent is written. A service `running` without one was
+    /// started by hand, and `ulak service install` leaves it in charge.
+    pub installed: bool,
 }
 
 pub fn health() -> Health {
@@ -744,6 +747,7 @@ pub fn health() -> Health {
             line: "not available on this platform".into(),
             problem: None,
             running: false,
+            installed: false,
         };
     };
     let text = unit_path(kind)
@@ -777,6 +781,7 @@ pub fn health() -> Health {
             ),
             problem: None,
             running: alive == Alive::Yes,
+            installed,
         };
     }
     // "Not installed" is only a PROBLEM where ulak would have
@@ -794,6 +799,7 @@ pub fn health() -> Health {
                 "nothing will look after your stacks once that terminal closes — now: ulak service install".into()
             }),
             running: true,
+            installed,
         },
         (false, _) => Health {
             line: if here {
@@ -805,6 +811,7 @@ pub fn health() -> Health {
                 "no background service on this machine: the stacks you leave up are not synced and their ports are not forwarded — now: ulak service install".into()
             }),
             running: false,
+            installed,
         },
         (true, Alive::No) => match vanished {
             Some(gone) => Health {
@@ -814,6 +821,7 @@ pub fn health() -> Health {
                     gone.display()
                 )),
                 running: false,
+                installed,
             },
             None => Health {
                 line: "installed, NOT running".into(),
@@ -822,6 +830,7 @@ pub fn health() -> Health {
                     log_path().map(|p| p.display().to_string()).unwrap_or_default()
                 )),
                 running: false,
+                installed,
             },
         },
         (true, Alive::Wedged) => Health {
@@ -836,6 +845,7 @@ pub fn health() -> Health {
                 log_path().map(|p| p.display().to_string()).unwrap_or_default()
             )),
             running: false,
+            installed,
         },
         (true, Alive::Yes) => {
             let beat = beat.expect("Alive::Yes needs a heartbeat");
@@ -858,6 +868,7 @@ pub fn health() -> Health {
                 line,
                 problem,
                 running: true,
+                installed,
             }
         }
     }

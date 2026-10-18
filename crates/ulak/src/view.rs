@@ -30,6 +30,7 @@ use crate::app::{
     Screen, Sel, Subject, TABS, Tab, TaskView, Tone,
 };
 use crate::engine::{self, Container, Tone as Dot};
+use crate::verbs::Install;
 
 const ACCENT: Color = Color::Cyan;
 const GOOD: Color = Color::Green;
@@ -113,7 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
             detail_body(f, body, app, d);
         }
     }
-    status_line(f, status, app);
+    status_line(f, status, app, &mut hits);
     footer(f, keys, app, &mut hits);
     toasts(f, body, app);
     overlay(f, area, app, &mut hits);
@@ -1055,7 +1056,7 @@ fn project_tab(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     } else {
         GOOD
     };
-    let mut lines = vec![Line::from(vec![
+    let mut service = vec![
         Span::styled(" service  ", bold()),
         Span::styled("● ", Style::new().fg(service_tone)),
         Span::raw(if app.local.service_line.is_empty() {
@@ -1063,7 +1064,18 @@ fn project_tab(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
         } else {
             app.local.service_line.clone()
         }),
-    ])];
+    ];
+    if let Some(how) = app.service_fix() {
+        service.push(Span::raw("   "));
+        let x = top.x + width_of(&service) as u16;
+        let button = service_button(how);
+        if app.overlay == Overlay::None {
+            hits.keys
+                .push((Rect::new(x, top.y, width_of(&button) as u16, 1), "I".into()));
+        }
+        service.extend(button);
+    }
+    let mut lines = vec![Line::from(service)];
     if let Some(problem) = &app.local.service_problem {
         lines.push(Line::styled(
             format!("          {problem}"),
@@ -2199,7 +2211,7 @@ fn span_of(samples: usize) -> String {
 
 // ─── status, keys, notices ──────────────────────────────────────────
 
-fn status_line(f: &mut Frame, area: Rect, app: &App) {
+fn status_line(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     let running: Vec<&TaskView> = app.tasks.iter().filter(|t| t.running()).collect();
     let line = if let Some(t) = running.last() {
         let spin = SPINNER[(app.frame as usize) % SPINNER.len()];
@@ -2221,14 +2233,45 @@ fn status_line(f: &mut Frame, area: Rect, app: &App) {
         Line::styled(format!(" ✕ {why}"), Style::new().fg(BAD))
     } else if let Some(t) = app.trouble.first() {
         Line::styled(format!(" ! {t}"), Style::new().fg(BUSY))
-    } else if let Some(problem) = &app.local.service_problem {
+    } else if let (Some(problem), Some(how)) = (&app.local.service_problem, app.service_fix()) {
         // On every tab, not just the Ulak one: without the service no
-        // port comes home, and the ports are what people look for.
-        Line::styled(format!(" ! {problem}"), Style::new().fg(BAD))
+        // port comes home, and the ports are what people look for. The
+        // fix it names is a button beside it.
+        let button = service_button(how);
+        let w = width_of(&button) as u16;
+        let text = vec![Span::styled(format!(" ! {problem}"), Style::new().fg(BAD))];
+        if area.width < w + 20 {
+            f.render_widget(Paragraph::new(Line::from(text)), area);
+            return;
+        }
+        let [left, right] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(w + 1)]).areas(area);
+        // Under a dialog it is no button: a click there is outside the
+        // dialog, which closes it.
+        if app.overlay == Overlay::None {
+            hits.keys
+                .push((Rect::new(right.x + 1, right.y, w, 1), "I".into()));
+        }
+        f.render_widget(Paragraph::new(pad_line(text, left.width as usize)), left);
+        f.render_widget(
+            Paragraph::new(Line::from(button)).alignment(ratatui::layout::Alignment::Right),
+            right,
+        );
+        return;
     } else {
         Line::raw("")
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// `I install it`, `I start it` or `I restart it`: the key that runs the
+/// fix every service problem names, saying what it does (`App::service_fix`).
+fn service_button(how: Install) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("I", key_style()),
+        Span::raw(" "),
+        Span::styled(how.button(), Style::new().fg(Color::Gray)),
+    ]
 }
 
 fn footer(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
@@ -2962,6 +3005,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             (":", "run any ulak docker command"),
             ("T", "tasks and their output"),
             ("@", "switch server"),
+            ("I", "install or restart the service (asks)"),
             ("ctrl-r", "refresh now; the service looks too"),
             ("q esc", "back, or quit"),
         ],
@@ -3490,24 +3534,48 @@ mod tests {
             "a stopped service's last report is history:\n{text}"
         );
         assert!(text.contains("no service running"), "{text}");
+        let (hits, terminal) = drawn(&a, 120, 24);
+        let buttons: Vec<String> = hits
+            .keys
+            .iter()
+            .filter(|(_, k)| k == "I")
+            .map(|(r, _)| cells(&terminal, *r))
+            .collect();
+        assert_eq!(
+            buttons,
+            ["I start it", "I start it"],
+            "beside the service's line, and beside its problem below"
+        );
     }
 
     #[test]
-    fn a_service_problem_is_said_on_every_tab() {
+    fn a_service_problem_is_said_on_every_tab_with_its_fix_as_a_button() {
         let mut a = app();
+        a.local.service_running = true;
+        a.local.service_installed = true;
         a.local.service_problem =
             Some("the running service is v0.1.0 and this ulak is v0.2.0".into());
-        let (_, terminal) = drawn(&a, 100, 24);
-        let status = cells(&terminal, Rect::new(0, 22, 100, 1));
+        let (hits, terminal) = drawn(&a, 100, 24);
+        let (r, _) = hits
+            .keys
+            .iter()
+            .find(|(_, k)| k == "I")
+            .expect("an I button on the Containers tab");
+        assert_eq!(cells(&terminal, *r), "I restart it");
+        let status = cells(&terminal, Rect::new(0, r.y, 100, 1));
         assert!(
             status.starts_with(" ! the running service is v0.1.0"),
             "{status}"
         );
         assert_eq!(
-            terminal.backend().buffer()[(1, 22)].fg,
+            terminal.backend().buffer()[(1, r.y)].fg,
             BAD,
             "said as a fault"
         );
+        // Under a dialog it is no button: a click there closes the dialog.
+        a.on_key(key('?'), Instant::now());
+        let (hits, _) = drawn(&a, 100, 24);
+        assert!(!hits.keys.iter().any(|(_, k)| k == "I"), "{:?}", hits.keys);
     }
 
     #[test]
