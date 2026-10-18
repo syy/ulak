@@ -10,7 +10,8 @@
 //! the link; tabs; the body; one status line (running work, or the newest
 //! notice); one line of the keys that apply to what is selected. Columns
 //! that do not fit are dropped from the least useful end rather than
-//! squeezed into unreadable stubs.
+//! squeezed into unreadable stubs. A footer with more keys than room
+//! drops its last ones, never `?` or `q`, because help names every key.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -2163,7 +2164,7 @@ fn status_line(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn footer(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
-    let keys = hints(app);
+    let keys = fitting(hints(app), area.width as usize);
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
     for (k, label) in keys {
@@ -2182,6 +2183,30 @@ fn footer(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
         used += w;
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The hints that fit in `width` cells. A row with more keys than room
+/// loses its last ones first: `?` and `q` stay, because they are how
+/// every other key is found and how to leave.
+pub fn fitting(hints: Vec<(String, String)>, width: usize) -> Vec<(String, String)> {
+    let cost = |(k, label): &(String, String)| k.width() + label.width() + 3;
+    let kept = |k: &str| k == "?" || k == "q";
+    let reserved: usize = hints.iter().filter(|h| kept(&h.0)).map(cost).sum();
+    let mut room = width.saturating_sub(1 + reserved);
+    let mut full = false;
+    let mut out = Vec::new();
+    for hint in hints {
+        if !kept(&hint.0) {
+            let w = cost(&hint);
+            full = full || w > room;
+            if full {
+                continue;
+            }
+            room -= w;
+        }
+        out.push(hint);
+    }
+    out
 }
 
 /// The keys that do something for what is selected, most useful first.
@@ -3120,6 +3145,32 @@ mod tests {
         (r.x..r.right())
             .map(|x| buffer[(x, r.y)].symbol().to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_row_with_more_keys_than_room_loses_its_last_ones_never_help_or_quit() {
+        let h = |k: &str, l: &str| (k.to_string(), l.to_string());
+        let hints = vec![
+            h("⏎", "logs"),
+            h("e", "shell"),
+            h("r", "restart"),
+            h("/", "filter"),
+            h("?", "help"),
+            h("q", "quit"),
+        ];
+        let keys = |width| {
+            fitting(hints.clone(), width)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(200), ["⏎", "e", "r", "/", "?", "q"]);
+        // " " + "⏎ logs  " + "e shell  " is 18, "? help  q quit  " 16.
+        assert_eq!(keys(34), ["⏎", "e", "?", "q"]);
+        // "/ filter" would fit where "r restart" did not, but the row's
+        // keys keep their order: once one is dropped, so is the rest.
+        assert_eq!(keys(44), ["⏎", "e", "?", "q"]);
+        assert_eq!(keys(45), ["⏎", "e", "r", "?", "q"]);
     }
 
     #[test]
