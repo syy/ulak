@@ -272,12 +272,15 @@ class Command:
             self.cut.set()
         for pump in self.pumps:
             pump.join()
+        # Marked before it is said: a client that read X may close at once,
+        # and must not be taken for one that left and hang up what the
+        # command left running on purpose.
+        self.done.set()
         if code < 0:
             exit = {"signal": signal_name(-code), "number": -code}
             self.peer.send("X", json.dumps(exit).encode())
         else:
             self.peer.send("X", json.dumps({"code": code}).encode())
-        self.done.set()
         # Both ways: what the client still sends is stdin nobody reads, and
         # the channel's end does not wait on a client that keeps it open.
         try:
