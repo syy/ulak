@@ -258,17 +258,11 @@ fn main_body(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     match app.tab {
         Tab::Project => project_tab(f, list, app, hits),
         _ => {
-            let (above, list) = match usage_line(app) {
-                Some(line) => {
-                    let [above, rest] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(list);
-                    (Some((above, line)), rest)
-                }
-                None => (None, list),
-            };
-            if let Some((r, line)) = above {
-                f.render_widget(Paragraph::new(line), r);
-            }
+            let usage = usage_lines(app);
+            let [above, list] =
+                Layout::vertical([Constraint::Length(usage.len() as u16), Constraint::Fill(1)])
+                    .areas(list);
+            f.render_widget(Paragraph::new(usage), above);
             list_rows(f, list, app, hits);
         }
     }
@@ -337,32 +331,40 @@ fn blocking_note(app: &App) -> Option<Vec<Line<'static>>> {
     })
 }
 
-fn usage_line(app: &App) -> Option<Line<'static>> {
-    let kind = match app.tab {
-        Tab::Images => "Images",
-        Tab::Volumes => "Local Volumes",
-        _ => return None,
+/// `docker system df` above the list, each row with the key that prunes
+/// it — and what that key takes, which for volumes is less than Docker's
+/// RECLAIMABLE: it counts named volumes too, and `P` keeps those.
+fn usage_lines(app: &App) -> Vec<Line<'static>> {
+    let rows: &[(&str, &str, &str)] = match app.tab {
+        Tab::Images => &[
+            ("Images", "", "P prunes unused images"),
+            ("Build Cache", "build cache ", "B prunes it"),
+        ],
+        Tab::Volumes => &[("Local Volumes", "", "P prunes unused anonymous ones")],
+        _ => &[],
     };
-    let u = app.usage.iter().find(|u| u.kind == kind)?;
-    Some(Line::from(vec![
-        Span::styled(
-            format!(" {} total · {} in use · ", u.total, u.active),
-            dim(),
-        ),
-        Span::styled(u.size.clone(), bold()),
-        Span::styled(" on disk · ", dim()),
-        Span::styled(
-            format!("{} reclaimable", u.reclaimable),
-            Style::new().fg(BUSY),
-        ),
-        Span::styled(
-            match app.tab {
-                Tab::Images => "  (P prunes dangling)",
-                _ => "  (P prunes unused anonymous)",
-            },
-            dim(),
-        ),
-    ]))
+    rows.iter()
+        .filter_map(|(kind, name, key)| {
+            let u = app.usage_of(kind)?;
+            let mut spans = vec![Span::styled(format!(" {name}"), dim())];
+            if name.is_empty() {
+                spans.push(Span::styled(
+                    format!("{} total · {} in use · ", u.total, u.active),
+                    dim(),
+                ));
+            }
+            spans.extend([
+                Span::styled(u.size.clone(), bold()),
+                Span::styled(" on disk · ", dim()),
+                Span::styled(
+                    format!("{} reclaimable", u.reclaimable),
+                    Style::new().fg(BUSY),
+                ),
+                Span::styled(format!("  ({key})"), dim()),
+            ]);
+            Some(Line::from(spans))
+        })
+        .collect()
 }
 
 /// A column: header, width, and whether it is the one that stretches.
@@ -2273,12 +2275,10 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("⏎", "inspect"));
                     out.push(h("p", "pull"));
                     out.push(h("d", "delete"));
-                    out.push(h("P", "prune"));
                 }
                 Some(Row::Volume(_)) | Some(Row::Network(_)) => {
                     out.push(h("⏎", "inspect"));
                     out.push(h("d", "delete"));
-                    out.push(h("P", "prune"));
                 }
                 Some(Row::Here | Row::Stack(_)) => {
                     out.push(h("⏎", "show"));
@@ -2288,6 +2288,12 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("c", "doctor"));
                 }
                 None => {}
+            }
+            // The tab's own verb, which needs no row. `B` is named beside
+            // the build cache's numbers instead: one more hint here pushes
+            // `?` and `q` off a 100-column footer.
+            if matches!(app.tab, Tab::Images | Tab::Volumes | Tab::Networks) {
+                out.push(h("P", "prune"));
             }
             out.push(h("/", "filter"));
             out.push(h("tab", "next tab"));
@@ -2741,6 +2747,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("p", "pull image"),
             ("d", "delete (asks first)"),
             ("P", "prune unused (asks first)"),
+            ("B", "prune the build cache (Images)"),
         ],
     ),
     (

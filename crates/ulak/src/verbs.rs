@@ -24,7 +24,7 @@ use anyhow::Result;
 
 use crate::catalog::{self, Route};
 use crate::docker::{Remote, Tty};
-use crate::engine::{Container, Image, Network, Volume, Want};
+use crate::engine::{Container, Image, Network, Usage, Volume, Want};
 use crate::ssh::Ssh;
 use crate::ui::fail;
 
@@ -245,13 +245,62 @@ pub fn pull_image(image: &Image) -> Option<Action> {
     })
 }
 
-pub fn prune_images() -> Action {
+/// `docker system df`'s RECLAIMABLE without its share: `3.404GB`.
+fn reclaimable(u: &Usage) -> &str {
+    u.reclaimable.split(" (").next().unwrap_or_default().trim()
+}
+
+/// Every image no container uses: `-a`. Plain `image prune` takes only
+/// dangling ones, while the number shown beside `P` is `system df`'s,
+/// which counts every unused image. Measured on Docker 29.8.1: 3.404GB
+/// reclaimable across 5 unused images, and `docker images -f
+/// dangling=true` empty — the old `P` had nothing to take.
+pub fn prune_images(usage: Option<&Usage>) -> Action {
+    let counted = usage
+        .and_then(|u| {
+            let total: u64 = u.total.trim().parse().ok()?;
+            let active: u64 = u.active.trim().parse().ok()?;
+            Some(format!(
+                " ({} of {total}, {})",
+                total.saturating_sub(active),
+                reclaimable(u)
+            ))
+        })
+        .unwrap_or_default();
     Action {
-        title: "prune dangling images".into(),
-        confirm: Some("Delete every dangling image (untagged, used by no container)?".into()),
-        plan: Plan::Daemon(vec!["image".into(), "prune".into(), "-f".into()]),
+        title: "prune unused images".into(),
+        confirm: Some(format!(
+            "Delete every image no container uses{counted}? A stack that is down pulls or builds its images again on its next up."
+        )),
+        plan: Plan::Daemon(vec![
+            "image".into(),
+            "prune".into(),
+            "-a".into(),
+            "-f".into(),
+        ]),
         refresh: Want {
             images: true,
+            usage: true,
+            ..Want::default()
+        },
+    }
+}
+
+/// The build cache, which the dashboard never showed: 9.975GB on that
+/// same server, more than all its images. Plain `builder prune`, as
+/// typing it would; `-a` also takes what BuildKit keeps by default. What
+/// it freed is Docker's to say, and the task's toast repeats it.
+pub fn prune_build_cache(usage: Option<&Usage>) -> Action {
+    let counted = usage
+        .map(|u| format!(" ({} of {})", reclaimable(u), u.size))
+        .unwrap_or_default();
+    Action {
+        title: "prune build cache".into(),
+        confirm: Some(format!(
+            "Delete the build cache Docker counts as reclaimable{counted}? Builds after this start colder."
+        )),
+        plan: Plan::Daemon(vec!["builder".into(), "prune".into(), "-f".into()]),
+        refresh: Want {
             usage: true,
             ..Want::default()
         },
@@ -274,13 +323,25 @@ pub fn remove_volume(volume: &Volume) -> Action {
     }
 }
 
+/// Anonymous volumes only, by their label as well as by Docker's default:
+/// before Docker 23, `volume prune` took every unused volume, named ones
+/// — a stack's database — among them. With the filter an older engine,
+/// which labels nothing, prunes nothing instead. On Docker 29.8.1 every
+/// anonymous volume carries `com.docker.volume.anonymous=`, and a
+/// Compose-named one does not.
 pub fn prune_volumes() -> Action {
     Action {
         title: "prune unused anonymous volumes".into(),
         confirm: Some(
-            "Delete every anonymous volume no container uses? Their data is gone for good.".into(),
+            "Delete every anonymous volume no container uses? Their data is gone for good. Named volumes stay; d deletes one.".into(),
         ),
-        plan: Plan::Daemon(vec!["volume".into(), "prune".into(), "-f".into()]),
+        plan: Plan::Daemon(vec![
+            "volume".into(),
+            "prune".into(),
+            "-f".into(),
+            "--filter".into(),
+            "label=com.docker.volume.anonymous".into(),
+        ]),
         refresh: Want {
             volumes: true,
             usage: true,
@@ -320,6 +381,7 @@ pub fn prune_containers() -> Action {
         plan: Plan::Daemon(vec!["container".into(), "prune".into(), "-f".into()]),
         refresh: Want {
             images: true,
+            usage: true,
             ..Want::default()
         },
     }
@@ -598,7 +660,8 @@ mod tests {
             remove(&[&web]),
             remove_image(&image),
             pull_image(&image).unwrap(),
-            prune_images(),
+            prune_images(None),
+            prune_build_cache(None),
             remove_volume(&volume),
             prune_volumes(),
             remove_network(&network),
@@ -621,6 +684,65 @@ mod tests {
         ] {
             assert!(!argv.is_empty());
         }
+    }
+
+    fn usage(kind: &str, total: &str, active: &str, size: &str, reclaimable: &str) -> Usage {
+        Usage {
+            kind: kind.into(),
+            total: total.into(),
+            active: active.into(),
+            size: size.into(),
+            reclaimable: reclaimable.into(),
+        }
+    }
+
+    #[test]
+    fn pruning_images_takes_every_unused_one_and_asks_with_dockers_own_numbers() {
+        let images = usage("Images", "19", "14", "8.978GB", "3.404GB (37%)");
+        let action = prune_images(Some(&images));
+        assert_eq!(
+            action.plan,
+            Plan::Daemon(vec![
+                "image".into(),
+                "prune".into(),
+                "-a".into(),
+                "-f".into()
+            ]),
+            "plain `image prune` takes dangling images only"
+        );
+        let question = action.confirm.unwrap();
+        assert!(question.contains("(5 of 19, 3.404GB)"), "{question}");
+        assert!(question.contains("pulls or builds"), "{question}");
+        // Before the first `system df` there is nothing to quote.
+        let question = prune_images(None).confirm.unwrap();
+        assert!(
+            question.starts_with("Delete every image no container uses?"),
+            "{question}"
+        );
+    }
+
+    #[test]
+    fn pruning_the_build_cache_quotes_what_docker_counts() {
+        let cache = usage("Build Cache", "264", "11", "9.975GB", "3.532GB");
+        let action = prune_build_cache(Some(&cache));
+        assert_eq!(
+            action.plan,
+            Plan::Daemon(vec!["builder".into(), "prune".into(), "-f".into()])
+        );
+        let question = action.confirm.unwrap();
+        assert!(question.contains("(3.532GB of 9.975GB)"), "{question}");
+        assert!(action.refresh.usage);
+    }
+
+    #[test]
+    fn pruning_volumes_names_anonymous_ones_on_every_engine() {
+        let Plan::Daemon(argv) = prune_volumes().plan else {
+            panic!("a daemon verb");
+        };
+        let filter = argv.iter().position(|a| a == "--filter").unwrap();
+        assert_eq!(argv[filter + 1], "label=com.docker.volume.anonymous");
+        let question = prune_volumes().confirm.unwrap();
+        assert!(question.contains("Named volumes stay"), "{question}");
     }
 
     #[test]
@@ -670,7 +792,8 @@ mod tests {
         assert!(restart(&[&web]).confirm.is_none());
         assert!(kill(&web).confirm.is_some());
         assert!(remove(&[&web]).confirm.is_some());
-        assert!(prune_images().confirm.is_some());
+        assert!(prune_images(None).confirm.is_some());
+        assert!(prune_build_cache(None).confirm.is_some());
         assert!(prune_volumes().confirm.is_some());
         assert!(prune_networks().confirm.is_some());
         assert!(prune_containers().confirm.is_some());

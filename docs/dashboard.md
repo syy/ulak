@@ -42,7 +42,7 @@ Press `?` for the full list. The ones you need first:
 | `l` | On a stack: every container's logs, merged by time |
 | `e` | A shell inside the container (`bash` where the image has it, else `sh`) |
 | `s` `r` `p` `K` | Stop or start, restart, pause or resume, kill |
-| `d` `P` | Delete the selected item, prune the unused ones — both ask first |
+| `d` `P` | Delete the selected item; prune the tab's unused ones — both ask first |
 | `u` `D` `S` | `compose up -d`, `compose down` (asks first), sync now |
 | `o` `y` | Open its forwarded `localhost` port in a browser; copy its id |
 | `/` | Filter the list; in logs and inspect, search (`n` older, `N` newer) |
@@ -53,6 +53,14 @@ Press `?` for the full list. The ones you need first:
 A destructive action says what it will remove and starts on No:
 
 ![ulak ui: compose down asks first, with No selected](images/dashboard-confirm.svg)
+
+`P` works on the whole tab, with or without a selection: on Images it
+deletes every image no container uses, on Volumes the anonymous volumes no
+container uses, on Networks the unused networks, and on Containers the
+stopped containers. Named volumes are never pruned; `d` deletes one. On the
+Images tab, `B` prunes the build cache Docker counts as reclaimable. The
+question quotes `docker system df`'s own numbers, and a prune that worked
+says how much Docker freed.
 
 In logs, `f` pauses and resumes following, `w` wraps long lines, `t` shows
 Docker's timestamps and `c` clears the view. Scrolling up pauses by itself and

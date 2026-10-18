@@ -1012,6 +1012,11 @@ impl App {
             .map(|(_, st)| st)
     }
 
+    /// `docker system df`'s row for `kind`: `Images`, `Build Cache`, …
+    pub fn usage_of(&self, kind: &str) -> Option<&Usage> {
+        self.usage.iter().find(|u| u.kind == kind)
+    }
+
     pub fn container_by_id(&self, id: &str) -> Option<&Container> {
         self.containers.iter().find(|c| c.id == id)
     }
@@ -1131,7 +1136,11 @@ impl App {
                     return fx;
                 }
                 if code == Some(0) {
-                    self.toast(Tone::Good, title, now);
+                    let said = match last.as_deref().and_then(freed) {
+                        Some(size) => format!("{title} · {size} freed"),
+                        None => title,
+                    };
+                    self.toast(Tone::Good, said, now);
                 } else {
                     let tail = last.map(|l| format!(": {l}")).unwrap_or_default();
                     self.toast(
@@ -1435,8 +1444,19 @@ impl App {
                     before: self.filter.clone(),
                 });
             }
-            KeyCode::Char('P') if self.tab == Tab::Containers => {
-                return self.act(verbs::prune_containers(), now);
+            // The tab's own verbs, so they work with nothing selected: a
+            // filter that matches nothing, or nothing left to list.
+            KeyCode::Char('P') if self.tab != Tab::Project => {
+                let action = match self.tab {
+                    Tab::Images => verbs::prune_images(self.usage_of("Images")),
+                    Tab::Volumes => verbs::prune_volumes(),
+                    Tab::Networks => verbs::prune_networks(),
+                    Tab::Containers | Tab::Project => verbs::prune_containers(),
+                };
+                return self.act(action, now);
+            }
+            KeyCode::Char('B') if self.tab == Tab::Images => {
+                return self.act(verbs::prune_build_cache(self.usage_of("Build Cache")), now);
             }
             KeyCode::Char('a') if self.tab == Tab::Containers => {
                 self.show_stopped = !self.show_stopped;
@@ -1569,7 +1589,6 @@ impl App {
                             Vec::new()
                         }
                     },
-                    KeyCode::Char('P') => self.act(verbs::prune_images(), now),
                     KeyCode::Char('y') => self.copy(image.reference(), now),
                     _ => Vec::new(),
                 }
@@ -1585,7 +1604,6 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Delete => {
                         self.act(verbs::remove_volume(&volume), now)
                     }
-                    KeyCode::Char('P') => self.act(verbs::prune_volumes(), now),
                     KeyCode::Char('y') => self.copy(volume.name.clone(), now),
                     _ => Vec::new(),
                 }
@@ -1613,7 +1631,6 @@ impl App {
                             self.act(verbs::remove_network(&network), now)
                         }
                     }
-                    KeyCode::Char('P') => self.act(verbs::prune_networks(), now),
                     KeyCode::Char('y') => self.copy(network.id.clone(), now),
                     _ => Vec::new(),
                 }
@@ -2166,6 +2183,11 @@ impl App {
             None => Vec::new(),
             Some(false) => {
                 self.overlay = Overlay::None;
+                // Said, so an Enter on the default reads as the No it is
+                // and not as a command that ran and did nothing.
+                if let Then::Run(action) = &c.then {
+                    self.toast(Tone::Note, format!("{}: cancelled", action.title), now);
+                }
                 Vec::new()
             }
             Some(true) => {
@@ -2485,6 +2507,18 @@ impl App {
         }
         Vec::new()
     }
+}
+
+/// What a prune's last line says it freed: `Total reclaimed space:
+/// 3.404GB` from an image, container, volume or system prune, `Total:
+/// 3.532GB` (tab-separated) from a builder prune.
+fn freed(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let size = line
+        .strip_prefix("Total reclaimed space:")
+        .or_else(|| line.strip_prefix("Total:"))?
+        .trim();
+    (!size.is_empty()).then_some(size)
 }
 
 /// Pretty-print a JSON document; anything else is shown as it came.
@@ -3310,6 +3344,125 @@ pub(crate) mod tests {
         let fx = a.on_mouse(left_click(38, 12), &hits, Instant::now());
         assert!(matches!(fx.as_slice(), [Effect::Run { .. }]), "{fx:?}");
         assert_eq!(a.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn prune_is_the_tabs_key_and_works_with_nothing_selected() {
+        let mut a = app();
+        a.on_key(key('2'), Instant::now());
+        a.filter = "matches nothing".into();
+        a.fix_selection();
+        assert!(a.selected().is_none());
+        a.on_key(key('P'), Instant::now());
+        let Overlay::Confirm(c) = &a.overlay else {
+            panic!("{:?}", a.overlay);
+        };
+        let Then::Run(action) = &c.then else {
+            panic!("{:?}", c.then);
+        };
+        assert_eq!(action.title, "prune unused images");
+        for (tab, title) in [
+            ('1', "prune stopped containers"),
+            ('3', "prune unused anonymous volumes"),
+            ('4', "prune unused networks"),
+        ] {
+            let mut a = app();
+            a.on_key(key(tab), Instant::now());
+            a.on_key(key('P'), Instant::now());
+            assert!(
+                matches!(&a.overlay, Overlay::Confirm(Confirm { then: Then::Run(x), .. }) if x.title == title),
+                "{tab}: {:?}",
+                a.overlay
+            );
+        }
+        let mut a = app();
+        a.on_key(key('5'), Instant::now());
+        a.on_key(key('P'), Instant::now());
+        assert_eq!(
+            a.overlay,
+            Overlay::None,
+            "the Ulak tab has nothing to prune"
+        );
+    }
+
+    #[test]
+    fn b_on_the_images_tab_asks_to_prune_the_build_cache_with_dockers_numbers() {
+        let mut a = app();
+        a.usage = vec![Usage {
+            kind: "Build Cache".into(),
+            total: "264".into(),
+            active: "11".into(),
+            size: "9.975GB".into(),
+            reclaimable: "3.532GB".into(),
+        }];
+        a.on_key(key('2'), Instant::now());
+        a.on_key(key('B'), Instant::now());
+        let Overlay::Confirm(c) = &a.overlay else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question.contains("(3.532GB of 9.975GB)"),
+            "{}",
+            c.question
+        );
+        let mut a = app();
+        a.on_key(key('B'), Instant::now());
+        assert_eq!(a.overlay, Overlay::None, "only the Images tab has it");
+    }
+
+    #[test]
+    fn declining_a_question_says_nothing_was_done() {
+        for no in [key('n'), code(KeyCode::Esc), code(KeyCode::Enter)] {
+            let mut a = app();
+            a.on_key(key('2'), Instant::now());
+            a.on_key(key('P'), Instant::now());
+            let fx = a.on_key(no, Instant::now());
+            assert!(fx.is_empty(), "{no:?}: {fx:?}");
+            assert_eq!(a.overlay, Overlay::None);
+            let toast = a.toasts.last().expect("a word about it");
+            assert_eq!(toast.text, "prune unused images: cancelled", "{no:?}");
+        }
+    }
+
+    #[test]
+    fn a_prune_that_worked_says_what_docker_says_it_freed() {
+        assert_eq!(freed("Total reclaimed space: 3.404GB"), Some("3.404GB"));
+        assert_eq!(freed("Total:\t3.532GB"), Some("3.532GB"));
+        assert_eq!(freed("Total reclaimed space: 0B"), Some("0B"));
+        assert_eq!(freed("demo_default"), None);
+        assert_eq!(freed("Total:"), None);
+        let mut a = app();
+        a.on_key(key('2'), Instant::now());
+        a.on_key(key('P'), Instant::now());
+        let fx = a.on_key(key('y'), Instant::now());
+        let [Effect::Run { task, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let task = *task;
+        for line in [
+            "Deleted Images:",
+            "deleted: sha256:4f1c…",
+            "",
+            "Total reclaimed space: 3.404GB",
+        ] {
+            a.on_msg(
+                Msg::TaskLine {
+                    task,
+                    line: line.into(),
+                },
+                Instant::now(),
+            );
+        }
+        a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(0),
+            },
+            Instant::now(),
+        );
+        let toast = a.toasts.last().unwrap();
+        assert_eq!(toast.tone, Tone::Good);
+        assert_eq!(toast.text, "prune unused images · 3.404GB freed");
     }
 
     #[test]
