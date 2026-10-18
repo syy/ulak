@@ -1169,8 +1169,9 @@ impl Watch {
                 }
                 // One more look: a signal sent to the caller's whole group
                 // reaches this process in the same instant as the caller,
-                // and is counted before the hangup is decided.
-                std::thread::sleep(watched);
+                // and is counted before the hangup is decided. Short, since
+                // a caller killed alone waits for it too.
+                std::thread::sleep(Duration::from_millis(50));
                 let passed_at = *passed.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(at) = passed_at {
                     while !stop.load(Ordering::Relaxed) && at.elapsed() < ENDING {
