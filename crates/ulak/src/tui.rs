@@ -523,7 +523,7 @@ struct World {
     poller: Poller,
     events: Option<Stream>,
     stats: Option<Stream>,
-    logs: BTreeMap<u64, Vec<Stream>>,
+    logs: BTreeMap<u64, Stream>,
     tasks: BTreeMap<u64, Task>,
     _local: LocalReader,
 }
@@ -600,19 +600,26 @@ impl World {
             }
             Effect::Shell(c) => self.shell(&c, screen)?,
             Effect::OpenLogs { stream, ids } => {
-                let mut streams = Vec::new();
-                for (source, id) in ids.iter().enumerate() {
-                    let started = verbs::logs_argv(id).and_then(|argv| {
-                        feed::stream(
+                // One session however many containers: see `feed.rs`.
+                let started = ids
+                    .iter()
+                    .map(|id| verbs::logs_argv(id))
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|argvs| match argvs.as_slice() {
+                        [argv] => feed::stream(
                             &self.quiet,
-                            &argv,
-                            Sink::Logs { stream, source },
+                            argv,
+                            Sink::Logs { stream, source: 0 },
                             self.out.clone(),
-                        )
+                        ),
+                        _ => feed::stack_logs(&self.quiet, &argvs, stream, self.out.clone()),
                     });
-                    match started {
-                        Ok(s) => streams.push(s),
-                        Err(e) => {
+                match started {
+                    Ok(s) => {
+                        self.logs.insert(stream, s);
+                    }
+                    Err(e) => {
+                        for source in 0..ids.len() {
                             let _ = self.out.send(Msg::StreamEnded {
                                 stream,
                                 source,
@@ -621,7 +628,6 @@ impl World {
                         }
                     }
                 }
-                self.logs.insert(stream, streams);
             }
             Effect::CloseLogs { stream } => {
                 self.logs.remove(&stream);

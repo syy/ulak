@@ -86,10 +86,12 @@ your SSH connection, recorded in the same audit trail as the commands you type.
   `docker events` reports a change. `docker system df`, which sizes every
   layer and volume, runs only while the Images or Volumes tab is open.
 - `docker events` and `docker stats` stream while it is open, and
-  `docker logs -f` while a log view is. Each runs under a small watchdog that
-  ends the remote command when the dashboard's end of the connection closes,
-  so nothing is left running on the server after you quit, even after a
-  crash.
+  `docker logs -f` while a log view is. A stack's merged view follows all of
+  its containers in one session: OpenSSH allows ten sessions on a connection
+  by default (`MaxSessions`), and one per container used them up. Each
+  stream runs under a small watchdog that ends the remote command when the
+  dashboard's end of the connection closes, so nothing is left running on
+  the server after you quit, even after a crash.
 - Container, image, volume and network actions are the Docker commands of the
   same name, checked against the same routing table as `ulak docker`.
   Compose actions, `sync`, `doctor` and the `:` prompt run `ulak` itself with
