@@ -511,6 +511,12 @@ class Server:
                     # in the backlog, and every command running goes on.
                     time.sleep(0.1)
                     conn = None
+                if conn is not None and self.stale():
+                    # A login now would get other groups: closed unanswered,
+                    # before anything ran, and the client starts the next
+                    # helper with them.
+                    conn.close()
+                    conn = None
                 if conn is not None:
                     conn.settimeout(None)
                     self.joined()
