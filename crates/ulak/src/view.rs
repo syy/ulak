@@ -2190,6 +2190,7 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
             return vec![h("↑↓", "server"), h("⏎", "switch"), h("esc", "close")];
         }
         Overlay::Help { .. } => return vec![h("↑↓", "scroll"), h("any other key", "close")],
+        Overlay::Leaving { .. } => return vec![h("q", "leave now")],
         Overlay::None => {}
     }
     let mut out = Vec::new();
@@ -2451,6 +2452,7 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             f.render_widget(Paragraph::new(Line::from(spans)), r);
         }
         Overlay::Tasks { selected, scroll } => tasks(f, area, app, *selected, *scroll, hits),
+        Overlay::Leaving { .. } => leaving(f, area, app, hits),
         Overlay::Servers { selected } => {
             let servers = app.servers();
             let height = (servers.len() as u16 + 4).min(area.height.saturating_sub(2));
@@ -2505,6 +2507,67 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             );
         }
     }
+}
+
+/// Quitting while tasks stop: what is being waited for, and the way out.
+fn leaving(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
+    const SHOWN: usize = 4;
+    let running: Vec<&TaskView> = app.tasks.iter().filter(|t| t.running()).collect();
+    let width = (area.width.saturating_sub(4)).min(64);
+    let inner = width.saturating_sub(4) as usize;
+    let (count, them) = match running.len() {
+        1 => ("1 task".to_string(), "it"),
+        n => (format!("{n} tasks"), "them"),
+    };
+    let said = format!(
+        "Stopping {count}, and waiting up to {}s for {them} to finish.",
+        crate::app::LEAVE_GRACE.as_secs()
+    );
+    let mut lines: Vec<Line> = wrap_words(&said, inner)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    lines.push(Line::raw(""));
+    let spin = SPINNER[(app.frame as usize) % SPINNER.len()];
+    for t in running.iter().take(SHOWN) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{spin} "), Style::new().fg(BUSY)),
+            Span::raw(fit(&t.title, inner.saturating_sub(2))),
+        ]));
+    }
+    if running.len() > SHOWN {
+        lines.push(Line::styled(
+            format!("  … and {} more", running.len() - SHOWN),
+            dim(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let rest = " leave now, killing what is left";
+    lines.push(
+        Line::from(vec![
+            Span::styled(" q ", key_style()),
+            Span::styled(rest, Style::new().fg(Color::Gray)),
+        ])
+        .alignment(ratatui::layout::Alignment::Center),
+    );
+    let r = centered(area, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, r);
+    hits.dialog = Some(r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BUSY))
+        .title(Span::styled(" Quitting ", bold()))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    // The button's line is centred the way Paragraph centres it: half
+    // the width less half the line, which for an odd line is not the
+    // same column as half of what is left.
+    let body = block.inner(r);
+    let button = 3 + rest.width() as u16;
+    let x = body.x + (body.width / 2).saturating_sub(button / 2);
+    let row = body.y + lines.len() as u16 - 1;
+    hits.keys
+        .push((Rect::new(x, row, button.min(body.width), 1), "q".into()));
+    f.render_widget(Paragraph::new(lines).block(block), r);
 }
 
 fn tasks(
@@ -2979,6 +3042,39 @@ mod tests {
         );
         a.on_key(key('d'), Instant::now());
         insta::assert_snapshot!(render(&a, 90, 20));
+    }
+
+    #[test]
+    fn the_quitting_dialog_names_what_it_waits_for_and_its_button_is_q() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut a = app();
+        a.on_key(code(KeyCode::Down), Instant::now());
+        a.on_key(key('r'), Instant::now());
+        a.on_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Instant::now(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut hits = Hits::default();
+        terminal.draw(|f| hits = draw(f, &a)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = render(&a, 90, 20);
+        assert!(text.contains("Quitting"), "{text}");
+        assert!(
+            text.contains("Stopping 1 task, and waiting up to 4s"),
+            "{text}"
+        );
+        assert!(text.contains(&a.tasks[0].title), "{text}");
+        let dialog = hits.dialog.expect("a dialog frame");
+        let (button, _) = hits
+            .keys
+            .iter()
+            .find(|(r, k)| k == "q" && dialog.contains(r.as_position()))
+            .expect("a q button inside the dialog");
+        let cells: String = (button.x..button.right())
+            .map(|x| buffer[(x, button.y)].symbol().to_string())
+            .collect();
+        assert_eq!(cells, " q  leave now, killing what is left", "{text}");
     }
 
     #[test]

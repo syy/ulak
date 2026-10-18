@@ -71,7 +71,10 @@ it; the wheel scrolls. Each key named in the bottom line is a button that
 presses that key, so `d delete` asks the same question the key does. Dialog
 buttons can be clicked, and a click outside a dialog closes it the way `esc`
 would, which never confirms. Because the dashboard reads the mouse, selecting
-text needs Shift-drag in most terminals, or Option-drag on a Mac.
+text needs Shift-drag in most terminals, or Option-drag on a Mac. It asks the
+terminal for clicks and the wheel only, never for movement, and reads what is
+still on its way before it gives the terminal back, so nothing you click or
+type in it ends up in your shell.
 
 ## What it runs
 
@@ -93,5 +96,8 @@ your SSH connection, recorded in the same audit trail as the commands you type.
   the project's exact Compose flags, so they synchronize, keep stacks live and
   forward ports exactly as the same command typed in a terminal would.
 
-Quitting with `q` while tasks still run asks first. Either way, running tasks
-are stopped the way Ctrl-C would stop them and given a moment to finish.
+Quitting with `q` while tasks still run asks first. Running tasks are then
+stopped the way Ctrl-C would stop them, and the dashboard stays up, saying
+what it waits for, until they finish or four seconds pass; `q` or Ctrl-C
+again leaves at once. Ctrl-C quits from anywhere without asking, and stops
+running tasks the same way.

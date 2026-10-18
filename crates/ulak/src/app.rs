@@ -51,6 +51,11 @@ const BAD_TOAST_FOR: Duration = Duration::from_secs(10);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// When `docker events` is down, the list is re-read this often instead.
 const BLIND_POLL: Duration = Duration::from_secs(5);
+/// How long running tasks get to stop once asked (`feed::Task::cancel`)
+/// when quitting, before what is left is killed. Waited out here, inside
+/// the loop, so the screen keeps drawing and reading while they stop:
+/// see `App::leave`.
+pub const LEAVE_GRACE: Duration = Duration::from_secs(4);
 const FEED_BACKOFF: &[u64] = &[2, 5, 15, 30];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -451,6 +456,7 @@ pub struct Input {
     pub before: String,
 }
 
+/// `Leaving` is quitting while the tasks that were running stop: `App::leave`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
@@ -459,6 +465,7 @@ pub enum Overlay {
     Input(Input),
     Tasks { selected: usize, scroll: usize },
     Servers { selected: usize },
+    Leaving { since: Instant },
 }
 
 #[derive(Debug, Clone)]
@@ -1117,6 +1124,12 @@ impl App {
                 let title = t.title.clone();
                 let refresh = t.refresh;
                 let last = t.lines.iter().rev().find(|l| !l.trim().is_empty()).cloned();
+                if matches!(self.overlay, Overlay::Leaving { .. }) {
+                    if self.running_tasks() == 0 {
+                        self.quit = true;
+                    }
+                    return fx;
+                }
                 if code == Some(0) {
                     self.toast(Tone::Good, title, now);
                 } else {
@@ -1262,6 +1275,11 @@ impl App {
     /// Ulak's own helpers held back while the dashboard owned the screen.
     pub fn on_tick(&mut self, now: Instant, held: Vec<(crate::ui::Level, String)>) -> Vec<Effect> {
         self.frame = self.frame.wrapping_add(1);
+        if let Overlay::Leaving { since } = self.overlay
+            && now.duration_since(since) >= LEAVE_GRACE
+        {
+            self.quit = true;
+        }
         for (level, text) in held {
             let tone = match level {
                 crate::ui::Level::Warn => Tone::Bad,
@@ -1311,11 +1329,18 @@ impl App {
     // ─── input ──────────────────────────────────────────────────────
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Vec<Effect> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return Vec::new();
-        }
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         match self.overlay.clone() {
+            // Read, so that it never reaches the shell, and dropped: only
+            // the quit keys mean anything now, and they mean "do not wait".
+            Overlay::Leaving { .. } => {
+                if ctrl_c || key.code == KeyCode::Char('q') {
+                    self.quit = true;
+                }
+                return Vec::new();
+            }
+            _ if ctrl_c => return self.leave(now),
             Overlay::None => {}
             Overlay::Help { scroll } => {
                 // Scrolling keys page through it; anything else closes it.
@@ -1447,6 +1472,30 @@ impl App {
             fx.push(Effect::Poke(missing));
         }
         fx
+    }
+
+    /// Quit, after asking running tasks to stop. While they stop, the
+    /// dashboard stays up, drawn and reading every key, and quits when
+    /// the last one is done, when `LEAVE_GRACE` is up, or at a second `q`
+    /// or Ctrl-C. The wait used to come after the loop, with nobody
+    /// reading: every click and key made during it was left in the
+    /// terminal for the shell.
+    fn leave(&mut self, now: Instant) -> Vec<Effect> {
+        let running: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|t| t.running())
+            .map(|t| t.id)
+            .collect();
+        if running.is_empty() {
+            self.quit = true;
+            return Vec::new();
+        }
+        self.overlay = Overlay::Leaving { since: now };
+        running
+            .into_iter()
+            .map(|task| Effect::Cancel { task })
+            .collect()
     }
 
     fn ask_quit(&mut self) -> Vec<Effect> {
@@ -2122,10 +2171,7 @@ impl App {
             Some(true) => {
                 self.overlay = Overlay::None;
                 match c.then {
-                    Then::Quit => {
-                        self.quit = true;
-                        Vec::new()
-                    }
+                    Then::Quit => self.leave(now),
                     Then::Run(action) => {
                         let deleting_here = matches!(
                             (&self.screen, &action.plan),
@@ -2904,15 +2950,128 @@ pub(crate) mod tests {
         assert!(a.tasks[0].failed());
     }
 
-    #[test]
-    fn quitting_with_a_running_task_asks_first() {
-        let mut a = app();
+    /// A restart of the second row, started and still running.
+    fn running_task(a: &mut App) -> u64 {
         a.on_key(code(KeyCode::Down), Instant::now());
-        a.on_key(key('r'), Instant::now());
-        a.on_key(key('q'), Instant::now());
+        let fx = a.on_key(key('r'), Instant::now());
+        let [Effect::Run { task, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        *task
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn quitting_with_a_running_task_asks_then_stops_it_and_waits_on_screen() {
+        let mut a = app();
+        let task = running_task(&mut a);
+        let now = Instant::now();
+        a.on_key(key('q'), now);
         assert!(!a.quit);
         assert!(matches!(&a.overlay, Overlay::Confirm(c) if c.then == Then::Quit));
-        a.on_key(key('y'), Instant::now());
+        let fx = a.on_key(key('y'), now);
+        assert_eq!(fx, vec![Effect::Cancel { task }]);
+        assert!(!a.quit, "it waits for the task, on screen");
+        assert!(
+            matches!(a.overlay, Overlay::Leaving { .. }),
+            "{:?}",
+            a.overlay
+        );
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(130),
+            },
+            now,
+        );
+        assert!(a.quit, "the last task to stop ends the wait");
+        assert!(fx.is_empty(), "nothing is refreshed on the way out: {fx:?}");
+    }
+
+    #[test]
+    fn while_quitting_every_key_is_read_and_only_q_or_ctrl_c_ends_the_wait() {
+        let mut a = app();
+        running_task(&mut a);
+        let now = Instant::now();
+        let fx = a.on_key(ctrl_c(), now);
+        assert!(matches!(fx.as_slice(), [Effect::Cancel { .. }]), "{fx:?}");
+        let waiting = a.overlay.clone();
+        assert!(matches!(waiting, Overlay::Leaving { .. }), "{waiting:?}");
+        for k in [
+            key('j'),
+            key('d'),
+            key('y'),
+            key('e'),
+            key(':'),
+            code(KeyCode::Enter),
+            code(KeyCode::Esc),
+        ] {
+            assert_eq!(a.on_key(k, now), Vec::new(), "{k:?}");
+            assert_eq!(a.overlay, waiting, "{k:?}");
+            assert!(!a.quit, "{k:?}");
+        }
+        // A click outside the dialog is esc, which does not end it either.
+        let hits = Hits {
+            dialog: Some(Rect::new(20, 8, 40, 7)),
+            ..Hits::default()
+        };
+        assert_eq!(a.on_mouse(left_click(2, 2), &hits, now), Vec::new());
+        assert!(!a.quit);
+        a.on_key(key('q'), now);
+        assert!(a.quit);
+
+        let mut b = app();
+        running_task(&mut b);
+        b.on_key(ctrl_c(), now);
+        assert!(!b.quit);
+        b.on_key(ctrl_c(), now);
+        assert!(b.quit, "a second ctrl-c does not wait either");
+    }
+
+    #[test]
+    fn quitting_stops_waiting_when_the_grace_is_up() {
+        let mut a = app();
+        running_task(&mut a);
+        let start = Instant::now();
+        a.on_key(ctrl_c(), start);
+        a.on_tick(start + LEAVE_GRACE - Duration::from_millis(100), Vec::new());
+        assert!(!a.quit);
+        a.on_tick(start + LEAVE_GRACE, Vec::new());
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn quitting_after_tasks_have_finished_quits_at_once() {
+        for quit in [key('q'), ctrl_c()] {
+            let mut a = app();
+            let task = running_task(&mut a);
+            a.on_msg(
+                Msg::TaskDone {
+                    task,
+                    code: Some(0),
+                },
+                Instant::now(),
+            );
+            let fx = a.on_key(quit, Instant::now());
+            assert_eq!(fx, Vec::new(), "nothing is left to stop");
+            assert!(a.quit, "{quit:?}");
+        }
+    }
+
+    #[test]
+    fn the_quitting_dialogs_button_leaves_now() {
+        let mut a = app();
+        running_task(&mut a);
+        a.on_key(ctrl_c(), Instant::now());
+        let hits = Hits {
+            keys: vec![(Rect::new(30, 12, 30, 1), "q".into())],
+            dialog: Some(Rect::new(20, 8, 40, 7)),
+            ..Hits::default()
+        };
+        a.on_mouse(left_click(35, 12), &hits, Instant::now());
         assert!(a.quit);
     }
 

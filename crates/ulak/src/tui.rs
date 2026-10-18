@@ -3,7 +3,7 @@
 //!
 //! `app.rs` decides and `view.rs` draws; this module owns what neither may
 //! touch — the terminal, the workers in `feed.rs`, and every child they
-//! start. Three orderings here are load-bearing:
+//! start. Four orderings here are load-bearing:
 //!
 //! - **Connect before raw mode.** The first connection to a server may
 //!   need a passphrase or a host-key answer. It is made while the
@@ -14,9 +14,23 @@
 //! - **`ui::hush` outlives the screen.** Locals drop in reverse order, so
 //!   the hush guard is declared first: the terminal is restored, and only
 //!   then are the warnings held meanwhile printed — moved, never lost.
+//! - **Nothing the user does reaches the shell.** Whatever is still in
+//!   the terminal's input queue when the screen is given back is read by
+//!   whoever reads next: the shell after quitting, or the child the
+//!   dashboard steps out for. So the mouse reports only what the app
+//!   reads (`ClicksOnly`), the loop reads a burst of input in one frame
+//!   instead of one event per frame, waiting for tasks to stop happens
+//!   inside the loop — drawn, and still reading — rather than after it,
+//!   and `settle` stops the mouse and swallows what is in flight before
+//!   the terminal changes hands. Measured before, on a macOS pty: the
+//!   four seconds `q` waited left every motion report, click and key made
+//!   meanwhile for the shell, `^[[<35;54;11M` and all.
 //! - **Leaving stops children the way Ctrl-C would.** Running tasks get
-//!   SIGINT and a grace to finish before anything is killed; a Ulak child
-//!   mid-sync then unwinds through its own guards.
+//!   SIGINT and a grace to finish (`app::LEAVE_GRACE`, counted by the app)
+//!   before anything is killed. A Ulak child stopped mid-sync does not
+//!   unwind, it dies of the signal, and that is safe by construction:
+//!   its workspace lock is an OS file lock and its state lands through
+//!   a temporary file and a rename.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -27,9 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
-};
+use ratatui::crossterm::event::{self, DisableMouseCapture, Event, KeyEventKind, MouseEventKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -55,8 +67,18 @@ const IDLE_FRAME: Duration = Duration::from_secs(1);
 /// the keyboard.
 const DRAIN: usize = 4_000;
 
-/// How long running tasks get to stop after SIGINT when leaving.
-const LEAVE_GRACE: Duration = Duration::from_secs(4);
+/// Input events handled per frame at most. A held arrow key, a wheel
+/// fling or a paste is a burst, and a burst read one event per frame
+/// lagged behind the hand and was still queued when the screen was
+/// given back.
+const BATCH: usize = 256;
+
+/// Input quiet for this long when the terminal changes hands means the
+/// terminal has nothing more on its way to us.
+const SETTLED: Duration = Duration::from_millis(50);
+
+/// The most `settle` waits, however busy the input stays.
+const SETTLE_AT_MOST: Duration = Duration::from_millis(500);
 
 /// A shell that ends faster than this almost certainly failed to start;
 /// its last words are kept on screen until a key is pressed.
@@ -81,8 +103,22 @@ pub fn run(globals: &[String]) -> Result<ExitCode> {
     let mut app = App::new(start.dest.clone(), start.here, start.known, now);
     let mut world = World::start(&app, start.ssh, tx);
     let result = event_loop(&mut screen, &mut app, &mut world, &rx);
-    world.leave(&rx);
-    drop(screen);
+    if result.is_ok() {
+        // The loop gave running tasks their grace itself, on screen.
+        world.leave(&rx, &[], Duration::ZERO);
+        drop(screen);
+    } else {
+        // A loop that failed did not; the terminal goes back first, so
+        // nobody types into a frozen frame while they stop.
+        let running: Vec<u64> = app
+            .tasks
+            .iter()
+            .filter(|t| t.running())
+            .map(|t| t.id)
+            .collect();
+        drop(screen);
+        world.leave(&rx, &running, crate::app::LEAVE_GRACE);
+    }
     result.map(|()| ExitCode::SUCCESS)
 }
 
@@ -266,6 +302,7 @@ impl Screen {
 
     /// Give the terminal back for a foreground child, then take it again.
     fn suspended<T>(&mut self, f: impl FnOnce() -> T) -> Result<T> {
+        settle();
         restore();
         let out = f();
         take()?;
@@ -278,9 +315,33 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        // A panic's hook has restored the terminal already, and a panic
+        // is no time to wait on input.
+        if !std::thread::panicking() {
+            settle();
+        }
         restore();
     }
 }
+
+/// The mouse reporting the dashboard reads: presses and releases, the
+/// wheel among them (`?1000h`), in SGR form so a click past column 223
+/// still has its column (`?1006h`).
+///
+/// crossterm's `EnableMouseCapture` asks for every motion as well
+/// (`?1003h`): each move over the window became a report the app threw
+/// away, but read and drawn for one frame each, and still queued when
+/// the screen was given back. `DisableMouseCapture` turns off all of it,
+/// so it stays the way out.
+struct ClicksOnly;
+
+impl ratatui::crossterm::Command for ClicksOnly {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(CLICKS_ONLY)
+    }
+}
+
+const CLICKS_ONLY: &str = "\x1b[?1000h\x1b[?1006h";
 
 /// Not every terminal blanks its alternate screen, and ratatui draws
 /// differences against a blank one — so the screen is cleared here, by
@@ -291,7 +352,7 @@ fn take() -> Result<()> {
     execute!(
         std::io::stdout(),
         EnterAlternateScreen,
-        EnableMouseCapture,
+        ClicksOnly,
         Clear(ClearType::All)
     )
     .context("cannot switch to the alternate screen")?;
@@ -300,6 +361,26 @@ fn take() -> Result<()> {
 
 fn fresh() -> Result<Term> {
     Terminal::new(CrosstermBackend::new(std::io::stdout())).context("cannot draw on this terminal")
+}
+
+/// Stop the mouse, then read and drop whatever is already on its way —
+/// reports the terminal sent before it saw the stop, keys typed into a
+/// screen that is closing — until the input has been quiet for
+/// `SETTLED`. Left in the queue, they are read by whoever reads the
+/// terminal next. Raw mode stays on throughout: dropped to cooked mode
+/// with input queued, the tty echoes it, which is the `^[[<0;12;40m`
+/// left on the prompt.
+fn settle() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let started = Instant::now();
+    while started.elapsed() < SETTLE_AT_MOST {
+        match event::poll(SETTLED) {
+            Ok(true) => {
+                let _ = event::read();
+            }
+            _ => break,
+        }
+    }
 }
 
 fn restore() {
@@ -324,6 +405,7 @@ fn event_loop(
     let mut last_draw = Instant::now() - IDLE_FRAME;
     let mut dirty = true;
     let mut hits = Hits::default();
+    let mut held: Option<Event> = None;
     loop {
         // Draw only when something changed, a spinner turns, or the idle
         // frame is due: a still dashboard should cost nothing.
@@ -339,15 +421,38 @@ fn event_loop(
 
         let mut fx = Vec::new();
         let wait = FRAME.saturating_sub(last_tick.elapsed());
-        if event::poll(wait).context("cannot read the terminal")? {
+        for read in 0..BATCH {
+            let event = match held.take() {
+                Some(event) => event,
+                None => {
+                    // Only the first wait is a wait: the rest of a burst
+                    // is already here.
+                    let wait = if read == 0 { wait } else { Duration::ZERO };
+                    if !event::poll(wait).context("cannot read the terminal")? {
+                        break;
+                    }
+                    event::read().context("cannot read the terminal")?
+                }
+            };
+            let turn = turn(&event, read == 0);
+            if turn == Turn::Hold {
+                held = Some(event);
+                break;
+            }
             let now = Instant::now();
             dirty = true;
-            match event::read().context("cannot read the terminal")? {
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     fx.extend(app.on_key(key, now))
                 }
                 Event::Mouse(mouse) => fx.extend(app.on_mouse(mouse, &hits, now)),
                 _ => {}
+            }
+            // Each effect runs before the next event is handled: an
+            // effect may take the terminal (`e`, a server switch), and
+            // the keys behind it must not be read as if it had not.
+            if turn == Turn::Last || !fx.is_empty() || app.quit {
+                break;
             }
         }
         let now = Instant::now();
@@ -368,6 +473,34 @@ fn event_loop(
         if app.quit {
             return Ok(());
         }
+    }
+}
+
+/// What one input event does to the rest of a frame's read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// Handle it and read on: keys, the wheel, a release.
+    Read,
+    /// Handle it, then draw before reading more: a click, a resize.
+    Last,
+    /// Not in this frame. A click is aimed at what is on screen, which
+    /// the events read before it in the same frame may have changed —
+    /// a tab switched, a dialog opened — so it waits for the frame they
+    /// produce, and is aimed at that.
+    Hold,
+}
+
+fn turn(event: &Event, first: bool) -> Turn {
+    match event {
+        Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
+            if first {
+                Turn::Last
+            } else {
+                Turn::Hold
+            }
+        }
+        Event::Resize(..) => Turn::Last,
+        _ => Turn::Read,
     }
 }
 
@@ -567,23 +700,34 @@ impl World {
         Ok(())
     }
 
-    /// Stop what is still running the way Ctrl-C would, and give it a
-    /// moment to finish before everything is dropped.
-    fn leave(&mut self, rx: &Receiver<Msg>) {
+    /// End every stream and task. `running` — the tasks the app still
+    /// sees running — are first stopped the way Ctrl-C would and given
+    /// up to `grace` to finish.
+    ///
+    /// Only those: `tasks` keeps every task ever started, and one that
+    /// ended long ago will neither answer a SIGINT (its pid may be
+    /// somebody else's by now) nor report done a second time. Waiting
+    /// for all of them was a full grace on every quit after any task.
+    fn leave(&mut self, rx: &Receiver<Msg>, running: &[u64], grace: Duration) {
         self.events = None;
         self.stats = None;
         self.logs.clear();
-        if self.tasks.is_empty() {
-            return;
-        }
-        for t in self.tasks.values() {
-            t.cancel();
-        }
-        let deadline = Instant::now() + LEAVE_GRACE;
-        let mut running: Vec<u64> = self.tasks.keys().copied().collect();
-        while !running.is_empty() && Instant::now() < deadline {
-            if let Ok(Msg::TaskDone { task, .. }) = rx.recv_timeout(Duration::from_millis(50)) {
-                running.retain(|t| *t != task);
+        let mut running: Vec<u64> = running
+            .iter()
+            .copied()
+            .filter(|id| self.tasks.contains_key(id))
+            .collect();
+        if !grace.is_zero() {
+            for id in &running {
+                if let Some(t) = self.tasks.get(id) {
+                    t.cancel();
+                }
+            }
+            let deadline = Instant::now() + grace;
+            while !running.is_empty() && Instant::now() < deadline {
+                if let Ok(Msg::TaskDone { task, .. }) = rx.recv_timeout(Duration::from_millis(50)) {
+                    running.retain(|t| *t != task);
+                }
             }
         }
         self.tasks.clear();
@@ -639,6 +783,61 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{
+        EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    };
+
+    fn mouse(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn ansi(command: impl ratatui::crossterm::Command) -> String {
+        let mut out = String::new();
+        command.write_ansi(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_click_is_aimed_at_a_fresh_frame_and_the_rest_of_a_burst_is_read_at_once() {
+        let click = mouse(MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(turn(&click, true), Turn::Last);
+        assert_eq!(
+            turn(&click, false),
+            Turn::Hold,
+            "read after other input, it waits for the frame that input made"
+        );
+        assert_eq!(turn(&Event::Resize(80, 24), false), Turn::Last);
+        for event in [
+            Event::Key(KeyEvent::from(KeyCode::Down)),
+            Event::Key(KeyEvent::from(KeyCode::Char('j'))),
+            mouse(MouseEventKind::ScrollDown),
+            mouse(MouseEventKind::ScrollUp),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            assert_eq!(turn(&event, true), Turn::Read, "{event:?}");
+            assert_eq!(turn(&event, false), Turn::Read, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn the_mouse_reports_clicks_and_the_wheel_and_never_motion() {
+        assert_eq!(ansi(ClicksOnly), "\x1b[?1000h\x1b[?1006h");
+        // The reason for ClicksOnly: crossterm 0.29's own capture asks for
+        // every motion. An upgrade that changes it fails here, and the
+        // rationale above wants reading again.
+        let theirs = ansi(EnableMouseCapture);
+        assert!(theirs.contains("\x1b[?1003h"), "{theirs:?}");
+        // Its teardown stays the way out, so it must cover ours.
+        let off = ansi(DisableMouseCapture);
+        for mode in ["\x1b[?1000l", "\x1b[?1006l"] {
+            assert!(off.contains(mode), "{off:?} leaves {mode:?} on");
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {
