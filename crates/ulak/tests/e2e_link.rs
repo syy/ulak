@@ -373,7 +373,9 @@ fn first_commands_at_once_log_in_once_and_all_take_the_link() {
         return;
     };
     let master = Master::cold(&server, "e2e-link-cold-wide");
-    let ran_by = "case $(ps -o comm= -p $PPID) in python*) echo link;; *) echo session;; esac";
+    // BusyBox's ps (CI's server) has no -p, so /proc comes first.
+    let ran_by = "case $(cat /proc/$PPID/comm 2>/dev/null || ps -o comm= -p $PPID) in \
+                  *python*) echo link;; *) echo session;; esac";
     let outs: Vec<Output> = std::thread::scope(|scope| {
         let master = &master;
         let handles: Vec<_> = (0..16)
