@@ -1322,11 +1322,17 @@ fn shell_code(status: std::process::ExitStatus) -> u8 {
     use std::os::unix::process::ExitStatusExt as _;
     match status.code() {
         Some(code) => u8::try_from(code).unwrap_or(1),
-        None => status
-            .signal()
-            .and_then(|signo| u8::try_from(128 + signo).ok())
-            .unwrap_or(130),
+        None => status.signal().map_or(130, signal_code),
     }
+}
+
+/// A shell's answer for a command killed by signal `signo`, by the same
+/// rule as `status_code` — also for one the link reports from the server.
+pub(crate) fn signal_code(signo: i32) -> u8 {
+    u8::try_from(signo)
+        .ok()
+        .filter(|n| (1..128).contains(n))
+        .map_or(130, |n| 128 + n)
 }
 
 fn decode_args(argv: Vec<OsString>) -> Result<Vec<String>> {

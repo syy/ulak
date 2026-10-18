@@ -28,6 +28,9 @@ notify-debouncer-full = "0.7"
 # no macros, and crossterm is the one backend this crate draws with.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive"] }
+# Already in the tree through crossterm; named here for its safe signal
+# iterator (link.rs), so production code stays free of `unsafe`.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "1"

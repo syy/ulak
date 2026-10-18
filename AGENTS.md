@@ -45,6 +45,7 @@ that header when its rationale changes. Modules below are in `crates/ulak/src/`.
 | Small-file transport and safe local landing | `stream.rs` / `stream.py`, `dirfd.rs` |
 | Remote change hints | `observer.rs` / `observer.py` |
 | Shell quoting and local-file commands | `ssh.rs`, `bridge.rs` |
+| Remote commands as channels of one connection | `link.rs` / `link.py` |
 | Bounded subprocesses | `proc.rs` |
 | Service, tunnels and persisted intent | `service.rs`, `agent.rs`, `forward.rs`, `intent.rs` |
 | Project scripts' Docker shim | `shim.rs` |

@@ -171,6 +171,7 @@ fn run_compose(mut project: Project) -> Result<ExitCode> {
         }
     };
     check_ok("ssh", &format!("connected as {}", facts.user));
+    link_row(&ssh);
 
     // Tool failures gate the model half; resource shortages do not.
     let mut tools_ok = true;
@@ -567,6 +568,7 @@ fn run_workspace(workspace: Workspace) -> Result<ExitCode> {
         }
     };
     check_ok("ssh", &format!("connected as {}", facts.user));
+    link_row(&ssh);
     if facts.daemon_ok {
         check_ok("docker", &format!("{} (daemon reachable)", facts.docker));
     } else {
@@ -687,6 +689,19 @@ fn ephemeral_state_note_lines(declared: bool, recorded: bool) -> &'static [&'sta
         "       files removed from the checkout stay on the server",
         "       to reconcile, persist XDG_STATE_HOME between runs",
     ]
+}
+
+/// Not a problem either way: a command the link does not carry still
+/// runs, as an ssh session of its own.
+fn link_row(ssh: &Ssh) {
+    match crate::link::state(&ssh.control_path()) {
+        Some(Ok(())) => check_ok("link", "one connection, each command a channel in it"),
+        Some(Err(why)) => check_ok(
+            "link",
+            &format!("not in use for now, commands run as ssh sessions: {why}"),
+        ),
+        None => check_ok("link", "not up yet, commands run as ssh sessions"),
+    }
 }
 
 fn check_ok(label: &str, detail: &str) {
