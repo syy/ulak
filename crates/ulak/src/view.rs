@@ -2712,7 +2712,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             (":", "run any ulak docker command"),
             ("T", "tasks and their output"),
             ("@", "switch server"),
-            ("ctrl-r", "refresh now"),
+            ("ctrl-r", "refresh now; the service looks too"),
             ("q esc", "back, or quit"),
         ],
     ),

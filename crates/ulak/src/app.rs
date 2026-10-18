@@ -502,7 +502,9 @@ pub struct Toast {
     pub at: Instant,
 }
 
-/// What `tui.rs` must do on the dashboard's behalf.
+/// What `tui.rs` must do on the dashboard's behalf. `Ring` rings the
+/// background service's doorbell for these stacks (`intent::nudge`): see
+/// `App::ring`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     Run { task: u64, action: Action },
@@ -517,6 +519,7 @@ pub enum Effect {
     Copy(String),
     Switch(String),
     RestartFeed(Feed),
+    Ring(Vec<String>),
 }
 
 /// Where the view drew the things a click can hit.
@@ -575,6 +578,10 @@ pub struct App {
     pub containers_loaded: bool,
     pub stats: BTreeMap<String, History>,
     pub local: Local,
+    /// Whether `local` has been read at least once.
+    local_loaded: bool,
+    /// The doorbell is due for this server's live stacks: `App::ring`.
+    ring_due: bool,
     pub drivers: BTreeMap<String, Driver>,
     pub groups: Vec<Group>,
 
@@ -625,6 +632,8 @@ impl App {
             containers_loaded: false,
             stats: BTreeMap::new(),
             local: Local::default(),
+            local_loaded: false,
+            ring_due: false,
             drivers: BTreeMap::new(),
             groups: Vec::new(),
             link: Link::Connecting,
@@ -1141,6 +1150,7 @@ impl App {
                         None => title,
                     };
                     self.toast(Tone::Good, said, now);
+                    self.ring_due = true;
                 } else {
                     let tail = last.map(|l| format!(": {l}")).unwrap_or_default();
                     self.toast(
@@ -1170,11 +1180,42 @@ impl App {
             Msg::Local(local) => {
                 self.drivers = local.drivers.clone();
                 self.local = *local;
+                self.local_loaded = true;
                 self.regroup();
                 self.fix_selection();
             }
         }
+        fx.extend(self.ring());
         fx
+    }
+
+    /// Ring the background service's doorbell for every stack this
+    /// machine keeps live on this server, when one is due: the dashboard
+    /// has just reached the server (opened, switched to it, or back after
+    /// losing it), a task it ran succeeded, or ctrl-r asked for
+    /// everything again.
+    ///
+    /// Each is a moment the service's picture may be stale, and the
+    /// service only learns otherwise by asking. After a failure it asks
+    /// on a ladder that climbs to two minutes, then five; a stack with
+    /// nothing running is asked every two minutes. So a dashboard showing
+    /// a server that plainly answers could sit beside ports that stay
+    /// closed for minutes. The doorbell makes the service ask now and
+    /// start its ladder again. Due before this machine's declarations
+    /// were first read, it waits for them.
+    fn ring(&mut self) -> Option<Effect> {
+        if !self.ring_due || !self.local_loaded {
+            return None;
+        }
+        self.ring_due = false;
+        let stacks: Vec<String> = self
+            .local
+            .catalog
+            .iter()
+            .filter(|(_, d)| d.live && d.destination == self.dest)
+            .map(|(id, _)| id.clone())
+            .collect();
+        (!stacks.is_empty()).then_some(Effect::Ring(stacks))
     }
 
     fn trim_tasks(&mut self) {
@@ -1199,6 +1240,9 @@ impl App {
     fn take_snapshot(&mut self, snap: Snapshot, took: Duration, now: Instant) {
         if matches!(self.link, Link::Down { .. }) {
             self.toast(Tone::Good, format!("{} is back", self.dest), now);
+        }
+        if !matches!(self.link, Link::Up { .. }) {
+            self.ring_due = true;
         }
         self.link = Link::Up { took };
         self.engine = snap.engine;
@@ -1395,7 +1439,10 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.last_poke = now;
                 self.toast(Tone::Note, "refreshing…", now);
-                return vec![Effect::Poke(Want::all())];
+                self.ring_due = true;
+                let mut fx = vec![Effect::Poke(Want::all())];
+                fx.extend(self.ring());
+                return fx;
             }
             KeyCode::Char(':') => {
                 self.overlay = Overlay::Input(Input {
@@ -3107,6 +3154,101 @@ pub(crate) mod tests {
         };
         a.on_mouse(left_click(35, 12), &hits, Instant::now());
         assert!(a.quit);
+    }
+
+    /// This machine's declarations: `(identity, server, live)` each.
+    fn declarations(stacks: &[(&str, &str, bool)]) -> Msg {
+        let catalog = stacks
+            .iter()
+            .map(|(identity, dest, live)| {
+                let desired = Desired {
+                    schema: crate::intent::SCHEMA,
+                    live: *live,
+                    workspace_id: "abc".into(),
+                    workspace_namespace: "n".into(),
+                    destination: (*dest).into(),
+                    identity: (*identity).into(),
+                    cwd: "/work/demo".into(),
+                    argv_globals: Vec::new(),
+                    compose_env: BTreeMap::new(),
+                    updated_unix: 1,
+                };
+                (crate::intent::stack_id(dest, identity), desired)
+            })
+            .collect();
+        Msg::Local(Box::new(Local {
+            catalog,
+            ..Local::default()
+        }))
+    }
+
+    fn rung(fx: &[Effect]) -> Vec<Vec<String>> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Ring(stacks) => Some(stacks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reaching_the_server_rings_the_services_doorbell_for_its_live_stacks_once() {
+        let mut a = app();
+        let now = Instant::now();
+        let mine = [
+            ("demo", "box", true),
+            ("idle", "box", false),
+            ("far", "elsewhere", true),
+        ];
+        // The fixture's first snapshot came before the declarations were
+        // read: the ring waited for them.
+        let fx = a.on_msg(declarations(&mine), now);
+        assert_eq!(
+            rung(&fx),
+            vec![vec![crate::intent::stack_id("box", "demo")]]
+        );
+        let fx = a.on_msg(declarations(&mine), now);
+        assert!(rung(&fx).is_empty(), "once: {fx:?}");
+        let snap = |result| Msg::Snapshot {
+            era: 1,
+            result,
+            took: Duration::from_millis(250),
+        };
+        let fx = a.on_msg(snap(Ok(Snapshot::default())), now);
+        assert!(rung(&fx).is_empty(), "the link was up already: {fx:?}");
+        a.on_msg(snap(Err("Connection refused".into())), now);
+        let fx = a.on_msg(snap(Ok(Snapshot::default())), now);
+        assert_eq!(rung(&fx).len(), 1, "back after losing it: {fx:?}");
+    }
+
+    #[test]
+    fn ctrl_r_and_a_task_that_worked_ring_the_doorbell_and_a_failed_one_does_not() {
+        let mut a = app();
+        let now = Instant::now();
+        a.on_msg(declarations(&[("demo", "box", true)]), now);
+        let fx = a.on_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert_eq!(rung(&fx).len(), 1, "{fx:?}");
+        let task = running_task(&mut a);
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(0),
+            },
+            now,
+        );
+        assert_eq!(rung(&fx).len(), 1, "{fx:?}");
+        let task = running_task(&mut a);
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(1),
+            },
+            now,
+        );
+        assert!(rung(&fx).is_empty(), "{fx:?}");
     }
 
     fn declare(a: &mut App, identity: &str, live: bool, ports: &[(u32, &str, bool)]) {

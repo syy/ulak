@@ -105,6 +105,9 @@ your SSH connection, recorded in the same audit trail as the commands you type.
   Compose actions, `sync`, `doctor` and the `:` prompt run `ulak` itself with
   the project's exact Compose flags, so they synchronize, keep stacks live and
   forward ports exactly as the same command typed in a terminal would.
+- When the dashboard reaches the server, on `ctrl-r`, and after an action
+  that worked, it asks Ulak's background service to look at this server's
+  live stacks now, instead of when its retry backoff next comes round.
 
 Quitting with `q` while tasks still run asks first. Running tasks are then
 stopped the way Ctrl-C would stop them, and the dashboard stays up, saying

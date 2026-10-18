@@ -646,6 +646,11 @@ impl World {
             Effect::Copy(text) => copy(&text),
             Effect::Switch(dest) => self.switch(dest, app, screen)?,
             Effect::RestartFeed(which) => self.feed(which, app.era),
+            Effect::Ring(stacks) => {
+                for stack in &stacks {
+                    crate::intent::nudge(stack);
+                }
+            }
         }
         Ok(())
     }
