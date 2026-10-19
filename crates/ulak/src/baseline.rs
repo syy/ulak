@@ -828,7 +828,7 @@ pub fn equal(local: &Contents, remote: &Contents) -> Contents {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A lost receipt's send survives a restart and a compaction, stays
@@ -1507,7 +1507,7 @@ mod tests {
         );
     }
 
-    fn newer_syntax_in(source: &str) -> crate::proc::Bounded {
+    pub(crate) fn newer_syntax_in(source: &str) -> crate::proc::Bounded {
         let mut command = crate::stream::python();
         command.args(["-c", NEWER_SYNTAX]);
         crate::proc::run_bounded(

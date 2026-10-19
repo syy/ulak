@@ -337,6 +337,8 @@ fn declare(app: &mut App, now: Instant) {
             drivers,
             service_line: "running (launchd), pid 4242".into(),
             service_problem: None,
+            service_running: true,
+            service_installed: true,
         })),
         now,
     );

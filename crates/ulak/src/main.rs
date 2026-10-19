@@ -27,6 +27,7 @@ mod init;
 mod intent;
 mod invocation;
 mod ledger;
+mod link;
 mod lockfile;
 mod management;
 mod manifest;
@@ -57,6 +58,14 @@ use clap::Parser;
 use crate::cli::{Cli, Command, ServiceCommand, ShimCommand};
 
 fn main() -> ExitCode {
+    // `ulak __link` stands in for ssh (`link.rs`) and is addressed like it.
+    // Its arguments are ssh's, handed on untouched when it becomes ssh, so
+    // clap never reads them, and nothing a command does on the way in
+    // (the global config, the agent) runs for it.
+    let mut argv = std::env::args_os().skip(1);
+    if argv.next().as_deref() == Some(std::ffi::OsStr::new(link::SUBCOMMAND)) {
+        return link::run(argv.collect());
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,

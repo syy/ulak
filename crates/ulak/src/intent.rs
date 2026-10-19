@@ -264,7 +264,8 @@ const STATUS: &str = "status.json";
 const NUDGE: &str = "nudge";
 
 /// Leave a nudge for the service: somebody just ran a compose command
-/// here, so whatever the service believes about this stack is stale.
+/// here, or the dashboard just found the server answering (`App::ring`),
+/// so whatever the service believes about this stack is stale.
 ///
 /// This is a doorbell, and without it there is none. The service can only
 /// DISCOVER that a stack came up, by asking — and it asks a destination
