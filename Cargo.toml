@@ -39,6 +39,10 @@ insta = "1"
 predicates = "3"
 tempfile = "3"
 
+[profile.dev]
+# File and line in backtraces, no variable info; CARGO_PROFILE_DEV_DEBUG=full for a debugger.
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
