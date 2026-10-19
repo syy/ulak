@@ -22,6 +22,7 @@ cargo test --test e2e_sync                  # one e2e target
 - `ULAK_TEST_E2E=skip cargo test --workspace` is the only sanctioned daemon-free
   workspace run. E2e targets then report `ok` without running; never call that e2e validation.
 - Do not use `--nocapture` with doctor tests; it breaks their output snapshots.
+- Each worktree builds in its own `target/`; a shared `CARGO_TARGET_DIR` lets tests run another checkout's `ulak`.
 - See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and CI image seeding.
 
 ## Design and ownership
