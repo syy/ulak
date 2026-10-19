@@ -10,7 +10,10 @@
 //! the link; tabs; the body; one status line (running work, or the newest
 //! notice); one line of the keys that apply to what is selected. Columns
 //! that do not fit are dropped from the least useful end rather than
-//! squeezed into unreadable stubs.
+//! squeezed into unreadable stubs. A list that does not fit keeps its
+//! first items whole and accounts for the rest: a row's ports count them
+//! (`+3`) and `o` lists them all; the footer drops its last keys, never
+//! `?` or `q`, because help names every key.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -23,10 +26,11 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, Detail, Group, History, Hits, Link, LogView, Overlay, Pane, Prompt, Row, Screen, Sel,
-    Subject, TABS, Tab, TaskView, Tone,
+    App, Detail, Group, History, Hits, Link, LogView, Overlay, Pane, PortKey, Ports, Prompt, Row,
+    Screen, Sel, Subject, TABS, Tab, TaskView, Tone,
 };
 use crate::engine::{self, Container, Tone as Dot};
+use crate::verbs::Install;
 
 const ACCENT: Color = Color::Cyan;
 const GOOD: Color = Color::Green;
@@ -110,7 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
             detail_body(f, body, app, d);
         }
     }
-    status_line(f, status, app);
+    status_line(f, status, app, &mut hits);
     footer(f, keys, app, &mut hits);
     toasts(f, body, app);
     overlay(f, area, app, &mut hits);
@@ -205,8 +209,11 @@ fn tab_bar(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     let mut spans = vec![Span::raw(" ")];
     let mut x = area.x + 1;
     for (i, tab) in TABS.iter().enumerate() {
+        // The Ulak tab is where the service's trouble is spelled out.
+        let flagged = *tab == Tab::Project && app.local.service_problem.is_some();
         let label = match tab_count(app, *tab) {
             Some(n) => format!(" {} {} {n} ", i + 1, tab.title()),
+            None if flagged => format!(" {} {} ! ", i + 1, tab.title()),
             None => format!(" {} {} ", i + 1, tab.title()),
         };
         let w = label.width() as u16;
@@ -215,6 +222,8 @@ fn tab_bar(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
                 .fg(Color::Black)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD)
+        } else if flagged {
+            Style::new().fg(BAD)
         } else {
             Style::new().fg(Color::Gray)
         };
@@ -258,17 +267,11 @@ fn main_body(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     match app.tab {
         Tab::Project => project_tab(f, list, app, hits),
         _ => {
-            let (above, list) = match usage_line(app) {
-                Some(line) => {
-                    let [above, rest] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(list);
-                    (Some((above, line)), rest)
-                }
-                None => (None, list),
-            };
-            if let Some((r, line)) = above {
-                f.render_widget(Paragraph::new(line), r);
-            }
+            let usage = usage_lines(app);
+            let [above, list] =
+                Layout::vertical([Constraint::Length(usage.len() as u16), Constraint::Fill(1)])
+                    .areas(list);
+            f.render_widget(Paragraph::new(usage), above);
             list_rows(f, list, app, hits);
         }
     }
@@ -337,32 +340,40 @@ fn blocking_note(app: &App) -> Option<Vec<Line<'static>>> {
     })
 }
 
-fn usage_line(app: &App) -> Option<Line<'static>> {
-    let kind = match app.tab {
-        Tab::Images => "Images",
-        Tab::Volumes => "Local Volumes",
-        _ => return None,
+/// `docker system df` above the list, each row with the key that prunes
+/// it — and what that key takes, which for volumes is less than Docker's
+/// RECLAIMABLE: it counts named volumes too, and `P` keeps those.
+fn usage_lines(app: &App) -> Vec<Line<'static>> {
+    let rows: &[(&str, &str, &str)] = match app.tab {
+        Tab::Images => &[
+            ("Images", "", "P prunes unused images"),
+            ("Build Cache", "build cache ", "B prunes it"),
+        ],
+        Tab::Volumes => &[("Local Volumes", "", "P prunes unused anonymous ones")],
+        _ => &[],
     };
-    let u = app.usage.iter().find(|u| u.kind == kind)?;
-    Some(Line::from(vec![
-        Span::styled(
-            format!(" {} total · {} in use · ", u.total, u.active),
-            dim(),
-        ),
-        Span::styled(u.size.clone(), bold()),
-        Span::styled(" on disk · ", dim()),
-        Span::styled(
-            format!("{} reclaimable", u.reclaimable),
-            Style::new().fg(BUSY),
-        ),
-        Span::styled(
-            match app.tab {
-                Tab::Images => "  (P prunes dangling)",
-                _ => "  (P prunes unused anonymous)",
-            },
-            dim(),
-        ),
-    ]))
+    rows.iter()
+        .filter_map(|(kind, name, key)| {
+            let u = app.usage_of(kind)?;
+            let mut spans = vec![Span::styled(format!(" {name}"), dim())];
+            if name.is_empty() {
+                spans.push(Span::styled(
+                    format!("{} total · {} in use · ", u.total, u.active),
+                    dim(),
+                ));
+            }
+            spans.extend([
+                Span::styled(u.size.clone(), bold()),
+                Span::styled(" on disk · ", dim()),
+                Span::styled(
+                    format!("{} reclaimable", u.reclaimable),
+                    Style::new().fg(BUSY),
+                ),
+                Span::styled(format!("  ({key})"), dim()),
+            ]);
+            Some(Line::from(spans))
+        })
+        .collect()
 }
 
 /// A column: header, width, and whether it is the one that stretches.
@@ -712,7 +723,8 @@ pub fn short_ports(raw: &str) -> String {
     out.join(" ")
 }
 
-fn group_summary(app: &App, group: &Group) -> Vec<Span<'static>> {
+/// `room` is the cells left of the row once its title is drawn.
+fn group_summary(app: &App, group: &Group, room: usize) -> Vec<Span<'static>> {
     let members: Vec<&Container> = group.members.iter().map(|&i| &app.containers[i]).collect();
     let running = members.iter().filter(|c| c.running()).count();
     let bad = members.iter().any(|c| c.tone() == Dot::Bad);
@@ -734,42 +746,98 @@ fn group_summary(app: &App, group: &Group) -> Vec<Span<'static>> {
             Style::new().fg(tone),
         ));
     }
-    let ports = app.ports_home(&group.key, "");
-    if !ports.is_empty() {
-        spans.push(Span::styled(" · ", dim()));
-        let shown: Vec<String> = ports
-            .iter()
-            .take(3)
-            .map(|p| format!("localhost:{p}"))
-            .collect();
-        spans.push(Span::styled(shown.join(" "), Style::new().fg(ACCENT)));
-        if ports.len() > 3 {
-            spans.push(Span::styled(format!(" +{}", ports.len() - 3), dim()));
-        }
-    }
+    let mut tail = Vec::new();
     if let Some(d) = &group.declared {
-        spans.push(Span::styled(" · ", dim()));
+        tail.push(Span::styled(" · ", dim()));
         if d.live {
             match app.stack_status(&group.key) {
+                _ if !app.local.service_running => tail.push(Span::styled(
+                    "kept live · no service running",
+                    Style::new().fg(BAD),
+                )),
                 Some(st) if st.connection != "up" && !st.connection.is_empty() => {
-                    spans.push(Span::styled(
+                    tail.push(Span::styled(
                         format!("kept · link {}", st.connection),
                         Style::new().fg(BAD),
                     ))
                 }
-                _ => spans.push(Span::styled("kept live by Ulak", Style::new().fg(GOOD))),
+                _ => tail.push(Span::styled("kept live by Ulak", Style::new().fg(GOOD))),
             }
         } else {
-            spans.push(Span::styled("declared here, not live", dim()));
+            tail.push(Span::styled("declared here, not live", dim()));
         }
     }
     if group.current {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             "  this project",
             Style::new().fg(ACCENT).add_modifier(Modifier::ITALIC),
         ));
     }
+    let ports = app.ports_home(&group.key, "");
+    if !ports.is_empty() {
+        let taken = width_of(&spans) + width_of(&tail) + 3;
+        spans.push(Span::styled(" · ", dim()));
+        spans.extend(port_spans(&ports, room.saturating_sub(taken)));
+    }
+    spans.extend(tail);
     spans
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// As many `words` as fit in `room` cells, joined by `sep`, leaving
+/// room for the `+N` that counts the rest: `(shown, rest)`.
+fn words_fitting(words: &[String], sep: &str, room: usize) -> (String, usize) {
+    let mut shown = String::new();
+    let mut count = 0;
+    for (i, word) in words.iter().enumerate() {
+        let rest = words.len() - i - 1;
+        let more = if rest > 0 {
+            sep.width() + format!("+{rest}").width()
+        } else {
+            0
+        };
+        let gap = if count > 0 { sep.width() } else { 0 };
+        if shown.width() + gap + word.width() + more > room {
+            break;
+        }
+        if count > 0 {
+            shown.push_str(sep);
+        }
+        shown.push_str(word);
+        count += 1;
+    }
+    (shown, words.len() - count)
+}
+
+/// As many `localhost:<port>` as fit in `room` cells; `o` lists them all.
+pub fn ports_fitting(ports: &[u32], room: usize) -> (String, usize) {
+    let words: Vec<String> = ports.iter().map(|p| format!("localhost:{p}")).collect();
+    words_fitting(&words, " ", room)
+}
+
+fn port_spans(ports: &[u32], room: usize) -> Vec<Span<'static>> {
+    let (shown, hidden) = ports_fitting(ports, room);
+    let mut spans = Vec::new();
+    if !shown.is_empty() {
+        spans.push(Span::styled(shown, Style::new().fg(ACCENT)));
+    }
+    match (spans.is_empty(), hidden) {
+        (_, 0) => {}
+        (true, n) => spans.push(Span::styled(format!("{n} ports"), Style::new().fg(ACCENT))),
+        (false, n) => spans.push(Span::styled(format!(" +{n}"), dim())),
+    }
+    spans
+}
+
+/// The footer's word for `o`.
+fn port_word(key: PortKey) -> &'static str {
+    match key {
+        PortKey::Open(_) => "open",
+        PortKey::List => "ports",
+    }
 }
 
 fn container_row(
@@ -788,7 +856,8 @@ fn container_row(
                 Span::styled(group.title().to_string(), bold()),
                 Span::raw("  "),
             ];
-            spans.extend(group_summary(app, group));
+            let room = width.saturating_sub(width_of(&spans));
+            spans.extend(group_summary(app, group, room));
             pad_line(spans, width)
         }
         Row::Empty(g) => {
@@ -840,11 +909,11 @@ fn container_row(
                         if home.is_empty() {
                             Span::styled(fit(&short_ports(&c.ports), *w), dim())
                         } else {
-                            let text = home
-                                .iter()
-                                .map(|p| format!("localhost:{p}"))
-                                .collect::<Vec<_>>()
-                                .join(" ");
+                            let text = match ports_fitting(&home, *w) {
+                                (shown, 0) => shown,
+                                (shown, n) if shown.is_empty() => format!("{n} ports"),
+                                (shown, n) => format!("{shown} +{n}"),
+                            };
                             Span::styled(fit(&text, *w), Style::new().fg(ACCENT))
                         }
                     }
@@ -987,7 +1056,7 @@ fn project_tab(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     } else {
         GOOD
     };
-    let mut lines = vec![Line::from(vec![
+    let mut service = vec![
         Span::styled(" service  ", bold()),
         Span::styled("● ", Style::new().fg(service_tone)),
         Span::raw(if app.local.service_line.is_empty() {
@@ -995,7 +1064,18 @@ fn project_tab(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
         } else {
             app.local.service_line.clone()
         }),
-    ])];
+    ];
+    if let Some(how) = app.service_fix() {
+        service.push(Span::raw("   "));
+        let x = top.x + width_of(&service) as u16;
+        let button = service_button(how);
+        if app.overlay == Overlay::None {
+            hits.keys
+                .push((Rect::new(x, top.y, width_of(&button) as u16, 1), "I".into()));
+        }
+        service.extend(button);
+    }
+    let mut lines = vec![Line::from(service)];
     if let Some(problem) = &app.local.service_problem {
         lines.push(Line::styled(
             format!("          {problem}"),
@@ -1114,25 +1194,20 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
         (true, false) => Span::styled(fit("idle", 10), dim()),
     };
     let mut detail: Vec<Span> = Vec::new();
+    let mut synced = Vec::new();
     if live && let Some(st) = status {
-        let tone = if st.connection == "up" { GOOD } else { BAD };
-        detail.push(Span::styled(
-            format!("link {}", st.connection),
-            Style::new().fg(tone),
-        ));
-        let open: Vec<String> = st
-            .tunnels
-            .iter()
-            .filter(|t| t.open)
-            .take(3)
-            .map(|t| format!("localhost:{}", t.port))
-            .collect();
-        if !open.is_empty() {
-            detail.push(Span::styled(" · ", dim()));
-            detail.push(Span::styled(open.join(" "), Style::new().fg(ACCENT)));
+        // A stopped service's last word is history: its link is not up.
+        if app.local.service_running {
+            let tone = if st.connection == "up" { GOOD } else { BAD };
+            detail.push(Span::styled(
+                format!("link {}", st.connection),
+                Style::new().fg(tone),
+            ));
+        } else {
+            detail.push(Span::styled("no service running", Style::new().fg(BAD)));
         }
         if st.last_sync_unix > 0 {
-            detail.push(Span::styled(
+            synced.push(Span::styled(
                 format!(" · synced {} ago", ago(app.clock, st.last_sync_unix)),
                 dim(),
             ));
@@ -1158,7 +1233,20 @@ fn stack_row(app: &App, row: Row, width: usize) -> Line<'static> {
         state,
         Span::raw(" "),
     ];
+    let ports: Vec<u32> = app
+        .forwards(&id, "")
+        .iter()
+        .filter(|f| f.open)
+        .map(|f| f.port)
+        .collect();
+    if !ports.is_empty() {
+        let mine = if here { "  this project".width() } else { 0 };
+        let taken = width_of(&spans) + width_of(&detail) + width_of(&synced) + mine + 3;
+        detail.push(Span::styled(" · ", dim()));
+        detail.extend(port_spans(&ports, width.saturating_sub(taken)));
+    }
     spans.extend(detail);
+    spans.extend(synced);
     if here {
         spans.push(Span::styled(
             "  this project",
@@ -1272,7 +1360,7 @@ fn preview_lines(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
             let group = &app.groups[g];
             let mut lines = vec![Line::from({
                 let mut l = field("stack", Span::raw(String::new()));
-                l.extend(group_summary(app, group));
+                l.extend(group_summary(app, group, width.saturating_sub(10)));
                 l
             })];
             if group.current
@@ -1443,7 +1531,12 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
         Line::from(field("server", Span::raw(dest.clone()))),
     ];
     if let Some((_, st)) = app.local.statuses.iter().find(|(sid, _)| *sid == id) {
-        let mut l = field("link", Span::raw(st.connection.clone()));
+        let link = if app.local.service_running {
+            Span::raw(st.connection.clone())
+        } else {
+            Span::styled("no service running", Style::new().fg(BAD))
+        };
+        let mut l = field("link", link);
         if st.last_sync_unix > 0 {
             l.push(Span::styled(
                 format!(" · synced {} ago", ago(app.clock, st.last_sync_unix)),
@@ -1451,8 +1544,8 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
             ));
         }
         lines.push(Line::from(l));
-        let tunnels: Vec<String> = st
-            .tunnels
+        let tunnels: Vec<String> = app
+            .forwards(&id, "")
             .iter()
             .map(|t| {
                 format!(
@@ -1464,7 +1557,12 @@ fn stack_preview(app: &App, row: Row, width: usize) -> (String, Vec<Line<'static
             })
             .collect();
         if !tunnels.is_empty() {
-            lines.push(Line::from(field("tunnels", Span::raw(tunnels.join("  ")))));
+            let (shown, rest) = words_fitting(&tunnels, "  ", width.saturating_sub(10));
+            let mut l = field("tunnels", Span::raw(shown));
+            if rest > 0 {
+                l.push(Span::styled(format!("  +{rest}"), dim()));
+            }
+            lines.push(Line::from(l));
         }
         if let Some(note) = &st.note {
             lines.push(Line::styled(
@@ -1527,11 +1625,15 @@ fn detail_bar(f: &mut Frame, area: Rect, app: &App, d: &Detail, hits: &mut Hits)
         Some(Some(c)) => {
             spans.push(dot(c.tone()));
             spans.push(Span::styled(short_status(&c.status), dim()));
-            if let Some(p) = app.ports_home(&c.project, &c.service).first() {
+            let home = app.ports_home(&c.project, &c.service);
+            if let Some(p) = home.first() {
                 spans.push(Span::styled(
                     format!("  localhost:{p}"),
                     Style::new().fg(ACCENT),
                 ));
+            }
+            if home.len() > 1 {
+                spans.push(Span::styled(format!(" +{}", home.len() - 1), dim()));
             }
         }
         Some(None) => spans.push(Span::styled("gone — it was removed", Style::new().fg(BAD))),
@@ -2109,7 +2211,7 @@ fn span_of(samples: usize) -> String {
 
 // ─── status, keys, notices ──────────────────────────────────────────
 
-fn status_line(f: &mut Frame, area: Rect, app: &App) {
+fn status_line(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     let running: Vec<&TaskView> = app.tasks.iter().filter(|t| t.running()).collect();
     let line = if let Some(t) = running.last() {
         let spin = SPINNER[(app.frame as usize) % SPINNER.len()];
@@ -2131,14 +2233,49 @@ fn status_line(f: &mut Frame, area: Rect, app: &App) {
         Line::styled(format!(" ✕ {why}"), Style::new().fg(BAD))
     } else if let Some(t) = app.trouble.first() {
         Line::styled(format!(" ! {t}"), Style::new().fg(BUSY))
+    } else if let (Some(problem), Some(how)) = (&app.local.service_problem, app.service_fix()) {
+        // On every tab, not just the Ulak one: without the service no
+        // port comes home, and the ports are what people look for. The
+        // fix it names is a button beside it.
+        let button = service_button(how);
+        let w = width_of(&button) as u16;
+        let text = vec![Span::styled(format!(" ! {problem}"), Style::new().fg(BAD))];
+        if area.width < w + 20 {
+            f.render_widget(Paragraph::new(Line::from(text)), area);
+            return;
+        }
+        let [left, right] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(w + 1)]).areas(area);
+        // Under a dialog it is no button: a click there is outside the
+        // dialog, which closes it.
+        if app.overlay == Overlay::None {
+            hits.keys
+                .push((Rect::new(right.x + 1, right.y, w, 1), "I".into()));
+        }
+        f.render_widget(Paragraph::new(pad_line(text, left.width as usize)), left);
+        f.render_widget(
+            Paragraph::new(Line::from(button)).alignment(ratatui::layout::Alignment::Right),
+            right,
+        );
+        return;
     } else {
         Line::raw("")
     };
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// `I install it`, `I start it` or `I restart it`: the key that runs the
+/// fix every service problem names, saying what it does (`App::service_fix`).
+fn service_button(how: Install) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("I", key_style()),
+        Span::raw(" "),
+        Span::styled(how.button(), Style::new().fg(Color::Gray)),
+    ]
+}
+
 fn footer(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
-    let keys = hints(app);
+    let keys = fitting(hints(app), area.width as usize);
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
     for (k, label) in keys {
@@ -2157,6 +2294,30 @@ fn footer(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
         used += w;
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The hints that fit in `width` cells. A row with more keys than room
+/// loses its last ones first: `?` and `q` stay, because they are how
+/// every other key is found and how to leave.
+pub fn fitting(hints: Vec<(String, String)>, width: usize) -> Vec<(String, String)> {
+    let cost = |(k, label): &(String, String)| k.width() + label.width() + 3;
+    let kept = |k: &str| k == "?" || k == "q";
+    let reserved: usize = hints.iter().filter(|h| kept(&h.0)).map(cost).sum();
+    let mut room = width.saturating_sub(1 + reserved);
+    let mut full = false;
+    let mut out = Vec::new();
+    for hint in hints {
+        if !kept(&hint.0) {
+            let w = cost(&hint);
+            full = full || w > room;
+            if full {
+                continue;
+            }
+            room -= w;
+        }
+        out.push(hint);
+    }
+    out
 }
 
 /// The keys that do something for what is selected, most useful first.
@@ -2189,7 +2350,17 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
         Overlay::Servers { .. } => {
             return vec![h("↑↓", "server"), h("⏎", "switch"), h("esc", "close")];
         }
+        Overlay::Ports(_) => {
+            return vec![
+                h("↑↓", "port"),
+                h("⏎", "open"),
+                h("1-9", "open that one"),
+                h("y", "copy"),
+                h("esc", "close"),
+            ];
+        }
         Overlay::Help { .. } => return vec![h("↑↓", "scroll"), h("any other key", "close")],
+        Overlay::Leaving { .. } => return vec![h("q", "leave now")],
         Overlay::None => {}
     }
     let mut out = Vec::new();
@@ -2245,8 +2416,9 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     ));
                     out.push(h("r", "restart"));
                     out.push(h("d", "delete"));
-                    if !app.ports_home(&c.project, &c.service).is_empty() {
-                        out.push(h("o", "open"));
+                    let stack = crate::intent::stack_id(&app.dest, &c.project);
+                    if let Some(k) = app.port_key(&stack, &c.service) {
+                        out.push(h("o", port_word(k)));
                     }
                     out.push(h("i", "inspect"));
                     out.push(h("p", "pause"));
@@ -2256,6 +2428,10 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("⏎", "fold"));
                     if !group.members.is_empty() {
                         out.push(h("l", "logs"));
+                    }
+                    let stack = crate::intent::stack_id(&app.dest, &group.key);
+                    if let Some(k) = app.port_key(&stack, "") {
+                        out.push(h("o", port_word(k)));
                     }
                     if group.driver.is_some() {
                         out.push(h("u", "up"));
@@ -2272,21 +2448,31 @@ pub fn hints(app: &App) -> Vec<(String, String)> {
                     out.push(h("⏎", "inspect"));
                     out.push(h("p", "pull"));
                     out.push(h("d", "delete"));
-                    out.push(h("P", "prune"));
                 }
                 Some(Row::Volume(_)) | Some(Row::Network(_)) => {
                     out.push(h("⏎", "inspect"));
                     out.push(h("d", "delete"));
-                    out.push(h("P", "prune"));
                 }
-                Some(Row::Here | Row::Stack(_)) => {
+                Some(row @ (Row::Here | Row::Stack(_))) => {
                     out.push(h("⏎", "show"));
+                    if let Some((identity, dest, _)) = app.stack_of(row) {
+                        let stack = crate::intent::stack_id(&dest, &identity);
+                        if let Some(k) = app.port_key(&stack, "") {
+                            out.push(h("o", port_word(k)));
+                        }
+                    }
                     out.push(h("u", "up"));
                     out.push(h("D", "down"));
                     out.push(h("S", "sync"));
                     out.push(h("c", "doctor"));
                 }
                 None => {}
+            }
+            // The tab's own verb, which needs no row. `B` is named beside
+            // the build cache's numbers instead: one more hint here pushes
+            // `?` and `q` off a 100-column footer.
+            if matches!(app.tab, Tab::Images | Tab::Volumes | Tab::Networks) {
+                out.push(h("P", "prune"));
             }
             out.push(h("/", "filter"));
             out.push(h("tab", "next tab"));
@@ -2451,6 +2637,8 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             f.render_widget(Paragraph::new(Line::from(spans)), r);
         }
         Overlay::Tasks { selected, scroll } => tasks(f, area, app, *selected, *scroll, hits),
+        Overlay::Leaving { .. } => leaving(f, area, app, hits),
+        Overlay::Ports(list) => ports(f, area, app, list, hits),
         Overlay::Servers { selected } => {
             let servers = app.servers();
             let height = (servers.len() as u16 + 4).min(area.height.saturating_sub(2));
@@ -2505,6 +2693,180 @@ fn overlay(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             );
         }
     }
+}
+
+/// Every port Ulak forwards for a stack, or one service of it, numbered
+/// for `1`–`9`, each with the reason it would not answer when there is
+/// one: the list `o` opens when there is more than one way to go.
+fn ports(f: &mut Frame, area: Rect, app: &App, list: &Ports, hits: &mut Hits) {
+    let (stack, service, selected) = (list.stack.as_str(), list.service.as_str(), list.selected);
+    let forwards = app.forwards(stack, service);
+    let name = app
+        .local
+        .catalog
+        .iter()
+        .find(|(id, _)| id == stack)
+        .map(|(_, d)| d.identity.clone())
+        .unwrap_or_default();
+    let title = if service.is_empty() {
+        format!(" Ports · {name} ")
+    } else {
+        format!(" Ports · {name} · {service} ")
+    };
+    let words: Vec<String> = forwards
+        .iter()
+        .map(|fw| format!("localhost:{}", fw.port))
+        .collect();
+    let port_w = words.iter().map(|w| w.width()).max().unwrap_or(0);
+    let service_w = forwards
+        .iter()
+        .map(|fw| fw.service.width())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let mut lines: Vec<Line> = forwards
+        .iter()
+        .zip(&words)
+        .enumerate()
+        .map(|(i, (fw, word))| {
+            let (note, tone) = if !fw.open {
+                (
+                    format!(
+                        "not tunneled: something here holds it (lsof -i :{})",
+                        fw.port
+                    ),
+                    Style::new().fg(BAD),
+                )
+            } else if fw.running == Some(false) {
+                ("no container is running for it".to_string(), dim())
+            } else {
+                (String::new(), Style::new())
+            };
+            Line::from(vec![
+                Span::styled(
+                    if i < 9 {
+                        format!(" {} ", i + 1)
+                    } else {
+                        "   ".to_string()
+                    },
+                    key_style(),
+                ),
+                Span::styled(
+                    fit(word, port_w),
+                    if fw.open {
+                        Style::new().fg(ACCENT)
+                    } else {
+                        dim()
+                    },
+                ),
+                Span::raw("  "),
+                Span::raw(fit(&fw.service, service_w)),
+                Span::raw("  "),
+                Span::styled(note, tone),
+            ])
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled(" Nothing is forwarded now.", dim()));
+    }
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (widest.max(title.width() + 2) as u16 + 3).min(area.width.saturating_sub(2));
+    // Padded to the frame, so the cursor's highlight spans the row.
+    let inner = width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let style = line.style;
+            let line = pad_line(line.spans, inner).style(style);
+            if i == selected && !forwards.is_empty() {
+                under_cursor(line)
+            } else {
+                line
+            }
+        })
+        .collect();
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let visible = height.saturating_sub(2) as usize;
+    let first = (selected + 1).saturating_sub(visible);
+    let r = centered(area, width, height);
+    f.render_widget(Clear, r);
+    hits.dialog = Some(r);
+    hits.picks = Some((
+        Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(2), visible as u16),
+        first,
+    ));
+    let lines: Vec<Line> = lines.into_iter().skip(first).collect();
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Span::styled(title, bold())),
+        ),
+        r,
+    );
+}
+
+/// Quitting while tasks stop: what is being waited for, and the way out.
+fn leaving(f: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
+    const SHOWN: usize = 4;
+    let running: Vec<&TaskView> = app.tasks.iter().filter(|t| t.running()).collect();
+    let width = (area.width.saturating_sub(4)).min(64);
+    let inner = width.saturating_sub(4) as usize;
+    let (count, them) = match running.len() {
+        1 => ("1 task".to_string(), "it"),
+        n => (format!("{n} tasks"), "them"),
+    };
+    let said = format!(
+        "Stopping {count}, and waiting up to {}s for {them} to finish.",
+        crate::app::LEAVE_GRACE.as_secs()
+    );
+    let mut lines: Vec<Line> = wrap_words(&said, inner)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    lines.push(Line::raw(""));
+    let spin = SPINNER[(app.frame as usize) % SPINNER.len()];
+    for t in running.iter().take(SHOWN) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{spin} "), Style::new().fg(BUSY)),
+            Span::raw(fit(&t.title, inner.saturating_sub(2))),
+        ]));
+    }
+    if running.len() > SHOWN {
+        lines.push(Line::styled(
+            format!("  … and {} more", running.len() - SHOWN),
+            dim(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let rest = " leave now, killing what is left";
+    lines.push(
+        Line::from(vec![
+            Span::styled(" q ", key_style()),
+            Span::styled(rest, Style::new().fg(Color::Gray)),
+        ])
+        .alignment(ratatui::layout::Alignment::Center),
+    );
+    let r = centered(area, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, r);
+    hits.dialog = Some(r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BUSY))
+        .title(Span::styled(" Quitting ", bold()))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    // The button's line is centred the way Paragraph centres it: half
+    // the width less half the line, which for an odd line is not the
+    // same column as half of what is left.
+    let body = block.inner(r);
+    let button = 3 + rest.width() as u16;
+    let x = body.x + (body.width / 2).saturating_sub(button / 2);
+    let row = body.y + lines.len() as u16 - 1;
+    hits.keys
+        .push((Rect::new(x, row, button.min(body.width), 1), "q".into()));
+    f.render_widget(Paragraph::new(lines).block(block), r);
 }
 
 fn tasks(
@@ -2643,7 +3005,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             (":", "run any ulak docker command"),
             ("T", "tasks and their output"),
             ("@", "switch server"),
-            ("ctrl-r", "refresh now"),
+            ("I", "install or restart the service (asks)"),
+            ("ctrl-r", "refresh now; the service looks too"),
             ("q esc", "back, or quit"),
         ],
     ),
@@ -2655,7 +3018,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("s · r", "stop / start · restart"),
             ("p · K", "pause / resume · kill"),
             ("d", "delete (asks first)"),
-            ("o", "open its localhost port"),
+            ("o", "open its port, or pick one of several"),
             ("i · y", "inspect · copy id"),
             ("a", "show / hide stopped"),
             ("P", "delete every stopped one (asks)"),
@@ -2678,6 +3041,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("p", "pull image"),
             ("d", "delete (asks first)"),
             ("P", "prune unused (asks first)"),
+            ("B", "prune the build cache (Images)"),
         ],
     ),
     (
@@ -2922,7 +3286,7 @@ pub fn ago(now: u64, then: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{app, code, key};
+    use crate::app::tests::{app, code, declare, key};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::time::Instant;
@@ -2979,6 +3343,239 @@ mod tests {
         );
         a.on_key(key('d'), Instant::now());
         insta::assert_snapshot!(render(&a, 90, 20));
+    }
+
+    #[test]
+    fn the_quitting_dialog_names_what_it_waits_for_and_its_button_is_q() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut a = app();
+        a.on_key(code(KeyCode::Down), Instant::now());
+        a.on_key(key('r'), Instant::now());
+        a.on_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Instant::now(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut hits = Hits::default();
+        terminal.draw(|f| hits = draw(f, &a)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = render(&a, 90, 20);
+        assert!(text.contains("Quitting"), "{text}");
+        assert!(
+            text.contains("Stopping 1 task, and waiting up to 4s"),
+            "{text}"
+        );
+        assert!(text.contains(&a.tasks[0].title), "{text}");
+        let dialog = hits.dialog.expect("a dialog frame");
+        let (button, _) = hits
+            .keys
+            .iter()
+            .find(|(r, k)| k == "q" && dialog.contains(r.as_position()))
+            .expect("a q button inside the dialog");
+        let cells: String = (button.x..button.right())
+            .map(|x| buffer[(x, button.y)].symbol().to_string())
+            .collect();
+        assert_eq!(cells, " q  leave now, killing what is left", "{text}");
+    }
+
+    /// What `draw` registered, and the cells under one hit.
+    fn drawn(a: &App, width: u16, height: u16) -> (Hits, Terminal<TestBackend>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = Hits::default();
+        terminal.draw(|f| hits = draw(f, a)).unwrap();
+        (hits, terminal)
+    }
+
+    fn cells(terminal: &Terminal<TestBackend>, r: Rect) -> String {
+        let buffer = terminal.backend().buffer();
+        (r.x..r.right())
+            .map(|x| buffer[(x, r.y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ports_fit_their_room_and_count_the_rest() {
+        let ports = [3000, 8080, 9090];
+        assert_eq!(
+            ports_fitting(&ports, 200),
+            ("localhost:3000 localhost:8080 localhost:9090".into(), 0)
+        );
+        // Two and their " +1" are 32 cells; a third would not fit.
+        assert_eq!(
+            ports_fitting(&ports, 32),
+            ("localhost:3000 localhost:8080".into(), 1)
+        );
+        assert_eq!(ports_fitting(&ports, 31), ("localhost:3000".into(), 2));
+        assert_eq!(ports_fitting(&ports, 16), (String::new(), 3));
+        assert_eq!(ports_fitting(&[], 10), (String::new(), 0));
+    }
+
+    #[test]
+    fn a_row_with_more_keys_than_room_loses_its_last_ones_never_help_or_quit() {
+        let h = |k: &str, l: &str| (k.to_string(), l.to_string());
+        let hints = vec![
+            h("⏎", "logs"),
+            h("e", "shell"),
+            h("r", "restart"),
+            h("/", "filter"),
+            h("?", "help"),
+            h("q", "quit"),
+        ];
+        let keys = |width| {
+            fitting(hints.clone(), width)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(200), ["⏎", "e", "r", "/", "?", "q"]);
+        // " " + "⏎ logs  " + "e shell  " is 18, "? help  q quit  " 16.
+        assert_eq!(keys(34), ["⏎", "e", "?", "q"]);
+        // "/ filter" would fit where "r restart" did not, but the row's
+        // keys keep their order: once one is dropped, so is the rest.
+        assert_eq!(keys(44), ["⏎", "e", "?", "q"]);
+        assert_eq!(keys(45), ["⏎", "e", "r", "?", "q"]);
+    }
+
+    #[test]
+    fn the_ports_list_numbers_every_port_and_says_why_one_would_not_answer() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[
+                (3000, "web", true),
+                (5432, "db", false),
+                (8080, "web", true),
+            ],
+        );
+        a.local.statuses[0].1.tunnels[2].service_running = Some(false);
+        a.on_key(key('o'), Instant::now());
+        let (hits, terminal) = drawn(&a, 100, 24);
+        let text = render(&a, 100, 24);
+        assert!(text.contains(" Ports · demo "), "{text}");
+        assert!(text.contains(" 1 localhost:3000  web"), "{text}");
+        assert!(
+            text.contains(
+                " 2 localhost:5432  db   not tunneled: something here holds it (lsof -i :5432)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(" 3 localhost:8080  web  no container is running for it"),
+            "{text}"
+        );
+        let (picks, first) = hits.picks.expect("its rows can be clicked");
+        assert_eq!(first, 0);
+        assert!(
+            cells(&terminal, Rect::new(picks.x, picks.y, picks.width, 1))
+                .contains("localhost:3000")
+        );
+        assert!(hits.dialog.is_some_and(|d| d.contains(picks.as_position())));
+        assert_eq!(
+            hints(&a).into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            ["↑↓", "⏎", "1-9", "y", "esc"]
+        );
+    }
+
+    #[test]
+    fn a_stacks_row_shows_the_ports_that_fit_and_counts_the_rest() {
+        let mut a = app();
+        let ports: Vec<(u32, &str, bool)> = (0..8).map(|i| (3000 + i, "web", true)).collect();
+        declare(&mut a, "demo", true, &ports);
+        let row = |text: &str| {
+            text.lines()
+                .find(|l| l.contains("▾ demo"))
+                .unwrap()
+                .to_string()
+        };
+        let wide = render(&a, 220, 24);
+        assert!(
+            row(&wide).contains("localhost:3007") && !row(&wide).contains(" +"),
+            "{wide}"
+        );
+        let narrow = render(&a, 100, 24);
+        let line = row(&narrow);
+        assert!(
+            line.contains("localhost:3000 localhost:3001 +6"),
+            "{narrow}"
+        );
+        assert!(
+            line.contains("kept live by Ulak") && line.contains("this project"),
+            "the rest of the row still fits: {line}"
+        );
+        assert!(narrow.lines().all(|l| l.width() <= 100), "{narrow}");
+        // `o` on that row lists them; the footer says so.
+        assert!(
+            hints(&a).contains(&("o".to_string(), "ports".to_string())),
+            "{:?}",
+            hints(&a)
+        );
+    }
+
+    #[test]
+    fn the_ulak_tab_shows_no_link_or_port_while_no_service_runs() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        a.on_key(key('5'), Instant::now());
+        let text = render(&a, 120, 24);
+        assert!(
+            text.contains("link up") && text.contains("localhost:8080"),
+            "{text}"
+        );
+        a.local.service_running = false;
+        a.local.service_problem = Some(
+            "the service agent is installed but nothing is running — now: ulak service install"
+                .into(),
+        );
+        let text = render(&a, 120, 24);
+        assert!(
+            !text.contains("link up") && !text.contains("localhost:8080"),
+            "a stopped service's last report is history:\n{text}"
+        );
+        assert!(text.contains("no service running"), "{text}");
+        let (hits, terminal) = drawn(&a, 120, 24);
+        let buttons: Vec<String> = hits
+            .keys
+            .iter()
+            .filter(|(_, k)| k == "I")
+            .map(|(r, _)| cells(&terminal, *r))
+            .collect();
+        assert_eq!(
+            buttons,
+            ["I start it", "I start it"],
+            "beside the service's line, and beside its problem below"
+        );
+    }
+
+    #[test]
+    fn a_service_problem_is_said_on_every_tab_with_its_fix_as_a_button() {
+        let mut a = app();
+        a.local.service_running = true;
+        a.local.service_installed = true;
+        a.local.service_problem =
+            Some("the running service is v0.1.0 and this ulak is v0.2.0".into());
+        let (hits, terminal) = drawn(&a, 100, 24);
+        let (r, _) = hits
+            .keys
+            .iter()
+            .find(|(_, k)| k == "I")
+            .expect("an I button on the Containers tab");
+        assert_eq!(cells(&terminal, *r), "I restart it");
+        let status = cells(&terminal, Rect::new(0, r.y, 100, 1));
+        assert!(
+            status.starts_with(" ! the running service is v0.1.0"),
+            "{status}"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(1, r.y)].fg,
+            BAD,
+            "said as a fault"
+        );
+        // Under a dialog it is no button: a click there closes the dialog.
+        a.on_key(key('?'), Instant::now());
+        let (hits, _) = drawn(&a, 100, 24);
+        assert!(!hits.keys.iter().any(|(_, k)| k == "I"), "{:?}", hits.keys);
     }
 
     #[test]

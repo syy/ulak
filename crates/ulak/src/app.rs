@@ -51,6 +51,11 @@ const BAD_TOAST_FOR: Duration = Duration::from_secs(10);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// When `docker events` is down, the list is re-read this often instead.
 const BLIND_POLL: Duration = Duration::from_secs(5);
+/// How long running tasks get to stop once asked (`feed::Task::cancel`)
+/// when quitting, before what is left is killed. Waited out here, inside
+/// the loop, so the screen keeps drawing and reading while they stop:
+/// see `App::leave`.
+pub const LEAVE_GRACE: Duration = Duration::from_secs(4);
 const FEED_BACKOFF: &[u64] = &[2, 5, 15, 30];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -451,6 +456,7 @@ pub struct Input {
     pub before: String,
 }
 
+/// `Leaving` is quitting while the tasks that were running stop: `App::leave`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
@@ -459,6 +465,39 @@ pub enum Overlay {
     Input(Input),
     Tasks { selected: usize, scroll: usize },
     Servers { selected: usize },
+    Leaving { since: Instant },
+    Ports(Ports),
+}
+
+/// The ports list: what Ulak forwards for one stack, by its id, or for
+/// one service of it when `service` is not empty (`App::forwards`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ports {
+    pub stack: String,
+    pub service: String,
+    pub selected: usize,
+}
+
+/// A port Ulak forwards to this machine, as the ports list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Forward {
+    pub port: u32,
+    pub service: String,
+    /// `TunnelState::open`. When false, something on this machine holds
+    /// the port, and opening it would reach that instead.
+    pub open: bool,
+    /// `TunnelState::service_running`: `Some(false)` when no container
+    /// answers behind it.
+    pub running: Option<bool>,
+}
+
+/// What `o` does with a stack's ports, or one service's: `App::port_key`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PortKey {
+    /// The only port, and it is tunneled: straight to the browser.
+    Open(u32),
+    /// Several, or one that is not tunneled: the ports list, which says why.
+    List,
 }
 
 #[derive(Debug, Clone)]
@@ -495,7 +534,9 @@ pub struct Toast {
     pub at: Instant,
 }
 
-/// What `tui.rs` must do on the dashboard's behalf.
+/// What `tui.rs` must do on the dashboard's behalf. `Ring` rings the
+/// background service's doorbell for these stacks (`intent::nudge`): see
+/// `App::ring`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     Run { task: u64, action: Action },
@@ -510,6 +551,7 @@ pub enum Effect {
     Copy(String),
     Switch(String),
     RestartFeed(Feed),
+    Ring(Vec<String>),
 }
 
 /// Where the view drew the things a click can hit.
@@ -568,6 +610,10 @@ pub struct App {
     pub containers_loaded: bool,
     pub stats: BTreeMap<String, History>,
     pub local: Local,
+    /// Whether `local` has been read at least once.
+    local_loaded: bool,
+    /// The doorbell is due for this server's live stacks: `App::ring`.
+    ring_due: bool,
     pub drivers: BTreeMap<String, Driver>,
     pub groups: Vec<Group>,
 
@@ -618,6 +664,8 @@ impl App {
             containers_loaded: false,
             stats: BTreeMap::new(),
             local: Local::default(),
+            local_loaded: false,
+            ring_due: false,
             drivers: BTreeMap::new(),
             groups: Vec::new(),
             link: Link::Connecting,
@@ -966,34 +1014,73 @@ impl App {
         }
     }
 
-    /// localhost ports Ulak keeps for this container's service, from the
-    /// service's own report — and only while the stack is declared live,
-    /// because a report about a stack nobody keeps is history.
+    /// What Ulak forwards for a stack, by its id, or for one service of
+    /// it, from the service's own report. Only while the stack is
+    /// declared live, because a report about a stack nobody keeps is
+    /// history.
+    pub fn forwards(&self, stack: &str, service: &str) -> Vec<Forward> {
+        // A tunnel no running service holds open is history too, the way
+        // `ulak status` reads it, and a port shown from history is one
+        // that connects to nothing.
+        if !self.kept_live(stack) || !self.local.service_running {
+            return Vec::new();
+        }
+        let mut forwards: Vec<Forward> = self
+            .local
+            .statuses
+            .iter()
+            .filter(|(sid, _)| sid == stack)
+            .flat_map(|(_, st)| st.tunnels.iter())
+            .filter(|t| service.is_empty() || t.service == service)
+            .map(|t| Forward {
+                port: t.port,
+                service: t.service.clone(),
+                open: t.open,
+                running: t.service_running,
+            })
+            .collect();
+        forwards.sort_by_key(|f| f.port);
+        forwards.dedup_by_key(|f| f.port);
+        forwards
+    }
+
+    fn kept_live(&self, stack: &str) -> bool {
+        self.local
+            .catalog
+            .iter()
+            .any(|(sid, d)| sid == stack && d.live)
+    }
+
+    /// The localhost ports that reach this container's service.
     pub fn ports_home(&self, project: &str, service: &str) -> Vec<u32> {
         if project.is_empty() {
             return Vec::new();
         }
         let id = crate::intent::stack_id(&self.dest, project);
-        let live = self
-            .local
-            .catalog
-            .iter()
-            .any(|(sid, d)| *sid == id && d.live);
-        if !live {
-            return Vec::new();
+        self.forwards(&id, service)
+            .into_iter()
+            .filter(|f| f.open)
+            .map(|f| f.port)
+            .collect()
+    }
+
+    /// What `o` does here; the footer names the same thing.
+    pub fn port_key(&self, stack: &str, service: &str) -> Option<PortKey> {
+        match self.forwards(stack, service).as_slice() {
+            [] => None,
+            [only] if only.open => Some(PortKey::Open(only.port)),
+            _ => Some(PortKey::List),
         }
-        let mut ports: Vec<u32> = self
-            .local
-            .statuses
-            .iter()
-            .filter(|(sid, _)| *sid == id)
-            .flat_map(|(_, st)| st.tunnels.iter())
-            .filter(|t| t.open && (service.is_empty() || t.service == service))
-            .map(|t| t.port)
-            .collect();
-        ports.sort_unstable();
-        ports.dedup();
-        ports
+    }
+
+    /// Every problem the service has names `ulak service install` as its
+    /// fix, which `I` runs: what that would do, or `None` with no problem.
+    pub fn service_fix(&self) -> Option<verbs::Install> {
+        let local = &self.local;
+        local
+            .service_problem
+            .is_some()
+            .then(|| verbs::Install::of(local.service_running, local.service_installed))
     }
 
     pub fn stack_status(&self, project: &str) -> Option<&crate::intent::Status> {
@@ -1003,6 +1090,11 @@ impl App {
             .iter()
             .find(|(sid, _)| *sid == id)
             .map(|(_, st)| st)
+    }
+
+    /// `docker system df`'s row for `kind`: `Images`, `Build Cache`, …
+    pub fn usage_of(&self, kind: &str) -> Option<&Usage> {
+        self.usage.iter().find(|u| u.kind == kind)
     }
 
     pub fn container_by_id(&self, id: &str) -> Option<&Container> {
@@ -1117,8 +1209,19 @@ impl App {
                 let title = t.title.clone();
                 let refresh = t.refresh;
                 let last = t.lines.iter().rev().find(|l| !l.trim().is_empty()).cloned();
+                if matches!(self.overlay, Overlay::Leaving { .. }) {
+                    if self.running_tasks() == 0 {
+                        self.quit = true;
+                    }
+                    return fx;
+                }
                 if code == Some(0) {
-                    self.toast(Tone::Good, title, now);
+                    let said = match last.as_deref().and_then(freed) {
+                        Some(size) => format!("{title} · {size} freed"),
+                        None => title,
+                    };
+                    self.toast(Tone::Good, said, now);
+                    self.ring_due = true;
                 } else {
                     let tail = last.map(|l| format!(": {l}")).unwrap_or_default();
                     self.toast(
@@ -1148,11 +1251,42 @@ impl App {
             Msg::Local(local) => {
                 self.drivers = local.drivers.clone();
                 self.local = *local;
+                self.local_loaded = true;
                 self.regroup();
                 self.fix_selection();
             }
         }
+        fx.extend(self.ring());
         fx
+    }
+
+    /// Ring the background service's doorbell for every stack this
+    /// machine keeps live on this server, when one is due: the dashboard
+    /// has just reached the server (opened, switched to it, or back after
+    /// losing it), a task it ran succeeded, or ctrl-r asked for
+    /// everything again.
+    ///
+    /// Each is a moment the service's picture may be stale, and the
+    /// service only learns otherwise by asking. After a failure it asks
+    /// on a ladder that climbs to two minutes, then five; a stack with
+    /// nothing running is asked every two minutes. So a dashboard showing
+    /// a server that plainly answers could sit beside ports that stay
+    /// closed for minutes. The doorbell makes the service ask now and
+    /// start its ladder again. Due before this machine's declarations
+    /// were first read, it waits for them.
+    fn ring(&mut self) -> Option<Effect> {
+        if !self.ring_due || !self.local_loaded {
+            return None;
+        }
+        self.ring_due = false;
+        let stacks: Vec<String> = self
+            .local
+            .catalog
+            .iter()
+            .filter(|(_, d)| d.live && d.destination == self.dest)
+            .map(|(id, _)| id.clone())
+            .collect();
+        (!stacks.is_empty()).then_some(Effect::Ring(stacks))
     }
 
     fn trim_tasks(&mut self) {
@@ -1177,6 +1311,9 @@ impl App {
     fn take_snapshot(&mut self, snap: Snapshot, took: Duration, now: Instant) {
         if matches!(self.link, Link::Down { .. }) {
             self.toast(Tone::Good, format!("{} is back", self.dest), now);
+        }
+        if !matches!(self.link, Link::Up { .. }) {
+            self.ring_due = true;
         }
         self.link = Link::Up { took };
         self.engine = snap.engine;
@@ -1262,6 +1399,11 @@ impl App {
     /// Ulak's own helpers held back while the dashboard owned the screen.
     pub fn on_tick(&mut self, now: Instant, held: Vec<(crate::ui::Level, String)>) -> Vec<Effect> {
         self.frame = self.frame.wrapping_add(1);
+        if let Overlay::Leaving { since } = self.overlay
+            && now.duration_since(since) >= LEAVE_GRACE
+        {
+            self.quit = true;
+        }
         for (level, text) in held {
             let tone = match level {
                 crate::ui::Level::Warn => Tone::Bad,
@@ -1311,11 +1453,18 @@ impl App {
     // ─── input ──────────────────────────────────────────────────────
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Vec<Effect> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return Vec::new();
-        }
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         match self.overlay.clone() {
+            // Read, so that it never reaches the shell, and dropped: only
+            // the quit keys mean anything now, and they mean "do not wait".
+            Overlay::Leaving { .. } => {
+                if ctrl_c || key.code == KeyCode::Char('q') {
+                    self.quit = true;
+                }
+                return Vec::new();
+            }
+            _ if ctrl_c => return self.leave(now),
             Overlay::None => {}
             Overlay::Help { scroll } => {
                 // Scrolling keys page through it; anything else closes it.
@@ -1338,6 +1487,7 @@ impl App {
             Overlay::Input(input) => return self.on_input_key(input, key, now),
             Overlay::Tasks { selected, scroll } => return self.on_tasks_key(selected, scroll, key),
             Overlay::Servers { selected } => return self.on_servers_key(selected, key, now),
+            Overlay::Ports(list) => return self.on_ports_key(list, key, now),
         }
         // Keys every screen shares.
         match key.code {
@@ -1361,7 +1511,10 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.last_poke = now;
                 self.toast(Tone::Note, "refreshing…", now);
-                return vec![Effect::Poke(Want::all())];
+                self.ring_due = true;
+                let mut fx = vec![Effect::Poke(Want::all())];
+                fx.extend(self.ring());
+                return fx;
             }
             KeyCode::Char(':') => {
                 self.overlay = Overlay::Input(Input {
@@ -1371,6 +1524,7 @@ impl App {
                 });
                 return Vec::new();
             }
+            KeyCode::Char('I') => return self.install_service(now),
             _ => {}
         }
         match &self.screen {
@@ -1410,8 +1564,19 @@ impl App {
                     before: self.filter.clone(),
                 });
             }
-            KeyCode::Char('P') if self.tab == Tab::Containers => {
-                return self.act(verbs::prune_containers(), now);
+            // The tab's own verbs, so they work with nothing selected: a
+            // filter that matches nothing, or nothing left to list.
+            KeyCode::Char('P') if self.tab != Tab::Project => {
+                let action = match self.tab {
+                    Tab::Images => verbs::prune_images(self.usage_of("Images")),
+                    Tab::Volumes => verbs::prune_volumes(),
+                    Tab::Networks => verbs::prune_networks(),
+                    Tab::Containers | Tab::Project => verbs::prune_containers(),
+                };
+                return self.act(action, now);
+            }
+            KeyCode::Char('B') if self.tab == Tab::Images => {
+                return self.act(verbs::prune_build_cache(self.usage_of("Build Cache")), now);
             }
             KeyCode::Char('a') if self.tab == Tab::Containers => {
                 self.show_stopped = !self.show_stopped;
@@ -1447,6 +1612,30 @@ impl App {
             fx.push(Effect::Poke(missing));
         }
         fx
+    }
+
+    /// Quit, after asking running tasks to stop. While they stop, the
+    /// dashboard stays up, drawn and reading every key, and quits when
+    /// the last one is done, when `LEAVE_GRACE` is up, or at a second `q`
+    /// or Ctrl-C. The wait used to come after the loop, with nobody
+    /// reading: every click and key made during it was left in the
+    /// terminal for the shell.
+    fn leave(&mut self, now: Instant) -> Vec<Effect> {
+        let running: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|t| t.running())
+            .map(|t| t.id)
+            .collect();
+        if running.is_empty() {
+            self.quit = true;
+            return Vec::new();
+        }
+        self.overlay = Overlay::Leaving { since: now };
+        running
+            .into_iter()
+            .map(|task| Effect::Cancel { task })
+            .collect()
     }
 
     fn ask_quit(&mut self) -> Vec<Effect> {
@@ -1520,7 +1709,6 @@ impl App {
                             Vec::new()
                         }
                     },
-                    KeyCode::Char('P') => self.act(verbs::prune_images(), now),
                     KeyCode::Char('y') => self.copy(image.reference(), now),
                     _ => Vec::new(),
                 }
@@ -1536,7 +1724,6 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Delete => {
                         self.act(verbs::remove_volume(&volume), now)
                     }
-                    KeyCode::Char('P') => self.act(verbs::prune_volumes(), now),
                     KeyCode::Char('y') => self.copy(volume.name.clone(), now),
                     _ => Vec::new(),
                 }
@@ -1564,7 +1751,6 @@ impl App {
                             self.act(verbs::remove_network(&network), now)
                         }
                     }
-                    KeyCode::Char('P') => self.act(verbs::prune_networks(), now),
                     KeyCode::Char('y') => self.copy(network.id.clone(), now),
                     _ => Vec::new(),
                 }
@@ -1639,34 +1825,115 @@ impl App {
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => self.act(verbs::remove(&[c]), now),
-            KeyCode::Char('o') => self.open_browser(&c.project, &c.service, &c.name, now),
+            KeyCode::Char('o') => {
+                let stack = crate::intent::stack_id(&self.dest, &c.project);
+                self.open_ports(&stack, &c.service, &c.name, now)
+            }
             KeyCode::Char('y') => self.copy(c.id.clone(), now),
             _ => Vec::new(),
         }
     }
 
-    fn open_browser(
-        &mut self,
-        project: &str,
-        service: &str,
-        name: &str,
-        now: Instant,
-    ) -> Vec<Effect> {
-        match self.ports_home(project, service).first() {
-            Some(port) => {
-                let url = format!("http://localhost:{port}");
-                self.toast(Tone::Note, format!("opening {url}"), now);
-                vec![Effect::Open(url)]
+    fn open_ports(&mut self, stack: &str, service: &str, name: &str, now: Instant) -> Vec<Effect> {
+        match self.port_key(stack, service) {
+            Some(PortKey::Open(port)) => self.open_url(port, now),
+            Some(PortKey::List) => {
+                let selected = self
+                    .forwards(stack, service)
+                    .iter()
+                    .position(|f| f.open)
+                    .unwrap_or(0);
+                self.overlay = Overlay::Ports(Ports {
+                    stack: stack.to_string(),
+                    service: service.to_string(),
+                    selected,
+                });
+                Vec::new()
             }
             None => {
-                self.toast(
-                    Tone::Note,
-                    format!("{name} has no localhost port — Ulak forwards the published ports of stacks it keeps live"),
-                    now,
-                );
+                let said = if self.kept_live(stack) && !self.local.service_running {
+                    let fix = if self.service_fix().is_some() {
+                        " — I starts it"
+                    } else {
+                        ""
+                    };
+                    format!("no Ulak service is running, so nothing forwards {name}'s ports{fix}")
+                } else {
+                    format!(
+                        "{name} has no localhost port — Ulak forwards the published ports of stacks it keeps live"
+                    )
+                };
+                self.toast(Tone::Note, said, now);
                 Vec::new()
             }
         }
+    }
+
+    fn open_url(&mut self, port: u32, now: Instant) -> Vec<Effect> {
+        let url = format!("http://localhost:{port}");
+        self.toast(Tone::Note, format!("opening {url}"), now);
+        vec![Effect::Open(url)]
+    }
+
+    fn on_ports_key(&mut self, mut list: Ports, key: KeyEvent, now: Instant) -> Vec<Effect> {
+        let forwards = self.forwards(&list.stack, &list.service);
+        let chosen = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                return Vec::new();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                list.selected = list.selected.saturating_sub(1);
+                self.overlay = Overlay::Ports(list);
+                return Vec::new();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                list.selected = (list.selected + 1).min(forwards.len().saturating_sub(1));
+                self.overlay = Overlay::Ports(list);
+                return Vec::new();
+            }
+            KeyCode::Enter | KeyCode::Char('o') => forwards.get(list.selected),
+            KeyCode::Char(c @ '1'..='9') => forwards.get(c as usize - '1' as usize),
+            KeyCode::Char('y') => {
+                let Some(f) = forwards.get(list.selected) else {
+                    return Vec::new();
+                };
+                self.overlay = Overlay::None;
+                return self.copy(format!("localhost:{}", f.port), now);
+            }
+            _ => None,
+        };
+        let Some(f) = chosen else {
+            return Vec::new();
+        };
+        self.overlay = Overlay::None;
+        if !f.open {
+            self.toast(
+                Tone::Bad,
+                format!(
+                    "localhost:{0} is not tunneled: something on this machine holds it — lsof -i :{0}",
+                    f.port
+                ),
+                now,
+            );
+            return Vec::new();
+        }
+        self.open_url(f.port, now)
+    }
+
+    /// `I`: what the service's problem says to type, asked first.
+    fn install_service(&mut self, now: Instant) -> Vec<Effect> {
+        let Some(how) = self.service_fix() else {
+            let said = if self.local.service_running {
+                "the Ulak service is running; nothing to install".to_string()
+            } else {
+                format!("the Ulak service: {}", self.local.service_line)
+            };
+            self.toast(Tone::Note, said, now);
+            return Vec::new();
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        self.act(verbs::install_service(cwd, how), now)
     }
 
     fn copy(&mut self, text: String, now: Instant) -> Vec<Effect> {
@@ -1788,7 +2055,10 @@ impl App {
                 }
                 None => no_driver(self),
             },
-            KeyCode::Char('o') => self.open_browser(&group.key, "", &stack, now),
+            KeyCode::Char('o') => {
+                let id = crate::intent::stack_id(&self.dest, &group.key);
+                self.open_ports(&id, "", &stack, now)
+            }
             _ => Vec::new(),
         }
     }
@@ -1842,6 +2112,11 @@ impl App {
                     _ => verbs::doctor(&d, &stack),
                 };
                 self.act(action, now)
+            }
+            // Its ports reach this machine whichever server is shown.
+            KeyCode::Char('o') => {
+                let id = crate::intent::stack_id(&dest, &stack);
+                self.open_ports(&id, "", &stack, now)
             }
             _ => Vec::new(),
         }
@@ -2117,15 +2392,17 @@ impl App {
             None => Vec::new(),
             Some(false) => {
                 self.overlay = Overlay::None;
+                // Said, so an Enter on the default reads as the No it is
+                // and not as a command that ran and did nothing.
+                if let Then::Run(action) = &c.then {
+                    self.toast(Tone::Note, format!("{}: cancelled", action.title), now);
+                }
                 Vec::new()
             }
             Some(true) => {
                 self.overlay = Overlay::None;
                 match c.then {
-                    Then::Quit => {
-                        self.quit = true;
-                        Vec::new()
-                    }
+                    Then::Quit => self.leave(now),
                     Then::Run(action) => {
                         let deleting_here = matches!(
                             (&self.screen, &action.plan),
@@ -2421,6 +2698,17 @@ impl App {
             .last_click
             .is_some_and(|(t, p)| now.duration_since(t) < DOUBLE_CLICK && p.y == at.y);
         self.last_click = Some((now, at));
+        if let Overlay::Ports(mut list) = self.overlay.clone()
+            && index < self.forwards(&list.stack, &list.service).len()
+        {
+            list.selected = index;
+            self.overlay = Overlay::Ports(list);
+            if double {
+                self.last_click = None;
+                return self.on_key(KeyEvent::from(KeyCode::Enter), now);
+            }
+            return Vec::new();
+        }
         match self.overlay {
             Overlay::Tasks { .. } if index < self.tasks.len() => {
                 self.overlay = Overlay::Tasks {
@@ -2439,6 +2727,18 @@ impl App {
         }
         Vec::new()
     }
+}
+
+/// What a prune's last line says it freed: `Total reclaimed space:
+/// 3.404GB` from an image, container, volume or system prune, `Total:
+/// 3.532GB` (tab-separated) from a builder prune.
+fn freed(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let size = line
+        .strip_prefix("Total reclaimed space:")
+        .or_else(|| line.strip_prefix("Total:"))?
+        .trim();
+    (!size.is_empty()).then_some(size)
 }
 
 /// Pretty-print a JSON document; anything else is shown as it came.
@@ -2904,19 +3204,227 @@ pub(crate) mod tests {
         assert!(a.tasks[0].failed());
     }
 
-    #[test]
-    fn quitting_with_a_running_task_asks_first() {
-        let mut a = app();
+    /// A restart of the second row, started and still running.
+    fn running_task(a: &mut App) -> u64 {
         a.on_key(code(KeyCode::Down), Instant::now());
-        a.on_key(key('r'), Instant::now());
-        a.on_key(key('q'), Instant::now());
+        let fx = a.on_key(key('r'), Instant::now());
+        let [Effect::Run { task, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        *task
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn quitting_with_a_running_task_asks_then_stops_it_and_waits_on_screen() {
+        let mut a = app();
+        let task = running_task(&mut a);
+        let now = Instant::now();
+        a.on_key(key('q'), now);
         assert!(!a.quit);
         assert!(matches!(&a.overlay, Overlay::Confirm(c) if c.then == Then::Quit));
-        a.on_key(key('y'), Instant::now());
+        let fx = a.on_key(key('y'), now);
+        assert_eq!(fx, vec![Effect::Cancel { task }]);
+        assert!(!a.quit, "it waits for the task, on screen");
+        assert!(
+            matches!(a.overlay, Overlay::Leaving { .. }),
+            "{:?}",
+            a.overlay
+        );
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(130),
+            },
+            now,
+        );
+        assert!(a.quit, "the last task to stop ends the wait");
+        assert!(fx.is_empty(), "nothing is refreshed on the way out: {fx:?}");
+    }
+
+    #[test]
+    fn while_quitting_every_key_is_read_and_only_q_or_ctrl_c_ends_the_wait() {
+        let mut a = app();
+        running_task(&mut a);
+        let now = Instant::now();
+        let fx = a.on_key(ctrl_c(), now);
+        assert!(matches!(fx.as_slice(), [Effect::Cancel { .. }]), "{fx:?}");
+        let waiting = a.overlay.clone();
+        assert!(matches!(waiting, Overlay::Leaving { .. }), "{waiting:?}");
+        for k in [
+            key('j'),
+            key('d'),
+            key('y'),
+            key('e'),
+            key(':'),
+            code(KeyCode::Enter),
+            code(KeyCode::Esc),
+        ] {
+            assert_eq!(a.on_key(k, now), Vec::new(), "{k:?}");
+            assert_eq!(a.overlay, waiting, "{k:?}");
+            assert!(!a.quit, "{k:?}");
+        }
+        // A click outside the dialog is esc, which does not end it either.
+        let hits = Hits {
+            dialog: Some(Rect::new(20, 8, 40, 7)),
+            ..Hits::default()
+        };
+        assert_eq!(a.on_mouse(left_click(2, 2), &hits, now), Vec::new());
+        assert!(!a.quit);
+        a.on_key(key('q'), now);
+        assert!(a.quit);
+
+        let mut b = app();
+        running_task(&mut b);
+        b.on_key(ctrl_c(), now);
+        assert!(!b.quit);
+        b.on_key(ctrl_c(), now);
+        assert!(b.quit, "a second ctrl-c does not wait either");
+    }
+
+    #[test]
+    fn quitting_stops_waiting_when_the_grace_is_up() {
+        let mut a = app();
+        running_task(&mut a);
+        let start = Instant::now();
+        a.on_key(ctrl_c(), start);
+        a.on_tick(start + LEAVE_GRACE - Duration::from_millis(100), Vec::new());
+        assert!(!a.quit);
+        a.on_tick(start + LEAVE_GRACE, Vec::new());
         assert!(a.quit);
     }
 
-    fn declare(a: &mut App, identity: &str, live: bool, ports: &[(u32, &str, bool)]) {
+    #[test]
+    fn quitting_after_tasks_have_finished_quits_at_once() {
+        for quit in [key('q'), ctrl_c()] {
+            let mut a = app();
+            let task = running_task(&mut a);
+            a.on_msg(
+                Msg::TaskDone {
+                    task,
+                    code: Some(0),
+                },
+                Instant::now(),
+            );
+            let fx = a.on_key(quit, Instant::now());
+            assert_eq!(fx, Vec::new(), "nothing is left to stop");
+            assert!(a.quit, "{quit:?}");
+        }
+    }
+
+    #[test]
+    fn the_quitting_dialogs_button_leaves_now() {
+        let mut a = app();
+        running_task(&mut a);
+        a.on_key(ctrl_c(), Instant::now());
+        let hits = Hits {
+            keys: vec![(Rect::new(30, 12, 30, 1), "q".into())],
+            dialog: Some(Rect::new(20, 8, 40, 7)),
+            ..Hits::default()
+        };
+        a.on_mouse(left_click(35, 12), &hits, Instant::now());
+        assert!(a.quit);
+    }
+
+    /// This machine's declarations: `(identity, server, live)` each.
+    fn declarations(stacks: &[(&str, &str, bool)]) -> Msg {
+        let catalog = stacks
+            .iter()
+            .map(|(identity, dest, live)| {
+                let desired = Desired {
+                    schema: crate::intent::SCHEMA,
+                    live: *live,
+                    workspace_id: "abc".into(),
+                    workspace_namespace: "n".into(),
+                    destination: (*dest).into(),
+                    identity: (*identity).into(),
+                    cwd: "/work/demo".into(),
+                    argv_globals: Vec::new(),
+                    compose_env: BTreeMap::new(),
+                    updated_unix: 1,
+                };
+                (crate::intent::stack_id(dest, identity), desired)
+            })
+            .collect();
+        Msg::Local(Box::new(Local {
+            catalog,
+            ..Local::default()
+        }))
+    }
+
+    fn rung(fx: &[Effect]) -> Vec<Vec<String>> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Ring(stacks) => Some(stacks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reaching_the_server_rings_the_services_doorbell_for_its_live_stacks_once() {
+        let mut a = app();
+        let now = Instant::now();
+        let mine = [
+            ("demo", "box", true),
+            ("idle", "box", false),
+            ("far", "elsewhere", true),
+        ];
+        // The fixture's first snapshot came before the declarations were
+        // read: the ring waited for them.
+        let fx = a.on_msg(declarations(&mine), now);
+        assert_eq!(
+            rung(&fx),
+            vec![vec![crate::intent::stack_id("box", "demo")]]
+        );
+        let fx = a.on_msg(declarations(&mine), now);
+        assert!(rung(&fx).is_empty(), "once: {fx:?}");
+        let snap = |result| Msg::Snapshot {
+            era: 1,
+            result,
+            took: Duration::from_millis(250),
+        };
+        let fx = a.on_msg(snap(Ok(Snapshot::default())), now);
+        assert!(rung(&fx).is_empty(), "the link was up already: {fx:?}");
+        a.on_msg(snap(Err("Connection refused".into())), now);
+        let fx = a.on_msg(snap(Ok(Snapshot::default())), now);
+        assert_eq!(rung(&fx).len(), 1, "back after losing it: {fx:?}");
+    }
+
+    #[test]
+    fn ctrl_r_and_a_task_that_worked_ring_the_doorbell_and_a_failed_one_does_not() {
+        let mut a = app();
+        let now = Instant::now();
+        a.on_msg(declarations(&[("demo", "box", true)]), now);
+        let fx = a.on_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert_eq!(rung(&fx).len(), 1, "{fx:?}");
+        let task = running_task(&mut a);
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(0),
+            },
+            now,
+        );
+        assert_eq!(rung(&fx).len(), 1, "{fx:?}");
+        let task = running_task(&mut a);
+        let fx = a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(1),
+            },
+            now,
+        );
+        assert!(rung(&fx).is_empty(), "{fx:?}");
+    }
+
+    pub(crate) fn declare(a: &mut App, identity: &str, live: bool, ports: &[(u32, &str, bool)]) {
         let desired = Desired {
             schema: crate::intent::SCHEMA,
             live,
@@ -2951,6 +3459,8 @@ pub(crate) mod tests {
                 catalog: vec![(id.clone(), desired)],
                 statuses: vec![(id, status)],
                 drivers,
+                service_running: true,
+                service_installed: true,
                 ..Local::default()
             })),
             Instant::now(),
@@ -2983,6 +3493,307 @@ pub(crate) mod tests {
         a.select(2);
         let fx = a.on_key(key('o'), Instant::now());
         assert_eq!(fx, vec![Effect::Open("http://localhost:8080".into())]);
+    }
+
+    #[test]
+    fn a_service_that_is_not_running_brings_no_port_home() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        assert_eq!(a.ports_home("demo", "web"), vec![8080]);
+        let mut dead = a.local.clone();
+        dead.service_running = false;
+        a.on_msg(Msg::Local(Box::new(dead)), Instant::now());
+        assert!(
+            a.ports_home("demo", "web").is_empty(),
+            "its status.json is history now"
+        );
+        a.select(2);
+        let fx = a.on_key(key('o'), Instant::now());
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Open(_))),
+            "o opens no dead port: {fx:?}"
+        );
+        let said = &a.toasts.last().unwrap().text;
+        assert!(
+            said.starts_with("no Ulak service is running, so nothing forwards demo-web-1's ports")
+                && !said.contains("I starts it"),
+            "the reason, and no key that would not help: {said}"
+        );
+        service(
+            &mut a,
+            Some("the service agent is installed but nothing is running"),
+            false,
+            true,
+        );
+        a.on_key(key('o'), Instant::now());
+        let said = &a.toasts.last().unwrap().text;
+        assert!(said.ends_with(" — I starts it"), "{said}");
+    }
+
+    /// The service as `agent::health` would report it.
+    fn service(a: &mut App, problem: Option<&str>, running: bool, installed: bool) {
+        let mut local = a.local.clone();
+        local.service_problem = problem.map(str::to_string);
+        local.service_running = running;
+        local.service_installed = installed;
+        a.on_msg(Msg::Local(Box::new(local)), Instant::now());
+    }
+
+    fn ports_listed(a: &App) -> (Vec<u32>, String, usize) {
+        let Overlay::Ports(list) = &a.overlay else {
+            panic!("no ports list: {:?}", a.overlay);
+        };
+        let ports = a
+            .forwards(&list.stack, &list.service)
+            .iter()
+            .map(|f| f.port)
+            .collect();
+        (ports, list.service.clone(), list.selected)
+    }
+
+    #[test]
+    fn o_opens_the_only_port_and_lists_several_or_one_that_is_not_tunneled() {
+        let mut a = app();
+        declare(&mut a, "demo", true, &[(8080, "web", true)]);
+        a.select(2);
+        assert_eq!(
+            a.on_key(key('o'), Instant::now()),
+            vec![Effect::Open("http://localhost:8080".into())]
+        );
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(8443, "web", true), (8080, "web", true), (5432, "db", true)],
+        );
+        assert!(a.on_key(key('o'), Instant::now()).is_empty());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![8080, 8443], "web".to_string(), 0),
+            "the web row lists web's ports, in order"
+        );
+        a.overlay = Overlay::None;
+        a.select(0);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![5432, 8080, 8443], String::new(), 0),
+            "the stack's row lists every service's"
+        );
+        a.overlay = Overlay::None;
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(5432, "db", false), (8080, "web", true)],
+        );
+        a.select(1);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![5432], "db".to_string(), 0),
+            "one port that is not tunneled is listed, so the list can say why"
+        );
+    }
+
+    #[test]
+    fn the_ports_list_opens_by_number_or_enter_copies_with_y_and_explains_a_held_port() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[
+                (5432, "db", false),
+                (3000, "web", true),
+                (8080, "web", true),
+            ],
+        );
+        a.select(0);
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            ports_listed(&a),
+            (vec![3000, 5432, 8080], String::new(), 0),
+            "the cursor starts on a port that opens"
+        );
+        assert_eq!(
+            a.on_key(key('3'), Instant::now()),
+            vec![Effect::Open("http://localhost:8080".into())]
+        );
+        assert_eq!(a.overlay, Overlay::None);
+
+        a.on_key(key('o'), Instant::now());
+        assert!(a.on_key(key('2'), Instant::now()).is_empty());
+        let toast = a.toasts.last().unwrap();
+        assert_eq!(toast.tone, Tone::Bad);
+        assert!(toast.text.contains("lsof -i :5432"), "{}", toast.text);
+
+        a.on_key(key('o'), Instant::now());
+        assert!(
+            a.on_key(key('9'), Instant::now()).is_empty(),
+            "no ninth port: nothing happens"
+        );
+        assert!(matches!(a.overlay, Overlay::Ports(_)));
+        for _ in 0..3 {
+            a.on_key(code(KeyCode::Down), Instant::now());
+        }
+        assert_eq!(ports_listed(&a).2, 2, "down stops at the last");
+        assert_eq!(
+            a.on_key(key('y'), Instant::now()),
+            vec![Effect::Copy("localhost:8080".into())]
+        );
+        a.on_key(key('o'), Instant::now());
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter), Instant::now()),
+            vec![Effect::Open("http://localhost:3000".into())]
+        );
+        a.on_key(key('o'), Instant::now());
+        assert!(a.on_key(code(KeyCode::Esc), Instant::now()).is_empty());
+        assert_eq!(a.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn a_click_picks_a_port_and_a_double_click_opens_it() {
+        let mut a = app();
+        declare(
+            &mut a,
+            "demo",
+            true,
+            &[(3000, "web", true), (8080, "web", true)],
+        );
+        a.select(2);
+        a.on_key(key('o'), Instant::now());
+        let hits = Hits {
+            picks: Some((Rect::new(30, 10, 40, 2), 0)),
+            dialog: Some(Rect::new(29, 9, 42, 4)),
+            ..Hits::default()
+        };
+        let t0 = Instant::now();
+        assert!(a.on_mouse(left_click(35, 11), &hits, t0).is_empty());
+        assert_eq!(ports_listed(&a).2, 1);
+        assert_eq!(
+            a.on_mouse(left_click(35, 11), &hits, t0 + Duration::from_millis(100)),
+            vec![Effect::Open("http://localhost:8080".into())]
+        );
+    }
+
+    #[test]
+    fn i_asks_then_runs_ulak_service_install_while_the_service_has_a_problem() {
+        let mut a = app();
+        service(
+            &mut a,
+            Some(
+                "the service agent is installed but nothing is running — now: ulak service install",
+            ),
+            false,
+            true,
+        );
+        assert!(
+            a.on_key(key('I'), Instant::now()).is_empty(),
+            "it asks first"
+        );
+        let Overlay::Confirm(c) = a.overlay.clone() else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question
+                .starts_with("Start Ulak's background service again"),
+            "{}",
+            c.question
+        );
+        assert!(!c.yes, "No is the default");
+        let fx = a.on_key(key('y'), Instant::now());
+        let [Effect::Run { action, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let verbs::Plan::Ulak(driven) = &action.plan else {
+            panic!("{:?}", action.plan);
+        };
+        assert_eq!(driven.args, vec!["service", "install"]);
+        assert_eq!(driven.env, None);
+    }
+
+    #[test]
+    fn i_restarts_a_running_service_only_after_saying_so_and_leaves_a_healthy_one_alone() {
+        let mut a = app();
+        service(
+            &mut a,
+            Some(
+                "the running service is v0.1.0 and this ulak is v0.2.0 — When nothing is mid-flight: ulak service install",
+            ),
+            true,
+            true,
+        );
+        a.on_key(key('I'), Instant::now());
+        let Overlay::Confirm(c) = a.overlay.clone() else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question.starts_with("Restart Ulak's background service")
+                && c.question.contains("starts over"),
+            "{}",
+            c.question
+        );
+        a.on_key(key('n'), Instant::now());
+        service(&mut a, None, true, true);
+        assert!(a.on_key(key('I'), Instant::now()).is_empty());
+        assert_eq!(a.overlay, Overlay::None, "nothing to ask");
+        assert_eq!(
+            a.toasts.last().unwrap().text,
+            "the Ulak service is running; nothing to install"
+        );
+    }
+
+    #[test]
+    fn i_asks_what_installing_does_to_the_service_there_is_and_its_button_agrees() {
+        // (running, installed): how the question opens, and the button.
+        let kinds = [
+            (
+                false,
+                false,
+                "Install Ulak's background service and start it",
+                "install it",
+            ),
+            (
+                false,
+                true,
+                "Start Ulak's background service again",
+                "start it",
+            ),
+            (
+                true,
+                true,
+                "Restart Ulak's background service on this ulak",
+                "restart it",
+            ),
+            (
+                true,
+                false,
+                "Install Ulak's background service (ulak service install)? The one you started by hand stays in charge",
+                "install it",
+            ),
+        ];
+        for (running, installed, opens, button) in kinds {
+            let mut a = app();
+            service(
+                &mut a,
+                Some("… — now: ulak service install"),
+                running,
+                installed,
+            );
+            assert_eq!(a.service_fix().map(verbs::Install::button), Some(button));
+            a.on_key(key('I'), Instant::now());
+            let Overlay::Confirm(c) = a.overlay.clone() else {
+                panic!("{:?}", a.overlay);
+            };
+            assert!(c.question.starts_with(opens), "{}", c.question);
+            assert_eq!(
+                c.question.contains("starts over"),
+                running && installed,
+                "only a restart interrupts the service: {}",
+                c.question
+            );
+        }
     }
 
     #[test]
@@ -3151,6 +3962,125 @@ pub(crate) mod tests {
         let fx = a.on_mouse(left_click(38, 12), &hits, Instant::now());
         assert!(matches!(fx.as_slice(), [Effect::Run { .. }]), "{fx:?}");
         assert_eq!(a.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn prune_is_the_tabs_key_and_works_with_nothing_selected() {
+        let mut a = app();
+        a.on_key(key('2'), Instant::now());
+        a.filter = "matches nothing".into();
+        a.fix_selection();
+        assert!(a.selected().is_none());
+        a.on_key(key('P'), Instant::now());
+        let Overlay::Confirm(c) = &a.overlay else {
+            panic!("{:?}", a.overlay);
+        };
+        let Then::Run(action) = &c.then else {
+            panic!("{:?}", c.then);
+        };
+        assert_eq!(action.title, "prune unused images");
+        for (tab, title) in [
+            ('1', "prune stopped containers"),
+            ('3', "prune unused anonymous volumes"),
+            ('4', "prune unused networks"),
+        ] {
+            let mut a = app();
+            a.on_key(key(tab), Instant::now());
+            a.on_key(key('P'), Instant::now());
+            assert!(
+                matches!(&a.overlay, Overlay::Confirm(Confirm { then: Then::Run(x), .. }) if x.title == title),
+                "{tab}: {:?}",
+                a.overlay
+            );
+        }
+        let mut a = app();
+        a.on_key(key('5'), Instant::now());
+        a.on_key(key('P'), Instant::now());
+        assert_eq!(
+            a.overlay,
+            Overlay::None,
+            "the Ulak tab has nothing to prune"
+        );
+    }
+
+    #[test]
+    fn b_on_the_images_tab_asks_to_prune_the_build_cache_with_dockers_numbers() {
+        let mut a = app();
+        a.usage = vec![Usage {
+            kind: "Build Cache".into(),
+            total: "264".into(),
+            active: "11".into(),
+            size: "9.975GB".into(),
+            reclaimable: "3.532GB".into(),
+        }];
+        a.on_key(key('2'), Instant::now());
+        a.on_key(key('B'), Instant::now());
+        let Overlay::Confirm(c) = &a.overlay else {
+            panic!("{:?}", a.overlay);
+        };
+        assert!(
+            c.question.contains("(3.532GB of 9.975GB)"),
+            "{}",
+            c.question
+        );
+        let mut a = app();
+        a.on_key(key('B'), Instant::now());
+        assert_eq!(a.overlay, Overlay::None, "only the Images tab has it");
+    }
+
+    #[test]
+    fn declining_a_question_says_nothing_was_done() {
+        for no in [key('n'), code(KeyCode::Esc), code(KeyCode::Enter)] {
+            let mut a = app();
+            a.on_key(key('2'), Instant::now());
+            a.on_key(key('P'), Instant::now());
+            let fx = a.on_key(no, Instant::now());
+            assert!(fx.is_empty(), "{no:?}: {fx:?}");
+            assert_eq!(a.overlay, Overlay::None);
+            let toast = a.toasts.last().expect("a word about it");
+            assert_eq!(toast.text, "prune unused images: cancelled", "{no:?}");
+        }
+    }
+
+    #[test]
+    fn a_prune_that_worked_says_what_docker_says_it_freed() {
+        assert_eq!(freed("Total reclaimed space: 3.404GB"), Some("3.404GB"));
+        assert_eq!(freed("Total:\t3.532GB"), Some("3.532GB"));
+        assert_eq!(freed("Total reclaimed space: 0B"), Some("0B"));
+        assert_eq!(freed("demo_default"), None);
+        assert_eq!(freed("Total:"), None);
+        let mut a = app();
+        a.on_key(key('2'), Instant::now());
+        a.on_key(key('P'), Instant::now());
+        let fx = a.on_key(key('y'), Instant::now());
+        let [Effect::Run { task, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let task = *task;
+        for line in [
+            "Deleted Images:",
+            "deleted: sha256:4f1c…",
+            "",
+            "Total reclaimed space: 3.404GB",
+        ] {
+            a.on_msg(
+                Msg::TaskLine {
+                    task,
+                    line: line.into(),
+                },
+                Instant::now(),
+            );
+        }
+        a.on_msg(
+            Msg::TaskDone {
+                task,
+                code: Some(0),
+            },
+            Instant::now(),
+        );
+        let toast = a.toasts.last().unwrap();
+        assert_eq!(toast.tone, Tone::Good);
+        assert_eq!(toast.text, "prune unused images · 3.404GB freed");
     }
 
     #[test]
