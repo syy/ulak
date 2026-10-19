@@ -7,6 +7,12 @@
 //! by `proc::run_bounded`; when a command times out or fails at the ssh
 //! layer the shared master is RETIRED (`-O exit`) and the command is
 //! retried exactly once without multiplexing.
+//!
+//! A command through the master is not a session of its own: `command`
+//! runs this binary's `__link` with ssh's arguments, which carries it as a
+//! channel of the master's connection and becomes ssh for anything it
+//! cannot carry (`link.rs`). rsync's transport and `direct_command` stay
+//! plain ssh.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +24,9 @@ use anyhow::Result;
 use crate::proc;
 use crate::ui::{self, fail};
 
-const CONTROL_PERSIST: &str = "600";
+/// Also how long a link helper takes new commands (`link.py`): a session
+/// through a master this old has a login this old.
+pub(crate) const CONTROL_PERSIST: &str = "600";
 
 /// Options every connection carries, in both transports.
 ///
@@ -126,9 +134,23 @@ impl Ssh {
         args
     }
 
-    /// Base `ssh` invocation with multiplexing, no remote command yet.
+    /// Base `ssh` invocation with multiplexing, no remote command yet:
+    /// over the link when this binary can carry it, ssh's arguments either
+    /// way. Asked on every call: the service holds one `Ssh` per server for
+    /// weeks, and the file it started from may be gone after an upgrade.
     pub fn command(&self) -> Command {
-        let mut cmd = Command::new("ssh");
+        self.command_via(crate::link::program())
+    }
+
+    fn command_via(&self, link: Option<PathBuf>) -> Command {
+        let mut cmd = match link {
+            Some(program) => {
+                let mut cmd = Command::new(program);
+                cmd.arg(crate::link::SUBCOMMAND);
+                cmd
+            }
+            None => Command::new("ssh"),
+        };
         cmd.args(self.multiplex_args());
         cmd
     }
@@ -1011,6 +1033,63 @@ mod tests {
         // would just recreate the master we just retired.
         assert!(argv.contains(&"none".to_string()), "{argv:?}");
         assert!(argv.contains(&"ControlMaster=no".to_string()), "{argv:?}");
+    }
+
+    /// The link gets ssh's arguments unchanged and in order, which is what
+    /// lets it hand them to ssh as they are; the retry never goes near it.
+    #[test]
+    fn the_link_runs_with_exactly_the_arguments_ssh_would_have_had() {
+        let args = |cmd: &Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let plain = fake();
+        let via = plain.command_via(Some(PathBuf::from("/opt/ulak/bin/ulak")));
+        assert_eq!(via.get_program(), "/opt/ulak/bin/ulak");
+        let mut expected = vec![crate::link::SUBCOMMAND.to_string()];
+        expected.extend(args(&plain.command()));
+        assert_eq!(args(&via), expected);
+        assert_eq!(plain.command().get_program(), "ssh");
+        assert_eq!(plain.direct_command().get_program(), "ssh");
+    }
+
+    /// Every command through the master is one the link carries. An option
+    /// added here that the link does not know would send every command
+    /// back to a session of its own without a word, so the two are checked
+    /// against each other with all that the environment can add.
+    #[test]
+    fn every_command_through_the_master_is_one_the_link_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identities = [
+            env(&[]),
+            env(&[
+                ("ULAK_SSH_KEY", PLAINTEXT_KEY),
+                ("ULAK_KNOWN_HOSTS", "server ssh-ed25519 AAAA\n"),
+            ]),
+        ];
+        for (i, identity) in identities.iter().enumerate() {
+            let ssh = Ssh::new_in("example", identity, false, tmp.path())
+                .unwrap()
+                .batch();
+            for tty in [None, Some("-t"), Some("-T")] {
+                let mut cmd = ssh.command();
+                cmd.args(tty).arg("--").arg(&ssh.dest).arg("docker ps");
+                let args: Vec<String> = cmd
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert!(crate::link::carries(&args), "identity {i}: {args:?}");
+            }
+        }
+        // The retry is meant to be ssh's alone.
+        let mut direct = fake().direct_command();
+        direct.arg("--").arg("example").arg("docker ps");
+        let args: Vec<String> = direct
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!crate::link::carries(&args), "{args:?}");
     }
 
     #[test]

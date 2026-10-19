@@ -12,7 +12,7 @@ published ports back to `localhost`. Builds and containers use the CPU, memory,
 disk, and architecture of the server.
 
 You do not need a local Docker daemon or Docker Desktop. Ulak itself installs
-no agent and opens no additional service port on the server.
+nothing on the server and opens no network port there.
 
 ```text
 local checkout  ⇄  sync over SSH   ⇄  remote workspace
@@ -95,6 +95,16 @@ ssh my-server 'bash -s' < scripts/check-server.sh
 Ulak sends Python helpers over SSH without installing them. Linux servers
 with Python 3.9 or later support prompt detection of server-side file changes;
 other supported servers use periodic comparisons.
+
+Commands share one SSH connection per server. Each one runs as a channel of
+that connection through a helper that Ulak starts on the server for it, so
+parallel commands do not run into sshd's `MaxSessions` limit, and a command
+whose caller is stopped stops on the server too. Commands get the environment,
+groups and forwarded agent of that connection's login. A new helper takes over
+every ten minutes, and as soon as the account's groups change, so other changes
+to the login environment reach commands within ten minutes. If the server does
+not allow unix-socket forwarding (`AllowStreamLocalForwarding`), commands use
+ordinary SSH sessions instead; `ulak doctor` shows which one is in use.
 
 ## Why not `DOCKER_HOST=ssh://`?
 

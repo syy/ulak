@@ -351,7 +351,7 @@ pub fn store(
 /// short read there is a row missing from the exclude list, and
 /// `--ignore-existing` is then free to re-create the file the user just
 /// deleted. A rename cannot be read halfway.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp.{}", std::process::id()));
     let tmp = path.with_file_name(name);
