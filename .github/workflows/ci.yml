@@ -24,7 +24,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # A PR's cache serves only that PR; saving it evicts main's, which every PR restores.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -44,6 +47,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The agent is for `bake::tests::with_a_real_buildx`, not for ssh:
       # Buildx resolves `ssh = ["default"]` for an ssh-style git context
       # even when only asked to --print, so a runner without one gets a
@@ -79,6 +84,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The e2e harness never pulls (see `needs_image`): it hands the
       # server a copy from THIS machine's daemon, so the suite cannot go
       # red on Docker Hub's per-IP anonymous limit halfway through a run.
@@ -131,6 +138,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # macOS ships Apple's openrsync, which reports "rsync version 2.6.9
       # compatible" and is exactly what `local_rsync` refuses. Without a
       # real one, every command that checks for rsync stops at that check
@@ -174,5 +183,7 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check the minimum supported Rust version
         run: cargo check --locked --all-targets
