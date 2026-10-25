@@ -6,6 +6,8 @@
 
 Run the Docker workloads for a local project on a server you control.
 
+![A Mac with no Docker runs ulak docker compose up -d on demo-server, opens the app on localhost:8525, edits a page that goes live on the server, then opens ulak ui](https://raw.githubusercontent.com/syy/ulak/main/docs/images/demo.gif)
+
 Ulak keeps your editor and source checkout on your computer. It synchronizes
 the files that Docker needs, runs Docker commands over SSH, and forwards
 published ports back to `localhost`. Builds and containers use the CPU, memory,
