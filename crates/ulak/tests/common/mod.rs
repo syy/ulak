@@ -795,6 +795,19 @@ impl TestServer {
         }
         ok
     }
+
+    /// Run `script` as root in the fixture; None on a real host.
+    pub fn as_root(&self, script: &str) -> Option<Output> {
+        let Kind::Docker { container_id } = &self.kind else {
+            return None;
+        };
+        Some(
+            Command::new("docker")
+                .args(["exec", container_id, "sh", "-c", script])
+                .output()
+                .expect("docker exec spawn"),
+        )
+    }
 }
 
 /// Kill the services a killed test binary could not.
