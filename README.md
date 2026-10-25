@@ -103,7 +103,7 @@ that connection through a helper that Ulak starts on the server for it, so
 parallel commands do not run into sshd's `MaxSessions` limit, and a command
 whose caller is stopped stops on the server too. Commands get the environment,
 groups and forwarded agent of that connection's login. A new helper takes over
-every ten minutes, and as soon as the account's groups change, so other changes
+every ten minutes, and as soon as the account gains a group, so other changes
 to the login environment reach commands within ten minutes. If the server does
 not allow unix-socket forwarding (`AllowStreamLocalForwarding`), commands use
 ordinary SSH sessions instead; `ulak doctor` shows which one is in use.

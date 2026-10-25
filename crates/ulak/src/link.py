@@ -31,8 +31,9 @@ session would. It takes new channels for LIFE seconds after it starts (the
 master's ControlPersist), then gives its socket up and leaves once its last
 command has ended; it gives it up sooner when its name no longer leads to it,
 and when a login now would get other groups than it has (Linux), so that
-`usermod -aG docker` reaches the next command. Other changes to the login
-environment reach commands within LIFE.
+`usermod -aG docker` reaches the next command: `start` says `stale` in a
+login that lacks a group, and the client logs in again. Other changes to the
+login environment reach commands within LIFE.
 
 Nothing it starts outlives it either: a helper that cannot go on, or is
 told to stop with TERM, hangs every command it runs up first. A traceback
@@ -629,6 +630,19 @@ def login_groups():
         return None
 
 
+def login_lacks_groups():
+    """Whether a login now gets a group this process lacks. Only gains
+    count: a login may have more groups than the account lists (pam_group)."""
+    login = login_groups()
+    if login is None:
+        return False
+    try:
+        have = set(os.getgroups()) | {os.getegid()}
+    except OSError:
+        return False
+    return not login[2] <= have
+
+
 def answers(path):
     """Whether a helper of this version is serving `path` right now."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -682,6 +696,10 @@ def start(name, life):
     if connection:
         name += "-%08x" % (binascii.crc32(connection.encode()) & 0xffffffff)
     path = os.path.join(directory, name + ".sock")
+    # Before `answers`: a helper of this login lacks the group as well.
+    if login_lacks_groups():
+        print("ulak-link stale")
+        return 0
     lock = os.open(os.path.join(directory, name + ".lock"),
                    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     fcntl.flock(lock, fcntl.LOCK_EX)

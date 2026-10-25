@@ -44,6 +44,13 @@
 //! away, and the command's group is hung up; the client closes it when its
 //! own caller dies, which ssh never noticed.
 //!
+//! Sessions inherit the groups of the connection's login; only root's are
+//! set afresh. Measured, OpenSSH_10.3p1 against OpenSSH_10.2p1, not root:
+//! after `usermod -aG`, a helper started through the old master lacked the
+//! group and a new connection had it. So `start` answers `stale`, and the
+//! client stops the master (`-O stop`; what it carries finishes) and logs
+//! in again.
+//!
 //! The client is this binary, `ulak __link`, addressed exactly like ssh:
 //! `Ssh::command` hands it the arguments ssh would have had, so every
 //! caller keeps its `Command`, its pipes and `proc::run_bounded`. Whatever
@@ -551,7 +558,7 @@ fn bring_up(plan: &Plan, place: &Place, parent: u32) -> Route {
         };
     };
     // Whoever held the queue may just have done all of this.
-    let fault = match greet(&place.socket, GREETING) {
+    let mut fault = match greet(&place.socket, GREETING) {
         Ok(stream) => return Route::Link(stream),
         Err(fault) => fault,
     };
@@ -566,12 +573,24 @@ fn bring_up(plan: &Plan, place: &Place, parent: u32) -> Route {
     // socket up before the first channel reaches it (its life ended, or its
     // groups went stale), and the master then closes the channel unanswered
     // exactly as a server that refuses the forward does. Only a helper that
-    // was just started refusing too is the server's answer.
-    for _ in 0..2 {
+    // was just started refusing too is the server's answer. A stale login
+    // is left once and does not count.
+    let mut tries = 0;
+    let mut logged_in_again = false;
+    while tries < 2 {
         let remote = match start_helper(plan, place) {
-            Ok(remote) => remote,
+            Ok(Helper::At(remote)) => remote,
+            Ok(Helper::Stale) if !logged_in_again => {
+                step_aside(plan, place);
+                logged_in_again = true;
+                fault = Fault::Absent;
+                forwarded = false;
+                continue;
+            }
+            Ok(Helper::Stale) => return Route::Ssh,
             Err(route) => return route,
         };
+        tries += 1;
         if fault == Fault::Absent && !forwarded {
             // A socket file nobody listens on is what a master that exited
             // leaves behind; the new one cannot bind over it.
@@ -642,10 +661,18 @@ impl Drop for Queue {
     }
 }
 
+/// Where a started helper left the command.
+enum Helper {
+    /// A helper of this version serves the connection at this remote path.
+    At(String),
+    /// The connection's login lacks a group the account has gained.
+    Stale,
+}
+
 /// One session through the master: start the helper unless one of this
 /// version already answers, and learn where its socket is. With no master
 /// yet, this session is the login that makes it.
-fn start_helper(plan: &Plan, place: &Place) -> Result<String, Route> {
+fn start_helper(plan: &Plan, place: &Place) -> Result<Helper, Route> {
     let mut cmd = Command::new("ssh");
     cmd.args(&plan.connection)
         .arg("--")
@@ -665,7 +692,8 @@ fn start_helper(plan: &Plan, place: &Place) -> Result<String, Route> {
     crate::audit::record_command_in("link", "ssh-link", &cmd, code);
     let logged_in = master || UnixStream::connect(&plan.control).is_ok();
     match helper_answer(&stdout, code, timed_out, logged_in) {
-        Started::Ready(path) => Ok(path),
+        Started::Ready(path) => Ok(Helper::At(path)),
+        Started::Stale => Ok(Helper::Stale),
         Started::Never(why) => {
             place.turn_off(&why);
             Err(Route::Ssh)
@@ -727,6 +755,8 @@ fn start_line() -> String {
 #[derive(Debug, PartialEq, Eq)]
 enum Started {
     Ready(String),
+    /// No helper started: the login lacks a group the account has.
+    Stale,
     /// This server cannot have the link; remembered for `OFF_FOR`.
     Never(String),
     /// Not this time; the next command asks again.
@@ -749,6 +779,9 @@ fn helper_answer(stdout: &[u8], code: Option<i32>, timed_out: bool, logged_in: b
                 ));
             }
             return Started::Ready(path.to_string());
+        }
+        if line == b"ulak-link stale" {
+            return Started::Stale;
         }
         if let Some(why) = line.strip_prefix(b"ulak-link refused: ") {
             return Started::Never(String::from_utf8_lossy(why).into_owned());
@@ -822,10 +855,21 @@ fn master_answers(plan: &Plan) -> bool {
 }
 
 fn retire(plan: &Plan) {
+    tell_master(plan, "exit");
+}
+
+/// The next command logs in anew. The stopped master keeps its forward
+/// bound until it leaves, so the name goes, or the new forward is refused.
+fn step_aside(plan: &Plan, place: &Place) {
+    tell_master(plan, "stop");
+    let _ = std::fs::remove_file(&place.socket);
+}
+
+fn tell_master(plan: &Plan, order: &str) {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg(format!("ControlPath={}", plan.control))
-        .args(["-O", "exit", "--"])
+        .args(["-O", order, "--"])
         .arg(&plan.dest);
     let code = proc::run_bounded(&mut cmd, None, proc::PROBE)
         .ok()
@@ -1391,6 +1435,10 @@ mod tests {
             helper_answer(b"", Some(1), false, true),
             Started::Never(_)
         ));
+        assert_eq!(
+            helper_answer(b"ulak-link stale\n", Some(0), false, true),
+            Started::Stale
+        );
         assert_eq!(helper_answer(b"", Some(255), false, true), Started::NotNow);
         assert_eq!(helper_answer(b"", None, true, true), Started::NotNow);
         // A path is not guessed at from bytes that are not UTF-8.
