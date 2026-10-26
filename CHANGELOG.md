@@ -4,6 +4,41 @@ Notable changes to Ulak. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+### Changed
+
+- **Remote commands run as channels of one SSH connection.** A helper Ulak
+  starts on the server, without installing anything, runs each command, so
+  parallel commands no longer hit sshd's `MaxSessions` limit, and a command
+  whose caller is stopped stops on the server too. A command killed by a
+  signal exits with 128+n instead of 255. After `usermod -aG docker`, the
+  next command logs in again and has the group. Servers without `python3` or
+  unix-socket forwarding keep using SSH sessions; `ulak doctor` shows which
+  is in use.
+- **`P` on the dashboard's Images tab deletes every image no container
+  uses**, not only dangling ones. It quotes `docker system df` first and says
+  how much Docker freed.
+
+### Added
+
+- `I` in the dashboard installs, starts or restarts the background service
+  when it has a problem, after asking.
+- `B` on the Images tab prunes the build cache.
+- A stack's row shows the forwarded ports that fit; `o` lists them all and
+  says why a port would not answer.
+
+### Fixed
+
+- `P` on the Volumes tab never removes a named volume; before Docker 23 it
+  now prunes nothing.
+- Clicks and keys made in the dashboard no longer end up in the shell.
+- A stack's merged logs use one SSH session instead of one per container.
+- The dashboard wakes the background service when it reaches the server.
+  Ports no service forwards are no longer shown, and every tab says when no
+  service is running.
+- `?` and `q` stay on a footer too narrow for every key.
+
 ## 0.2.0
 
 The first four changes below can change what an existing project sends or
