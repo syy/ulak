@@ -1,0 +1,23 @@
+# Publishes the tagged crate to crates.io. dist calls it from release.yml
+# (`publish-jobs` in dist-workspace.toml) after the GitHub Release exists.
+# crates.io trusts release.yml through Trusted Publishing; no token is stored.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  crates-io:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish -p ulak --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
