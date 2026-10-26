@@ -4,6 +4,12 @@ Notable changes to Ulak. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.1
+
+No changes to Ulak. 0.3.0 never reached the crates.io index, so
+`cargo install ulak` still installed 0.2.0; this release brings 0.3.0's
+changes there.
+
 ## 0.3.0
 
 ### Changed

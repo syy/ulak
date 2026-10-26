@@ -11,7 +11,10 @@ ci = "github"
 installers = ["shell", "homebrew"]
 # dist publishes the prebuilt-binary formula to our own tap.
 tap = "syy/homebrew-tap"
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates"]
+# Overriding drops dist's defaults, so id-token (crates.io Trusted
+# Publishing) is listed again; contents lets the job check out the tag.
+github-custom-job-permissions = { "publish-crates" = { id-token = "write", contents = "read" } }
 # Target platforms (MVP DoD): darwin arm64/x86_64 + linux musl.
 # ulak is unix-only by nature (ssh + rsync + unix perms).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
